@@ -133,9 +133,17 @@ public:
 	FMCPConnectionRelease(const FMCPConnectionRelease&) = delete;
 	FMCPConnectionRelease& operator=(const FMCPConnectionRelease&) = delete;
 
+	/**
+	 * Called from the connection thread once the WebSocket handshake response
+	 * is on the wire. Until then this TCP connection is not a client anyone
+	 * can talk to, and the toolbar's "connected" dot should not count it.
+	 */
+	void MarkHandshaken() { bHandshaken = true; }
+
 private:
 	FMCPBridgeServer& Server;
 	FMCPSocketHandle Handle;
+	bool bHandshaken = false;
 };
 
 class FMCPBridgeServer : public FRunnable
@@ -212,6 +220,31 @@ public:
 
 	// Get game thread executor (to set editor ready)
 	FMCPGameThreadExecutor& GetGameThreadExecutor() { return GameThreadExecutor; }
+
+	// True once the listen socket is bound and the accept loop is running.
+	// The toolbar uses this to distinguish "listening with no client" from
+	// "bridge failed to start".
+	bool IsRunning() const { return bIsRunning; }
+
+	/** The port the accept loop bound, after any collision walk. */
+	int32 GetPort() const { return ServerPort; }
+
+	/** Where the port number came from ("-MCPPort command line", ...). */
+	const FString& GetPortSource() const { return PortSource; }
+
+	/**
+	 * Clients whose WebSocket handshake completed and who have not yet
+	 * disconnected. Unlike ActiveConnectionCount, a TCP connection that is
+	 * still mid-handshake does not count as a connected client, which is the
+	 * distinction the editor toolbar's status dot draws.
+	 */
+	int32 GetHandshakenClientCount() const { return HandshakenClientCount.GetValue(); }
+
+	/** Called from the connection thread once the 101 response is on the wire. */
+	void NoteHandshakenClient() { HandshakenClientCount.Increment(); }
+
+	/** Called from the connection thread when a handshaken connection ends. */
+	void NoteClientClosed() { HandshakenClientCount.Decrement(); }
 
 	// Process a JSON-RPC message
 	FString ProcessMessage(const FString& Message);
@@ -325,6 +358,7 @@ private:
 	FCriticalSection ConnectionsMutex;
 	TSet<FMCPSocketHandle> LiveConnections;
 	FThreadSafeCounter ActiveConnectionCount;
+	FThreadSafeCounter HandshakenClientCount;
 
 	// #821: identity for this server object, so a record on disk can say which
 	// process wrote it and only that process can take it away. A pid alone is

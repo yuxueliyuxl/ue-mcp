@@ -30,6 +30,7 @@ public class UE_MCP_Bridge : ModuleRules
 			new string[]
 			{
 				"AIModule",
+				"ApplicationCore",
 				"MessageLog",
 				"AnimGraph",
 				"AnimationEditor",
@@ -140,3 +141,5 @@ public class UE_MCP_Bridge : ModuleRules
 }
 
 // Rescan trigger: round 2 added handler translation units.
+// Private/Toolbar/MCPToolbarStatus.cpp: toolbar connection-status indicator;
+// same reason - UBT caches the module's file list.

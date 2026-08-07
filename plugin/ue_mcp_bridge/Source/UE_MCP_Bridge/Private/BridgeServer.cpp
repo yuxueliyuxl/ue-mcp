@@ -107,6 +107,13 @@ FMCPConnectionRelease::FMCPConnectionRelease(FMCPBridgeServer& InServer, FMCPSoc
 
 FMCPConnectionRelease::~FMCPConnectionRelease()
 {
+	// A TCP connection that never finished its WebSocket handshake was never a
+	// client anyone could talk to, so it must not leave a handshake count
+	// behind either. The flag is only set once the 101 response is on the wire.
+	if (bHandshaken)
+	{
+		Server.NoteClientClosed();
+	}
 	Server.UnregisterConnection(Handle);
 }
 
@@ -1652,6 +1659,12 @@ void FMCPBridgeServer::HandleWebSocketConnection(FMCPSocketHandle ClientSocketFD
 	}
 
 	UE_LOG(LogMCPBridge, Log, TEXT("[UE-MCP] Sent WebSocket handshake response (%d bytes)"), UTF8Response.Length());
+
+	// The client is now a real WebSocket peer: count it for the editor
+	// toolbar's connected indicator. The release object drops it again when
+	// this connection ends, whichever path leaves this function.
+	Release.MarkHandshaken();
+	NoteHandshakenClient();
 
 	// Process WebSocket messages
 	UE_LOG(LogMCPBridge, Log, TEXT("[UE-MCP] Starting WebSocket message processing"));
