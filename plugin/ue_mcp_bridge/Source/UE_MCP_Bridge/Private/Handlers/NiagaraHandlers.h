@@ -61,4 +61,13 @@ private:
 	// Retarget a data-interface function-call node (e.g. ParticleRead "Get Float
 	// By ID" -> "Get Float By Index") so cross-emitter reads work on GPU.
 	static TSharedPtr<FJsonValue> SetDiFunction(const TSharedPtr<FJsonObject>& Params);
+
+	// Generic Niagara graph authoring primitives (node-level editing inside
+	// module/scratch scripts).
+	static TSharedPtr<FJsonValue> GraphAddNode(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GraphConnectPins(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GraphDisconnectPins(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GraphSetPin(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GraphSetNodeProperty(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GraphRemoveNode(const TSharedPtr<FJsonObject>& Params);
 };

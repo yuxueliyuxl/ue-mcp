@@ -32,6 +32,7 @@
 #include "NiagaraNodeAssignment.h"
 #include "NiagaraNodeInput.h"
 #include "NiagaraDataInterfaceParticleRead.h"
+#include "NiagaraNodeOp.h"
 #include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
 #include "NiagaraStackFunctionInputBinder.h"
 #include "NiagaraParameterMapHistory.h"
@@ -104,6 +105,12 @@ void FNiagaraHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("set_niagara_module_enabled"), &SetModuleEnabled);
 	Registry.RegisterHandler(TEXT("describe_niagara_script_graph"), &DescribeScriptGraph);
 	Registry.RegisterHandler(TEXT("set_niagara_di_function"), &SetDiFunction);
+	Registry.RegisterHandler(TEXT("graph_add_node"), &GraphAddNode);
+	Registry.RegisterHandler(TEXT("graph_connect_pins"), &GraphConnectPins);
+	Registry.RegisterHandler(TEXT("graph_disconnect_pins"), &GraphDisconnectPins);
+	Registry.RegisterHandler(TEXT("graph_set_pin"), &GraphSetPin);
+	Registry.RegisterHandler(TEXT("graph_set_node_property"), &GraphSetNodeProperty);
+	Registry.RegisterHandler(TEXT("graph_remove_node"), &GraphRemoveNode);
 }
 
 TSharedPtr<FJsonValue> FNiagaraHandlers::ListNiagaraSystems(const TSharedPtr<FJsonObject>& Params)
@@ -2774,5 +2781,359 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::SetDiFunction(const TSharedPtr<FJsonObj
 	Res->SetStringField(TEXT("newFunction"), NewFunction);
 	Res->SetNumberField(TEXT("nodesUpdated"), Updated);
 	Res->SetStringField(TEXT("nodes"), FString::Join(UpdatedNodes, TEXT(", ")));
+	return MCPResult(Res);
+}
+
+// ===========================================================================
+// Generic Niagara graph authoring primitives
+// ===========================================================================
+namespace
+{
+	UNiagaraScript* LoadScriptAndGraph(const FString& ObjectPath, UNiagaraGraph*& OutGraph, FString& OutErr)
+	{
+		UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ObjectPath);
+		if (!Script)
+		{
+			OutErr = FString::Printf(TEXT("NiagaraScript not found: %s"), *ObjectPath);
+			return nullptr;
+		}
+		OutGraph = GraphOfScript(Script);
+		if (!OutGraph)
+		{
+			OutErr = TEXT("Script has no source graph");
+			return nullptr;
+		}
+		return Script;
+	}
+
+	void SaveScriptPackage(UNiagaraScript* Script)
+	{
+		if (!Script) return;
+		const FString PkgName = Script->GetPackage() ? Script->GetPackage()->GetName() : FString();
+		if (!PkgName.IsEmpty())
+		{
+			UEditorAssetLibrary::SaveAsset(PkgName);
+		}
+	}
+
+	UNiagaraNode* FindNiagaraNode(UNiagaraGraph* Graph, const FString& Name)
+	{
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			if (N && N->GetName().Equals(Name, ESearchCase::IgnoreCase))
+			{
+				return Cast<UNiagaraNode>(N);
+			}
+		}
+		return nullptr;
+	}
+
+	UEdGraphPin* FindNodePin(UEdGraphNode* Node, const FString& PinName, int32 Direction)
+	{
+		if (!Node) return nullptr;
+		for (UEdGraphPin* P : Node->Pins)
+		{
+			if (!P || !P->PinName.ToString().Equals(PinName, ESearchCase::IgnoreCase)) continue;
+			if (Direction < 0 || P->Direction == (Direction == 0 ? EGPD_Input : EGPD_Output)) return P;
+		}
+		return nullptr;
+	}
+}
+
+TSharedPtr<FJsonValue> FNiagaraHandlers::GraphAddNode(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ObjectPath;
+	if (auto Err = RequireString(Params, TEXT("objectPath"), ObjectPath)) return Err;
+	FString NodeClass;
+	if (auto Err = RequireString(Params, TEXT("nodeClass"), NodeClass)) return Err;
+	FString OpName = OptionalString(Params, TEXT("opName"), TEXT(""));
+	FString Hlsl = OptionalString(Params, TEXT("hlsl"), TEXT(""));
+	FString DiClass = OptionalString(Params, TEXT("diClass"), TEXT(""));
+	FString DiFunction = OptionalString(Params, TEXT("diFunction"), TEXT(""));
+
+	UNiagaraGraph* Graph = nullptr;
+	FString Err;
+	UNiagaraScript* Script = LoadScriptAndGraph(ObjectPath, Graph, Err);
+	if (!Script) return MCPError(Err);
+
+	UClass* Cls = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/NiagaraEditor.%s"), *NodeClass));
+	if (!Cls || !Cls->IsChildOf(UNiagaraNode::StaticClass()))
+	{
+		return MCPError(FString::Printf(TEXT("Niagara node class not found: %s"), *NodeClass));
+	}
+
+	Graph->Modify();
+	UEdGraphNode* Node = nullptr;
+	if (Cls == UNiagaraNodeOp::StaticClass())
+	{
+		FGraphNodeCreator<UNiagaraNodeOp> Creator(*Graph);
+		UNiagaraNodeOp* Op = Creator.CreateNode();
+		if (!OpName.IsEmpty()) Op->OpName = FName(*OpName);
+		Creator.Finalize();
+		Op->ReconstructNode();
+		Node = Op;
+	}
+	else if (Cls == UNiagaraNodeCustomHlsl::StaticClass())
+	{
+		FGraphNodeCreator<UNiagaraNodeCustomHlsl> Creator(*Graph);
+		UNiagaraNodeCustomHlsl* Custom = Creator.CreateNode();
+		if (!Hlsl.IsEmpty())
+		{
+			if (FStrProperty* SP = CastField<FStrProperty>(
+				Custom->GetClass()->FindPropertyByName(TEXT("CustomHlsl"))))
+			{
+				Custom->Modify();
+				SP->SetPropertyValue(SP->ContainerPtrToValuePtr<void>(Custom), Hlsl);
+			}
+		}
+		Creator.Finalize();
+		Custom->ReconstructNode();
+		Node = Custom;
+	}
+	else if (Cls == UNiagaraNodeFunctionCall::StaticClass())
+	{
+		FGraphNodeCreator<UNiagaraNodeFunctionCall> Creator(*Graph);
+		UNiagaraNodeFunctionCall* FC = Creator.CreateNode();
+		if (!DiClass.IsEmpty() && !DiFunction.IsEmpty())
+		{
+			UClass* DiUClass = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Niagara.%s"), *DiClass));
+			if (DiUClass)
+			{
+				UNiagaraDataInterface* DI = NewObject<UNiagaraDataInterface>(GetTransientPackage(), DiUClass);
+				if (DI)
+				{
+					TArray<FNiagaraFunctionSignature> Sigs;
+					DI->GetFunctionSignatures(Sigs);
+					for (const FNiagaraFunctionSignature& S : Sigs)
+					{
+						if (S.Name.ToString().Equals(DiFunction, ESearchCase::IgnoreCase))
+						{
+							FC->Signature = S;
+							break;
+						}
+					}
+				}
+			}
+		}
+		Creator.Finalize();
+		FC->ReconstructNode();
+		Node = FC;
+	}
+	else
+	{
+		// Generic path for node classes whose headers are private
+		// (MapGet/MapSet/Convert/Reroute): create raw and allocate pins.
+		Node = NewObject<UEdGraphNode>(Graph, Cls);
+		if (Node)
+		{
+			Node->SetFlags(RF_Transactional);
+			Graph->AddNode(Node, false, false);
+			Node->AllocateDefaultPins();
+			Node->ReconstructNode();
+		}
+	}
+	if (!Node) return MCPError(TEXT("Failed to create node"));
+	Node->PostEditChange();
+	Graph->NotifyGraphChanged();
+	SaveScriptPackage(Script);
+
+	TSharedPtr<FJsonObject> Res = MCPSuccess();
+	MCPSetCreated(Res);
+	Res->SetStringField(TEXT("objectPath"), ObjectPath);
+	Res->SetStringField(TEXT("nodeClass"), Cls->GetName());
+	Res->SetStringField(TEXT("nodeName"), Node->GetName());
+	return MCPResult(Res);
+}
+
+TSharedPtr<FJsonValue> FNiagaraHandlers::GraphConnectPins(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ObjectPath;
+	if (auto Err = RequireString(Params, TEXT("objectPath"), ObjectPath)) return Err;
+	FString FromNode;
+	if (auto Err = RequireString(Params, TEXT("fromNode"), FromNode)) return Err;
+	FString FromPin;
+	if (auto Err = RequireString(Params, TEXT("fromPin"), FromPin)) return Err;
+	FString ToNode;
+	if (auto Err = RequireString(Params, TEXT("toNode"), ToNode)) return Err;
+	FString ToPin;
+	if (auto Err = RequireString(Params, TEXT("toPin"), ToPin)) return Err;
+
+	UNiagaraGraph* Graph = nullptr;
+	FString Err;
+	UNiagaraScript* Script = LoadScriptAndGraph(ObjectPath, Graph, Err);
+	if (!Script) return MCPError(Err);
+
+	UEdGraphPin* From = FindNodePin(FindNiagaraNode(Graph, FromNode), FromPin, 1);
+	UEdGraphPin* To = FindNodePin(FindNiagaraNode(Graph, ToNode), ToPin, 0);
+	if (!From) return MCPError(FString::Printf(TEXT("Output pin '%s' not found on node '%s'"), *FromPin, *FromNode));
+	if (!To) return MCPError(FString::Printf(TEXT("Input pin '%s' not found on node '%s'"), *ToPin, *ToNode));
+	if (From->LinkedTo.Contains(To))
+	{
+		return MCPError(TEXT("Pins are already connected"));
+	}
+
+	Graph->Modify();
+	From->Modify();
+	To->Modify();
+	From->MakeLinkTo(To);
+	Graph->NotifyGraphChanged();
+	SaveScriptPackage(Script);
+
+	TSharedPtr<FJsonObject> Res = MCPSuccess();
+	MCPSetUpdated(Res);
+	Res->SetStringField(TEXT("connection"), FString::Printf(TEXT("%s.%s -> %s.%s"), *FromNode, *FromPin, *ToNode, *ToPin));
+	return MCPResult(Res);
+}
+
+TSharedPtr<FJsonValue> FNiagaraHandlers::GraphDisconnectPins(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ObjectPath;
+	if (auto Err = RequireString(Params, TEXT("objectPath"), ObjectPath)) return Err;
+	FString NodeName;
+	if (auto Err = RequireString(Params, TEXT("node"), NodeName)) return Err;
+	FString PinName;
+	if (auto Err = RequireString(Params, TEXT("pin"), PinName)) return Err;
+	// -1 any, 0 input, 1 output
+	const int32 Direction = OptionalInt(Params, TEXT("direction"), -1);
+
+	UNiagaraGraph* Graph = nullptr;
+	FString Err;
+	UNiagaraScript* Script = LoadScriptAndGraph(ObjectPath, Graph, Err);
+	if (!Script) return MCPError(Err);
+
+	UEdGraphPin* Pin = FindNodePin(FindNiagaraNode(Graph, NodeName), PinName, Direction);
+	if (!Pin) return MCPError(FString::Printf(TEXT("Pin '%s' not found on node '%s'"), *PinName, *NodeName));
+	const int32 BrokenCount = Pin->LinkedTo.Num();
+
+	Graph->Modify();
+	Pin->Modify();
+	Pin->BreakAllPinLinks(true);
+	Graph->NotifyGraphChanged();
+	SaveScriptPackage(Script);
+
+	TSharedPtr<FJsonObject> Res = MCPSuccess();
+	MCPSetUpdated(Res);
+	Res->SetStringField(TEXT("node"), NodeName);
+	Res->SetStringField(TEXT("pin"), PinName);
+	Res->SetNumberField(TEXT("linksBroken"), BrokenCount);
+	return MCPResult(Res);
+}
+
+TSharedPtr<FJsonValue> FNiagaraHandlers::GraphSetPin(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ObjectPath;
+	if (auto Err = RequireString(Params, TEXT("objectPath"), ObjectPath)) return Err;
+	FString NodeName;
+	if (auto Err = RequireString(Params, TEXT("node"), NodeName)) return Err;
+	FString PinName;
+	if (auto Err = RequireString(Params, TEXT("pin"), PinName)) return Err;
+	FString Value;
+	if (auto Err = RequireString(Params, TEXT("value"), Value)) return Err;
+	const int32 Direction = OptionalInt(Params, TEXT("direction"), 0);
+
+	UNiagaraGraph* Graph = nullptr;
+	FString Err;
+	UNiagaraScript* Script = LoadScriptAndGraph(ObjectPath, Graph, Err);
+	if (!Script) return MCPError(Err);
+
+	UEdGraphPin* Pin = FindNodePin(FindNiagaraNode(Graph, NodeName), PinName, Direction);
+	if (!Pin) return MCPError(FString::Printf(TEXT("Pin '%s' not found on node '%s'"), *PinName, *NodeName));
+
+	const bool bWasLinked = Pin->LinkedTo.Num() > 0;
+	Graph->Modify();
+	Pin->Modify();
+	if (bWasLinked)
+	{
+		Pin->BreakAllPinLinks(true);
+	}
+	Pin->DefaultValue = Value;
+	Graph->NotifyGraphChanged();
+	SaveScriptPackage(Script);
+
+	TSharedPtr<FJsonObject> Res = MCPSuccess();
+	MCPSetUpdated(Res);
+	Res->SetStringField(TEXT("node"), NodeName);
+	Res->SetStringField(TEXT("pin"), PinName);
+	Res->SetStringField(TEXT("value"), Value);
+	Res->SetBoolField(TEXT("brokeLinks"), bWasLinked);
+	return MCPResult(Res);
+}
+
+TSharedPtr<FJsonValue> FNiagaraHandlers::GraphSetNodeProperty(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ObjectPath;
+	if (auto Err = RequireString(Params, TEXT("objectPath"), ObjectPath)) return Err;
+	FString NodeName;
+	if (auto Err = RequireString(Params, TEXT("node"), NodeName)) return Err;
+	FString PropertyName;
+	if (auto Err = RequireString(Params, TEXT("propertyName"), PropertyName)) return Err;
+	FString Value;
+	if (auto Err = RequireString(Params, TEXT("value"), Value)) return Err;
+
+	UNiagaraGraph* Graph = nullptr;
+	FString Err;
+	UNiagaraScript* Script = LoadScriptAndGraph(ObjectPath, Graph, Err);
+	if (!Script) return MCPError(Err);
+
+	UNiagaraNode* Node = FindNiagaraNode(Graph, NodeName);
+	if (!Node) return MCPError(FString::Printf(TEXT("Node '%s' not found"), *NodeName));
+
+	FProperty* Prop = Node->GetClass()->FindPropertyByName(*PropertyName);
+	if (!Prop)
+	{
+		return MCPError(FString::Printf(TEXT("Property '%s' not found on node '%s'"), *PropertyName, *NodeName));
+	}
+
+	Node->Modify();
+	bool bSet = false;
+	if (FBoolProperty* BP = CastField<FBoolProperty>(Prop)) { BP->SetPropertyValue_InContainer(Node, Value.ToBool()); bSet = true; }
+	else if (FIntProperty* IP = CastField<FIntProperty>(Prop)) { IP->SetPropertyValue_InContainer(Node, FCString::Atoi(*Value)); bSet = true; }
+	else if (FFloatProperty* FP = CastField<FFloatProperty>(Prop)) { FP->SetPropertyValue_InContainer(Node, FCString::Atof(*Value)); bSet = true; }
+	else if (FDoubleProperty* DP = CastField<FDoubleProperty>(Prop)) { DP->SetPropertyValue_InContainer(Node, FCString::Atod(*Value)); bSet = true; }
+	else if (FNameProperty* NP = CastField<FNameProperty>(Prop)) { NP->SetPropertyValue_InContainer(Node, FName(*Value)); bSet = true; }
+	else if (FStrProperty* SP = CastField<FStrProperty>(Prop)) { SP->SetPropertyValue_InContainer(Node, Value); bSet = true; }
+	else if (FTextProperty* TP = CastField<FTextProperty>(Prop)) { TP->SetPropertyValue_InContainer(Node, FText::FromString(Value)); bSet = true; }
+
+	if (!bSet)
+	{
+		return MCPError(FString::Printf(TEXT("Unsupported property type for '%s'"), *PropertyName));
+	}
+
+	Node->PostEditChange();
+	Graph->NotifyGraphChanged();
+	SaveScriptPackage(Script);
+
+	TSharedPtr<FJsonObject> Res = MCPSuccess();
+	MCPSetUpdated(Res);
+	Res->SetStringField(TEXT("node"), NodeName);
+	Res->SetStringField(TEXT("propertyName"), PropertyName);
+	Res->SetStringField(TEXT("value"), Value);
+	return MCPResult(Res);
+}
+
+TSharedPtr<FJsonValue> FNiagaraHandlers::GraphRemoveNode(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ObjectPath;
+	if (auto Err = RequireString(Params, TEXT("objectPath"), ObjectPath)) return Err;
+	FString NodeName;
+	if (auto Err = RequireString(Params, TEXT("node"), NodeName)) return Err;
+
+	UNiagaraGraph* Graph = nullptr;
+	FString Err;
+	UNiagaraScript* Script = LoadScriptAndGraph(ObjectPath, Graph, Err);
+	if (!Script) return MCPError(Err);
+
+	UNiagaraNode* Node = FindNiagaraNode(Graph, NodeName);
+	if (!Node) return MCPError(FString::Printf(TEXT("Node '%s' not found"), *NodeName));
+
+	Graph->Modify();
+	Node->Modify();
+	Graph->RemoveNode(Node);
+	Graph->NotifyGraphChanged();
+	SaveScriptPackage(Script);
+
+	TSharedPtr<FJsonObject> Res = MCPSuccess();
+	MCPSetUpdated(Res);
+	Res->SetStringField(TEXT("removedNode"), NodeName);
 	return MCPResult(Res);
 }
