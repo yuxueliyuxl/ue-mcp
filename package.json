@@ -1,6 +1,6 @@
 {
   "name": "ue-mcp",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "description": "Unreal Engine MCP server - 24 tools, 783+ actions for AI-driven editor control",
   "type": "module",
   "main": "dist/index.js",
@@ -89,7 +89,7 @@
     "prepare": "husky"
   },
   "dependencies": {
-    "@db-lyon/flowkit": "~0.5.3",
+    "@db-lyon/flowkit": "^0.14.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "js-yaml": "^4.1.0",
     "ws": "^8.18.0",

@@ -1,5 +1,9 @@
-#!/usr/bin/env node
 // Duplicate file-local definition audit.
+//
+// No shebang: this file is run by `node` from npm scripts and re-imported by
+// vitest, whose loader chokes on the shebang line as "Invalid or unexpected
+// token" and takes the whole test file down with it. Invoke as
+// `node scripts/audit-unity-collisions.mjs` (already the `audit:unity` shape).
 //
 // UBT compiles a module as a unity build: several .cpp files are concatenated
 // into one translation unit. An anonymous namespace is per translation unit, so

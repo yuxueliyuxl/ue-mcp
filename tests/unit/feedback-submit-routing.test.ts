@@ -88,6 +88,20 @@ async function route(ctx: ToolContext, params: Record<string, unknown>): Promise
 
 const CACHED_USER = { token: "ghu_abc", login: "tester", authorized_at: "2026-05-20T00:00:00Z" };
 
+// Redirect ~/.ue-mcp/state.json to a per-run temp file. resolveFeedbackMode
+// falls back to the user-scoped preference when no env override is set, so
+// without this these tests read the developer's real feedback mode and a
+// machine set to auto-approve skips the approval gate they assert on.
+let stateRoot: string;
+beforeEach(() => {
+  stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ue-mcp-routing-state-"));
+  process.env.UE_MCP_USER_STATE = path.join(stateRoot, "state.json");
+});
+afterEach(() => {
+  delete process.env.UE_MCP_USER_STATE;
+  fs.rmSync(stateRoot, { recursive: true, force: true });
+});
+
 describe("feedback(submit) plugin routing", () => {
   beforeEach(() => {
     delete process.env.UE_MCP_FEEDBACK_ROUTING;

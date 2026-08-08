@@ -52,6 +52,22 @@ const CACHED_USER = {
   authorized_at: "2026-05-20T00:00:00Z",
 };
 
+// Redirect ~/.ue-mcp/state.json to a per-run temp file. resolveFeedbackMode
+// falls back to the user-scoped preference when no env override is set, so
+// without this the whole file reads the developer's real feedback mode: a
+// machine with `npx ue-mcp feedback mode auto-approve` set skips the
+// elicitation gate these tests exist to cover. CI passes either way because
+// its home directory is empty, which is what let it go unnoticed.
+let stateRoot: string;
+beforeEach(() => {
+  stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ue-mcp-feedback-state-"));
+  process.env.UE_MCP_USER_STATE = path.join(stateRoot, "state.json");
+});
+afterEach(() => {
+  delete process.env.UE_MCP_USER_STATE;
+  fs.rmSync(stateRoot, { recursive: true, force: true });
+});
+
 describe("feedback(submit) elicitation gate", () => {
   beforeEach(() => {
     // Routing (plugin-registry lookup) is exercised in feedback-routing.test.ts

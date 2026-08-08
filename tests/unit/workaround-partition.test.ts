@@ -47,6 +47,11 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "ue-mcp-workaround-"));
   resetAllWorkarounds();
   process.env.UE_MCP_FEEDBACK_ROUTING = "off";
+  // Redirect ~/.ue-mcp/state.json into the same temp root. resolveFeedbackMode
+  // falls back to the user-scoped preference when no env override is set, so
+  // without this the submit path reads the developer's real feedback mode and
+  // a machine set to auto-approve bypasses the elicitation this asserts on.
+  process.env.UE_MCP_USER_STATE = path.join(root, "state.json");
   mockSubmitFeedback.mockReset();
   mockReadUserAuth.mockReset();
   mockReadUserAuth.mockResolvedValue({
@@ -60,6 +65,7 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
   resetAllWorkarounds();
   delete process.env.UE_MCP_FEEDBACK_ROUTING;
+  delete process.env.UE_MCP_USER_STATE;
 });
 
 describe("workaround tracker partitioning", () => {
