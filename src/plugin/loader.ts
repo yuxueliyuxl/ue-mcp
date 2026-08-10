@@ -47,6 +47,10 @@ export interface PluginRecord {
   /** Validation status: "active" if loaded; anything else means skipped. */
   status: "active" | "skipped";
   statusReason?: string;
+  /** Units the manifest declared that did not survive validation, while the
+   *  rest of the plugin loaded. `"<manifest path>: <reason>"` each. Present
+   *  and non-empty means the plugin is active but narrower than authored. */
+  degraded: string[];
 }
 
 export interface PluginLoadResult {
@@ -353,6 +357,13 @@ async function loadOne(
     return skip(base, `manifest invalid: ${(e as Error).message}`);
   }
   const manifest = parsed.manifest;
+  // Salvaged units: the plugin loads, minus whatever failed validation on its
+  // own. Each one is warned individually so the log names the handler rather
+  // than leaving the reader to diff the manifest against the live surface.
+  for (const d of parsed.dropped) {
+    base.degraded.push(`${d.path}: ${d.reason}`);
+    warn("plugin", `${entry.name}: dropped ${d.path} - ${d.reason}`);
+  }
   base.manifestPath = parsed.manifestPath;
   base.actionPrefix = manifest.actionPrefix;
   base.minServerVersion = manifest.minServerVersion;
@@ -433,27 +444,29 @@ async function loadOne(
     }
   }
 
-  // Every inject entry must point to a task we just registered.
+  // Every inject and provides entry must point to a task we just registered.
+  // One that does not is dropped rather than fatal: an action with no task
+  // behind it cannot dispatch, but the plugin's other actions still can, and
+  // the reason travels on the record instead of taking the category down.
   for (const [category, actions] of Object.entries(manifest.inject)) {
     for (const [bareName, spec] of Object.entries(actions)) {
-      if (!taskCtors.has(spec.task)) {
-        return skip(
-          base,
-          `inject ${category}.${bareName} references unknown task '${spec.task}'`,
-        );
-      }
+      if (taskCtors.has(spec.task)) continue;
+      delete actions[bareName];
+      base.degraded.push(
+        `inject.${category}.${bareName}: references unknown task '${spec.task}'`,
+      );
+      warn("plugin", `${entry.name}: dropped inject.${category}.${bareName} - unknown task '${spec.task}'`);
     }
   }
 
-  // Every provides entry must also point to a task we just registered.
   for (const [category, providedSpec] of Object.entries(manifest.provides)) {
     for (const [actionName, actionSpec] of Object.entries(providedSpec.actions)) {
-      if (!taskCtors.has(actionSpec.task)) {
-        return skip(
-          base,
-          `provides ${category}.${actionName} references unknown task '${actionSpec.task}'`,
-        );
-      }
+      if (taskCtors.has(actionSpec.task)) continue;
+      delete providedSpec.actions[actionName];
+      base.degraded.push(
+        `provides.${category}.actions.${actionName}: references unknown task '${actionSpec.task}'`,
+      );
+      warn("plugin", `${entry.name}: dropped provides.${category}.${actionName} - unknown task '${actionSpec.task}'`);
     }
   }
 
@@ -475,6 +488,7 @@ function baseRecord(entry: PluginEntry): PluginRecord {
     flows: [],
     tasks: [],
     status: "skipped",
+    degraded: [],
   };
 }
 

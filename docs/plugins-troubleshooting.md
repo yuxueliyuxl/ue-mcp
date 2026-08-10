@@ -14,7 +14,17 @@ These are enforced both at install (`ue-mcp plugin install`) and at server load:
 - Every `inject:` and `provides:` entry must point to a task declared under `tasks:`, and every task's `class_path` must resolve under `dist/`.
 - `minServerVersion` is checked at install and re-checked at load.
 - `nativeModule.minBridgeApi` is checked at install (against the deployed bridge's `UEMCP_BRIDGE_API_VERSION`) and re-checked at load.
-- A plugin that fails any of these is skipped entirely (never partially injected) with a loud warning. Other plugins keep loading.
+- A plugin that fails a rule affecting the whole package (`actionPrefix`, an unknown `inject:` target, a version gate, an unresolvable `class_path`) is skipped entirely with a loud warning. Other plugins keep loading.
+- A failure confined to one handler, one injected or provided action, one flow, one task or one knowledge entry costs **that unit only**. The plugin still loads; the dropped units and their reasons appear as `degraded` on `plugins(action="list")` and `describe`, in `ue-mcp plugin list`, and in the `PLUGIN LOAD WARNINGS` block of the server instructions.
+
+## An action, or a whole category, is missing
+
+Read the `PLUGIN LOAD WARNINGS` block the server sends at initialize, or run `plugins(action="list")`. Two shapes:
+
+- `status: "skipped"` with a `statusReason` - the plugin never loaded, so none of its actions exist. Fix the reason and restart the server.
+- `status: "active"` with a non-empty `degraded` - the plugin loaded, but the listed units did not. Each entry names the manifest path and the validation error, e.g. `nativeModule.handlers.actor_set: nativeModule.handlers.actor_set.schema.value.type: Invalid enum value`.
+
+An absent warning for a plugin you expected means the plugin is not in `plugins:` at all, or its package is not under `node_modules/`.
 
 ## `plugins(action="list")` returns `pluginCount: 0`
 

@@ -116,6 +116,18 @@ The key under each category is the **bare** action name. The loader prepends you
 
 Param schemas under `schema:` accept these types: `string`, `number`, `boolean`, `object`, `array`. Non-required params become optional at the top level of the host category tool's schema.
 
+`type` is optional. Omit it for a param that genuinely has no single type, and the param accepts any JSON value:
+
+```yaml
+        value: { description: "Value to write (number, bool, string, or enum name)" }
+```
+
+Give a list instead when you know the alternatives, and the param compiles to a union of exactly those:
+
+```yaml
+        value: { type: [number, boolean, string] }
+```
+
 ## Providing new categories (`provides:`)
 
 When the plugin's actions don't belong inside any built-in category, declare a `provides:` block. Each entry registers a brand-new top-level MCP category that the plugin owns. Action names are NOT prefixed inside provided categories - the category itself is the namespace.

@@ -241,7 +241,14 @@ function cmdInstall(): void {
 
   let manifest;
   try {
-    manifest = loadManifest(pkgDir).manifest;
+    const parsed = loadManifest(pkgDir);
+    manifest = parsed.manifest;
+    // Salvaged units: the install stands, minus what failed validation. Say
+    // which parts are gone here, at the one moment the user is looking, rather
+    // than leaving them to notice the missing actions later.
+    for (const d of parsed.dropped) {
+      console.error(`[ue-mcp] warn: ${name} declares ${d.path}, which failed validation and was dropped - ${d.reason}`);
+    }
   } catch (e) {
     fail(`${name} has no valid ue-mcp.plugin.yml: ${(e as Error).message}`);
   }
@@ -402,9 +409,12 @@ function cmdList(): void {
     const pj = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf-8")) as { version?: string };
     let status = "ok";
     let categories: string[] = [];
+    let dropped: Array<{ path: string; reason: string }> = [];
     try {
-      const m = loadManifest(pkgDir).manifest;
-      categories = Object.keys(m.inject);
+      const parsed = loadManifest(pkgDir);
+      categories = Object.keys(parsed.manifest.inject);
+      dropped = parsed.dropped;
+      if (dropped.length > 0) status = `ok (${dropped.length} part(s) dropped)`;
     } catch (e) {
       status = `manifest invalid: ${(e as Error).message}`;
     }
@@ -414,6 +424,7 @@ function cmdList(): void {
       ` - ${status}` +
       (categories.length ? ` - injects: ${categories.join(", ")}` : ""),
     );
+    for (const d of dropped) console.log(`      dropped ${d.path} - ${d.reason}`);
   }
 }
 

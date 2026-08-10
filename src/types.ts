@@ -96,6 +96,9 @@ export interface PluginInfo {
   actionPrefix: string;
   status: "active" | "skipped";
   statusReason?: string;
+  /** Manifest units that failed validation while the rest of the plugin
+   *  loaded. Non-empty means active but narrower than the manifest declares. */
+  degraded: string[];
   minServerVersion?: string;
   uePluginDependency?: string;
   uePluginPresent?: boolean;

@@ -413,11 +413,19 @@ async function main() {
   const withKnowledge = knowledgeBlock
     ? `${baseInstructions}\n\n═══ PLUGIN KNOWLEDGE ═══\n${knowledgeBlock}`
     : baseInstructions;
+  // A plugin that failed to load takes its actions with it, and absent actions
+  // read as "never installed" rather than "broken". Say so at initialize, where
+  // the caller is already reading the surface, instead of only in a log file
+  // and a `plugins(list)` field nobody queries until they suspect a problem.
+  const loadWarnings = buildPluginWarningBlock(surfaces);
+  const withWarnings = loadWarnings
+    ? `${withKnowledge}\n\n═══ PLUGIN LOAD WARNINGS ═══\n${loadWarnings}`
+    : withKnowledge;
   // Targeting is documented only when there is something to target, so a
   // single-editor client's initialize payload is unchanged.
   const serverInstructions = sessions.size > 1
-    ? `${withKnowledge}\n\n${multiEditorInstructions(sessions.list().map((s) => s.name), sessions.active.name)}`
-    : withKnowledge;
+    ? `${withWarnings}\n\n${multiEditorInstructions(sessions.list().map((s) => s.name), sessions.active.name)}`
+    : withWarnings;
 
   const server = new McpServer({
     name: "ue-mcp",
@@ -892,6 +900,34 @@ function buildKnowledgeBlock(knowledgeByCategory: Record<string, string[]>): str
   return lines.join("\n").trim();
 }
 
+/**
+ * One line per plugin that is missing from the surface or narrower than its
+ * manifest declares. Empty string when every configured plugin loaded whole,
+ * which is the usual case and leaves the initialize payload untouched.
+ */
+function buildPluginWarningBlock(surfaces: SessionSurface[]): string {
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const surface of surfaces) {
+    for (const rec of surface.pluginRecords) {
+      if (rec.status === "active" && rec.degraded.length === 0) continue;
+      if (seen.has(rec.name)) continue;
+      seen.add(rec.name);
+      if (rec.status !== "active") {
+        lines.push(
+          `${rec.name}@${rec.version} did NOT load, so none of its actions exist: ${rec.statusReason ?? "unknown reason"}`,
+        );
+      } else {
+        lines.push(`${rec.name}@${rec.version} loaded with ${rec.degraded.length} part(s) dropped:`);
+        for (const d of rec.degraded) lines.push(`  - ${d}`);
+      }
+    }
+  }
+  if (lines.length === 0) return "";
+  lines.push("Run plugins(action=\"describe\", name=\"<plugin>\") for the full record.");
+  return lines.join("\n");
+}
+
 function toPluginInfo(rec: PluginRecord, project: ProjectContext): PluginInfo {
   const uePluginPresent = rec.uePluginDependency
     ? isUePluginEnabled(project, rec.uePluginDependency)
@@ -902,6 +938,7 @@ function toPluginInfo(rec: PluginRecord, project: ProjectContext): PluginInfo {
     actionPrefix: rec.actionPrefix,
     status: rec.status,
     statusReason: rec.statusReason,
+    degraded: rec.degraded,
     minServerVersion: rec.minServerVersion,
     uePluginDependency: rec.uePluginDependency,
     uePluginPresent,

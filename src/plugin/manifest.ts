@@ -9,8 +9,17 @@ import yaml from "js-yaml";
  * end user.
  */
 
+const ParamTypeSchema = z.enum(["string", "number", "boolean", "object", "array"]);
+
+export type ManifestParamType = z.infer<typeof ParamTypeSchema>;
+
 const SchemaFieldSchema = z.object({
-  type: z.enum(["string", "number", "boolean", "object", "array"]),
+  // Omitted means "any JSON value". Some handler params genuinely have no one
+  // type: a property write coerced through UE's ImportText takes a number, a
+  // bool, a string or an enum name with equal validity, and forcing the author
+  // to pick one of them would lie about the surface. A list of type names
+  // narrows that to a union when the author does know the alternatives.
+  type: z.union([ParamTypeSchema, z.array(ParamTypeSchema).nonempty()]).optional(),
   required: z.boolean().optional(),
   description: z.string().optional(),
 });
@@ -152,9 +161,89 @@ export function findManifestPath(pkgDir: string): string | null {
   return null;
 }
 
+/** One manifest subtree removed to keep the rest of the plugin loadable. */
+export interface DroppedUnit {
+  /** Dotted manifest path, e.g. `nativeModule.handlers.actor_set`. */
+  path: string;
+  /** The validation error that cost it, already rendered for a log line. */
+  reason: string;
+}
+
 export interface ManifestParseResult {
   manifest: PluginManifest;
   manifestPath: string;
+  /** Units dropped by salvage. Empty when the manifest validated as authored. */
+  dropped: DroppedUnit[];
+}
+
+/**
+ * The smallest manifest subtree a validation error can be confined to. An
+ * error inside one of these costs that unit and nothing else, so a single
+ * malformed handler no longer takes its whole category off the surface.
+ * Returns null for anything structural (actionPrefix, nativeModule.source,
+ * a manifest that is not an object at all), which still fails the plugin.
+ */
+function salvageableUnit(issuePath: ReadonlyArray<string | number>): Array<string | number> | null {
+  const p = issuePath;
+  if (p[0] === "nativeModule" && p[1] === "handlers" && p.length >= 3) return p.slice(0, 3);
+  if (p[0] === "inject" && p.length >= 3) return p.slice(0, 3);
+  if (p[0] === "inject" && p.length === 2) return p.slice(0, 2);
+  if (p[0] === "provides" && p[2] === "actions" && p.length >= 4) return p.slice(0, 4);
+  if (p[0] === "provides" && p.length >= 2) return p.slice(0, 2);
+  if (p[0] === "flows" && p.length >= 2) return p.slice(0, 2);
+  if (p[0] === "tasks" && p.length >= 2) return p.slice(0, 2);
+  if (p[0] === "knowledge" && p.length >= 2) return p.slice(0, 2);
+  return null;
+}
+
+/** Delete `path` from a nested plain object. No-op if the path is not there. */
+function deleteAt(root: unknown, path: Array<string | number>): void {
+  let cur: unknown = root;
+  for (const key of path.slice(0, -1)) {
+    if (typeof cur !== "object" || cur === null) return;
+    cur = (cur as Record<string | number, unknown>)[key];
+  }
+  if (typeof cur !== "object" || cur === null) return;
+  delete (cur as Record<string | number, unknown>)[path[path.length - 1]];
+}
+
+/**
+ * Validate a manifest, dropping individually-salvageable units rather than
+ * rejecting the whole plugin. Throws (with Zod's full issue dump, as before)
+ * when any error lands outside a droppable unit.
+ */
+export function parseManifest(raw: unknown): { manifest: PluginManifest; dropped: DroppedUnit[] } {
+  const dropped: DroppedUnit[] = [];
+  let current = raw;
+  // Each pass removes at least one unit, so the loop is bounded by the number
+  // of units in the manifest; the cap is a backstop against a pathological
+  // schema where pruning cannot make progress.
+  for (let pass = 0; pass < 100; pass++) {
+    const result = PluginManifestSchema.safeParse(current);
+    if (result.success) return { manifest: result.data, dropped };
+
+    // Keyed by the rendered path only for dedup; the pruning itself uses the
+    // segment array, since a segment (a task name, say) may contain a dot.
+    const units = new Map<string, { unit: Array<string | number>; reason: string }>();
+    for (const issue of result.error.issues) {
+      const unit = salvageableUnit(issue.path);
+      if (!unit) throw result.error;
+      const key = unit.join(".");
+      if (!units.has(key)) {
+        units.set(key, { unit, reason: `${issue.path.join(".")}: ${issue.message}` });
+      }
+    }
+    if (units.size === 0) throw result.error;
+
+    current = structuredClone(current);
+    for (const [key, { unit, reason }] of units) {
+      deleteAt(current, unit);
+      dropped.push({ path: key, reason });
+    }
+  }
+  // Unreachable in practice: pruning that never converges means the schema
+  // rejects the pruned shape too, which is a bug in the schema, not the input.
+  throw new Error("manifest validation did not converge after 100 salvage passes");
 }
 
 export function loadManifest(pkgDir: string): ManifestParseResult {
@@ -163,8 +252,8 @@ export function loadManifest(pkgDir: string): ManifestParseResult {
     throw new Error(`ue-mcp.plugin.yml not found in ${pkgDir}`);
   }
   const raw = yaml.load(fs.readFileSync(manifestPath, "utf-8")) as unknown;
-  const manifest = PluginManifestSchema.parse(raw);
-  return { manifest, manifestPath };
+  const { manifest, dropped } = parseManifest(raw);
+  return { manifest, manifestPath, dropped };
 }
 
 /**
@@ -177,19 +266,47 @@ export function compileSchemaFields(
   if (!fields) return {};
   const out: Record<string, z.ZodType> = {};
   for (const [key, def] of Object.entries(fields)) {
-    let zod: z.ZodType;
-    switch (def.type) {
-      case "string": zod = z.string(); break;
-      case "number": zod = z.number(); break;
-      case "boolean": zod = z.boolean(); break;
-      case "object": zod = z.record(z.unknown()); break;
-      case "array": zod = z.array(z.unknown()); break;
-    }
+    let zod = zodForDeclaredType(def.type, def.required === true);
     if (def.description) zod = zod.describe(def.description);
     if (!def.required) zod = zod.optional();
     out[key] = zod;
   }
   return out;
+}
+
+function zodForParamType(type: ManifestParamType): z.ZodType {
+  switch (type) {
+    case "string": return z.string();
+    case "number": return z.number();
+    case "boolean": return z.boolean();
+    case "object": return z.record(z.unknown());
+    case "array": return z.array(z.unknown());
+  }
+}
+
+/**
+ * Zod for one declared `type`, which is a single name, a list of names, or
+ * absent. Absent compiles to `z.any()`, which accepts undefined on its own, so
+ * a required untyped param carries a refinement that puts the presence check
+ * back: `.isOptional()` is what the SDK reads to build the JSON Schema
+ * `required` list.
+ */
+function zodForDeclaredType(
+  type: ManifestSchemaField["type"],
+  required: boolean,
+): z.ZodType {
+  if (type === undefined) {
+    return required
+      ? z.any().refine((v) => v !== undefined, { message: "Required" })
+      : z.any();
+  }
+  if (Array.isArray(type)) {
+    const members = type.map(zodForParamType);
+    return members.length === 1
+      ? members[0]
+      : z.union(members as [z.ZodType, z.ZodType, ...z.ZodType[]]);
+  }
+  return zodForParamType(type);
 }
 
 /**
