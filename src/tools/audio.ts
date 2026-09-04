@@ -3,6 +3,68 @@ import { categoryTool, bp, type ToolDef } from "../types.js";
 import { Vec3 } from "../schemas.js";
 
 /**
+ * Element schemas for the declarative graph-authoring arrays (#936).
+ *
+ * These were `z.array(z.any())`, which serialises to an array schema with no
+ * `items`. VS Code refuses to load any tool carrying one ("tool parameters
+ * array type must have items"), which took the whole audio category out of
+ * service there. Each shape below mirrors what the C++ handler actually reads,
+ * and every object stays open (`.passthrough()`) so a key the handler grew
+ * before the schema did still reaches the bridge.
+ */
+
+/** metasound_author: a graph input pin. */
+const MetaSoundGraphInput = z.object({
+  name: z.string().describe("Graph input name"),
+  dataType: z.string().describe("MetaSound data type: Float, Int32, Bool, String, Trigger, Audio, Time, ..."),
+  default: z.any().optional().describe("Literal default for the input"),
+}).passthrough();
+
+/** metasound_author: a graph output pin. */
+const MetaSoundGraphOutput = z.object({
+  name: z.string().describe("Graph output name"),
+  dataType: z.string().describe("MetaSound data type"),
+}).passthrough();
+
+/** metasound_author: one node, addressed by a caller-chosen local id. */
+const MetaSoundAuthorNode = z.object({
+  id: z.string().describe("Local id used by 'connections' to address this node"),
+  class: z.string().describe("MetaSound node class name, e.g. 'Sine'"),
+  namespace: z.string().optional().describe("Node class namespace (default 'UE')"),
+  variant: z.string().optional().describe("Node class variant"),
+  majorVersion: z.number().optional().describe("Node class major version (default 1)"),
+  inputs: z.record(z.any()).optional().describe("Per-node input defaults, keyed by input name"),
+}).passthrough();
+
+/** cue_author: one SoundCue node, addressed by a caller-chosen local id. */
+const SoundCueAuthorNode = z.object({
+  id: z.string().describe("Local id used by 'connections' to address this node"),
+  type: z.string().describe("SoundCue node type: wave_player, mixer, random, modulator, ..."),
+  soundWavePath: z.string().optional().describe("wave_player: SoundWave asset to play"),
+}).passthrough();
+
+/** metasound_author: 'from'/'to' endpoints, each 'nodeId.pin', 'input.Name', 'output.Name' or 'audioOut.N'. */
+const MetaSoundAuthorConnection = z.object({
+  from: z.string().describe("Source endpoint: 'nodeId.OutputPin' or 'input.GraphInputName'"),
+  to: z.string().describe("Destination endpoint: 'nodeId.InputPin', 'output.GraphOutputName' or 'audioOut.0'"),
+}).passthrough();
+
+/** cue_author: parent/child wiring, an omitted or 'root' parent meaning the cue root. */
+const SoundCueAuthorConnection = z.object({
+  child: z.string().describe("Local id of the child node"),
+  parent: z.string().optional().describe("Local id of the parent node; omitted or 'root' wires the cue root"),
+  index: z.number().optional().describe("Child slot on the parent (default: append)"),
+}).passthrough();
+
+/** create_sound_mix: one per-SoundClass adjustment. */
+const SoundClassAdjuster = z.object({
+  soundClassPath: z.string().describe("SoundClass asset the adjustment applies to"),
+  volumeAdjuster: z.number().optional().describe("Volume multiplier (default 1)"),
+  pitchAdjuster: z.number().optional().describe("Pitch multiplier (default 1)"),
+  applyToChildren: z.boolean().optional().describe("Apply to child sound classes (default false)"),
+}).passthrough();
+
+/**
  * Audio: the full UE5 audio stack, authored end-to-end through the bridge.
  *
  *  - Assets + playback (import, cue/metasound creation, play, ambient).
@@ -117,10 +179,10 @@ export const audioTool: ToolDef = categoryTool(
     inputName: z.string().optional(),
 
     // one-shot declarative graph authoring (metasound_author / cue_author)
-    inputs: z.array(z.any()).optional().describe("metasound_author: [{name,dataType,default?}]"),
-    outputs: z.array(z.any()).optional().describe("metasound_author: [{name,dataType}]"),
-    nodes: z.array(z.any()).optional().describe("author: node specs"),
-    connections: z.array(z.any()).optional().describe("author: connection specs"),
+    inputs: z.array(MetaSoundGraphInput).optional().describe("metasound_author: [{name,dataType,default?}]"),
+    outputs: z.array(MetaSoundGraphOutput).optional().describe("metasound_author: [{name,dataType}]"),
+    nodes: z.array(z.union([MetaSoundAuthorNode, SoundCueAuthorNode])).optional().describe("author: node specs. metasound_author: [{id,class,namespace?,variant?,majorVersion?,inputs?}]. cue_author: [{id,type,soundWavePath?,...props}]"),
+    connections: z.array(z.union([MetaSoundAuthorConnection, SoundCueAuthorConnection])).optional().describe("author: connection specs. metasound_author: [{from,to}]. cue_author: [{child,parent?,index?}]"),
     root: z.string().optional().describe("cue_author: explicit root nodeId"),
 
     // soundcue graph
@@ -139,7 +201,7 @@ export const audioTool: ToolDef = categoryTool(
     submixPath: z.string().optional(),
     effectType: z.string().optional(),
     settings: z.record(z.any()).optional(),
-    adjusters: z.array(z.any()).optional(),
+    adjusters: z.array(SoundClassAdjuster).optional().describe("create_sound_mix: [{soundClassPath,volumeAdjuster?,pitchAdjuster?,applyToChildren?}]"),
     fadeInTime: z.number().optional(),
     fadeOutTime: z.number().optional(),
     maxCount: z.number().optional(),

@@ -21,7 +21,7 @@ Each handler accepts a parameter identifying the entity it operates on. Examples
 
 | Entity | Natural key param |
 |---|---|
-| Actor | `actorLabel` (or `label` shorthand on creates) |
+| Actor | `actorPath`, or `actorLabel` (or `label` shorthand on creates) |
 | Asset (material, texture, mesh, datatable…) | `assetPath` or `path` |
 | Blueprint variable | `blueprintPath` + `variableName` |
 | Blueprint function | `blueprintPath` + `functionName` |
@@ -29,6 +29,48 @@ Each handler accepts a parameter identifying the entity it operates on. Examples
 | Material parameter | `materialPath` + `parameterName` |
 
 Handlers without a natural key (e.g., `execute_command`, `shell`) **cannot** be idempotent or reversible - document them as such, do not emit rollback records.
+
+#### Selecting an actor
+
+Editor labels are **not unique**. A copy-pasted Blueprint gives every copy the
+same label, so a lookup that answers with the first actor the level iterator
+reached is a coin flip decided by streaming order. That is how a write aimed at
+one road landed on a road at the other end of the map and reported success
+(#983).
+
+Every actor-targeting handler therefore resolves its target through
+`MCPResolveActor` in `Public/HandlerUtils.h`, and never through a loop of its
+own:
+
+```cpp
+FString ActorLabel;
+if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
+
+REQUIRE_EDITOR_WORLD(World);
+
+TSharedPtr<FJsonValue> ActorErr;
+AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+if (!Actor) return ActorErr;
+ActorLabel = Actor->GetActorLabel();
+```
+
+The rules the resolver enforces, so no handler restates them:
+
+- `actorPath` is the unambiguous selector and wins whenever it is given. A path
+  that names nothing is an error about the path, not a quiet fall-through to
+  the label.
+- A label matching more than one actor is refused with a structured error:
+  `ambiguous: true`, `matchCount`, and a `candidates[]` array carrying each
+  actor's `actorPath`, label, class, folder and location. There is no override
+  that picks one anyway.
+- An action whose answer is genuinely plural (an ignore list, a selection, a
+  batch) uses `MCPCollectActorsByToken` and acts on **every** match instead.
+- An action naming its actor something else passes an `FMCPActorSelector`; the
+  convention is that the path key is the label key with "Label" swapped for
+  "Path" (`childLabel` / `childPath`).
+
+Every handler that returns an actor also returns its `actorPath`, so the round
+trip from a read into the next write is a copy of one field.
 
 ### `onConflict` - creates only
 

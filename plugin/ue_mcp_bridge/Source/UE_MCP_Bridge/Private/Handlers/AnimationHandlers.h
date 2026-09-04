@@ -96,6 +96,8 @@ private:
 	// IK Rig (#93)
 	static TSharedPtr<FJsonValue> CreateIKRig(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadIKRig(const TSharedPtr<FJsonObject>& Params);
+	// UE 5.8 full-body IK definition authoring over an existing IK Rig.
+	static TSharedPtr<FJsonValue> ConfigureIKRig(const TSharedPtr<FJsonObject>& Params);
 
 	// Control Rig (#11)
 	static TSharedPtr<FJsonValue> ListControlRigVariables(const TSharedPtr<FJsonObject>& Params);
@@ -103,6 +105,14 @@ private:
 	static TSharedPtr<FJsonValue> ReadControlRigGraph(const TSharedPtr<FJsonObject>& Params);
 	// #619 per-element Control Rig hierarchy metadata (name, type, index, parent)
 	static TSharedPtr<FJsonValue> ReadControlRigHierarchy(const TSharedPtr<FJsonObject>& Params);
+
+	// UE 5.8 Control Rig editing in Sequencer. Source AnimSequences are read-only;
+	// edits live in a LevelSequence until explicitly baked to a new AnimSequence.
+	static TSharedPtr<FJsonValue> BeginControlRigEdit(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReadControlRigEdit(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ApplyControlRigEdits(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> BakeControlRigEdit(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AnalyzeAnimation(const TSharedPtr<FJsonObject>& Params);
 
 	// v0.7.11 - depth
 	static TSharedPtr<FJsonValue> SetRootMotionSettings(const TSharedPtr<FJsonObject>& Params);
@@ -114,6 +124,8 @@ private:
 	// v0.7.11 - issue fixes
 	static TSharedPtr<FJsonValue> CreateIKRetargeter(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadIKRetargeter(const TSharedPtr<FJsonObject>& Params);
+	// UE 5.8 retarget op, chain-map, preview-mesh and retarget-pose authoring.
+	static TSharedPtr<FJsonValue> ConfigureIKRetargeter(const TSharedPtr<FJsonObject>& Params);
 	// #701/#703: IK rig/retargeter authoring tail + batch retarget bake.
 	static TSharedPtr<FJsonValue> SetIKRigMesh(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetIKRetargeterRig(const TSharedPtr<FJsonObject>& Params);
@@ -164,4 +176,17 @@ private:
 	static TSharedPtr<FJsonValue> ListBones(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RebindLeaderPose(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> PreviewAnimation(const TSharedPtr<FJsonObject>& Params);
+
+	// #922/#926 - the evaluated pose off a live SkeletalMeshComponent, for a set
+	// of bones at once. Lives in AnimationHandlers_SkeletalLive.cpp.
+	static TSharedPtr<FJsonValue> GetLiveBoneTransforms(const TSharedPtr<FJsonObject>& Params);
+
+	// #923/#926/#922 - evaluated pose reads off an asset. Live in
+	// AnimationHandlers_Pose.cpp.
+	// Evaluate an AnimSequence (or a BlendSpace at a blend position) at given
+	// frames or times and return composed transforms.
+	static TSharedPtr<FJsonValue> SamplePose(const TSharedPtr<FJsonObject>& Params);
+	// Planted-foot speed of a clip, which every retarget changes by the target
+	// skeleton's leg-length ratio and so has to be re-measured per clip.
+	static TSharedPtr<FJsonValue> MeasureNaturalSpeed(const TSharedPtr<FJsonObject>& Params);
 };

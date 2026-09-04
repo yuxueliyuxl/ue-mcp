@@ -199,7 +199,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateRenderTarget2D(const TSharedPtr<FJs
 	// Probe first so the idempotent hit can report the settings of the asset
 	// that is already on disk instead of the lean "existed" record.
 	const FString ObjectPath = PackageName + TEXT(".") + Name;
-	if (UObject* ExistingObject = LoadObject<UObject>(nullptr, *ObjectPath))
+	if (UObject* ExistingObject = MCPLoadAssetObject(ObjectPath))
 	{
 		if (OnConflict == TEXT("error"))
 		{

@@ -3,10 +3,16 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerJsonProperty.h"
+#include "JsonSerializer.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "BlueprintEditorLibrary.h"
 #include "Engine/Blueprint.h"
+#include "Engine/BlueprintGeneratedClass.h"
+// #942: World -> level script Blueprint resolution.
+#include "Engine/World.h"
+#include "Engine/Level.h"
+#include "Engine/LevelScriptBlueprint.h"
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
 #include "K2Node.h"
@@ -17,6 +23,7 @@
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UObjectHash.h"
 #include "UObject/UnrealType.h"
 #include "UObject/Package.h"
 #include "Misc/PackageName.h"
@@ -25,6 +32,7 @@
 #include "UObject/TopLevelAssetPath.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
+#include "PackageTools.h"
 #include "Factories/BlueprintFactory.h"
 #include "EdGraph/EdGraph.h"
 #include "K2Node_CallFunction.h"
@@ -35,6 +43,7 @@
 #include "K2Node_EditablePinBase.h"
 #include "K2Node_IfThenElse.h"
 #include "K2Node_MacroInstance.h"
+#include "K2Node_AddComponent.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_VariableSet.h"
@@ -69,6 +78,10 @@
 void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 {
 	constexpr float ReadBlueprintGraphTimeoutSeconds = 180.0f;
+	// #945: a first sweep on a cold project pays for every package load the
+	// registry could not rule out, which the default request timeout does not
+	// come close to covering.
+	constexpr float SearchCallSitesTimeoutSeconds = 600.0f;
 
 	Registry.RegisterHandler(TEXT("create_blueprint"), &CreateBlueprint);
 	Registry.RegisterHandler(TEXT("read_blueprint"), &ReadBlueprint);
@@ -107,6 +120,7 @@ void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("delete_variable"), &DeleteVariable);
 	Registry.RegisterHandler(TEXT("add_function_parameter"), &AddFunctionParameter);
 	Registry.RegisterHandler(TEXT("set_variable_default"), &SetVariableDefault);
+	Registry.RegisterHandler(TEXT("get_blueprint_variable_default"), &GetVariableDefault);
 
 	// v0.7.8 stubs
 	Registry.RegisterHandler(TEXT("read_blueprint_graph_summary"), &ReadBlueprintGraphSummary);
@@ -125,6 +139,7 @@ void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("reparent_component"), &ReparentComponent);
 	Registry.RegisterHandler(TEXT("reparent_blueprint"), &ReparentBlueprint);
 	Registry.RegisterHandler(TEXT("flush_inheritable_component_handler"), &FlushInheritableComponentHandler);
+	Registry.RegisterHandler(TEXT("flush_blueprint_component_templates"), &FlushComponentTemplates);
 	Registry.RegisterHandler(TEXT("set_actor_tick_settings"), &SetActorTickSettings);
 
 	// v0.7.12 - issue #128 - single-property read (inherited-aware)
@@ -147,6 +162,9 @@ void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("connect_pins_batch"), &ConnectPinsBatch);
 	Registry.RegisterHandler(TEXT("set_node_position"), &SetNodePosition);
 	Registry.RegisterHandler(TEXT("auto_layout_graph"), &AutoLayoutGraph);
+
+	// #945: project-wide call-site audit (BlueprintHandlers_Search.cpp).
+	Registry.RegisterHandlerWithTimeout(TEXT("search_blueprint_call_sites"), &SearchCallSites, SearchCallSitesTimeoutSeconds);
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +184,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprintGraphSummary(const TShar
 	const bool bFiltering = !TitleFilter.IsEmpty() || !ClassFilter.IsEmpty();
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	if (!Blueprint) return BlueprintNotFoundError(AssetPath);
 
 	UEdGraph* Graph = FindGraph(Blueprint, GraphName);
 	if (!Graph) return MCPError(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
@@ -214,6 +232,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprintGraphSummary(const TShar
 
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
 	Result->SetStringField(TEXT("path"), AssetPath);
+	AnnotateResolvedBlueprint(Result, Blueprint);
 	Result->SetStringField(TEXT("graphName"), GraphName);
 	// #298: identify graph type so callers can tell ubergraph / construction
 	// script / function / macro apart without having to grep node titles.
@@ -254,7 +273,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::GetBlueprintExecutionFlow(const TShar
 	FString EntryPoint = OptionalString(Params, TEXT("entryPoint"), TEXT(""));
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	if (!Blueprint) return BlueprintNotFoundError(AssetPath);
 
 	UEdGraph* Graph = FindGraph(Blueprint, GraphName);
 	if (!Graph) return MCPError(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
@@ -336,6 +355,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::GetBlueprintExecutionFlow(const TShar
 
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
 	Result->SetStringField(TEXT("path"), AssetPath);
+	AnnotateResolvedBlueprint(Result, Blueprint);
 	Result->SetStringField(TEXT("graphName"), GraphName);
 	Result->SetStringField(TEXT("entryPoint"), Entry->GetNodeTitle(ENodeTitleType::ListView).ToString());
 	Result->SetStringField(TEXT("entryId"), Entry->NodeGuid.ToString(EGuidFormats::Short));
@@ -351,7 +371,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::GetBlueprintDependencies(const TShare
 	const bool bReverse = OptionalBool(Params, TEXT("reverse"), false);
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	if (!Blueprint) return BlueprintNotFoundError(AssetPath);
 
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 	IAssetRegistry& Registry = AssetRegistryModule.Get();
@@ -433,9 +453,52 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::GetBlueprintDependencies(const TShare
 	return MCPResult(Result);
 }
 
+namespace
+{
+	// #942: resolve a World/umap path to the level script Blueprint that lives
+	// inside it. The level script is a subobject of the persistent level, never
+	// an asset of its own, so loading a UBlueprint from "/Game/Maps/SomeLevel"
+	// can never find it however the path is spelled.
+	//
+	// bDontCreate is deliberate. A map that has never had a Level Blueprint
+	// opened has no level script object, and a READ must not author one as a
+	// side effect: it would dirty the map package and write a new subobject
+	// into somebody's level for asking a question about it.
+	ULevelScriptBlueprint* ResolveLevelScriptBlueprint(const FString& AssetPath)
+	{
+		UWorld* World = LoadAssetByPath<UWorld>(AssetPath);
+		if (!World || !World->PersistentLevel) return nullptr;
+		return World->PersistentLevel->GetLevelScriptBlueprint(/*bDontCreate=*/true);
+	}
+}
+
 UBlueprint* FBlueprintHandlers::LoadBlueprint(const FString& AssetPath)
 {
-	return LoadAssetByPath<UBlueprint>(AssetPath);
+	if (UBlueprint* Direct = LoadAssetByPath<UBlueprint>(AssetPath))
+	{
+		return Direct;
+	}
+	// #942: one resolution point, so every action that reaches a Blueprint
+	// through this function accepts a umap path on exactly the same terms.
+	return ResolveLevelScriptBlueprint(AssetPath);
+}
+
+TSharedPtr<FJsonValue> BlueprintNotFoundError(const FString& AssetPath)
+{
+	if (UWorld* World = LoadAssetByPath<UWorld>(AssetPath))
+	{
+		return MCPError(FString::Printf(
+			TEXT("'%s' is a World, and its level script Blueprint does not exist yet, so there is nothing to read. Open the map's Level Blueprint in the editor once (that creates it), then retry this call with the same path. When it exists it resolves to %s:PersistentLevel.%s"),
+			*AssetPath, *World->GetPathName(), *World->GetName()));
+	}
+	return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+}
+
+void AnnotateResolvedBlueprint(const TSharedPtr<FJsonObject>& Result, UBlueprint* Blueprint)
+{
+	if (!Result.IsValid() || !Blueprint) return;
+	Result->SetStringField(TEXT("blueprintPath"), Blueprint->GetPathName());
+	Result->SetBoolField(TEXT("isLevelScript"), Blueprint->IsA<ULevelScriptBlueprint>());
 }
 
 // ---------------------------------------------------------------------------
@@ -451,9 +514,9 @@ namespace
 		const FString Name = Graph->GetName();
 		const int32 DuplicateIndex = SeenCounts.FindOrAdd(Name)++;
 		const int32 DuplicateCount = NameCounts.FindRef(Name);
-		const FString Selector = DuplicateCount > 1
-			? FString::Printf(TEXT("%s[%d]"), *Name, DuplicateIndex)
-			: Name;
+		// #945: one selector rule, shared with search_call_sites so the two
+		// cannot disagree about how to address the same graph.
+		const FString Selector = MakeGraphSelector(Name, DuplicateIndex, DuplicateCount);
 
 		TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
 		GraphObj->SetStringField(TEXT("name"), Name);
@@ -465,17 +528,6 @@ namespace
 		GraphObj->SetNumberField(TEXT("duplicateCount"), DuplicateCount);
 		return GraphObj;
 	}
-
-	void CountGraphNames(const TArray<UEdGraph*>& Graphs, TMap<FString, int32>& OutNameCounts)
-	{
-		for (UEdGraph* Graph : Graphs)
-		{
-			if (Graph)
-			{
-				++OutNameCounts.FindOrAdd(Graph->GetName());
-			}
-		}
-	}
 }
 
 TSharedPtr<FJsonValue> FBlueprintHandlers::ListGraphs(const TSharedPtr<FJsonObject>& Params)
@@ -486,7 +538,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ListGraphs(const TSharedPtr<FJsonObje
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	TArray<UEdGraph*> AllGraphs;
@@ -505,6 +557,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ListGraphs(const TSharedPtr<FJsonObje
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("path"), AssetPath);
+	AnnotateResolvedBlueprint(Result, Blueprint);
 	Result->SetArrayField(TEXT("graphs"), GraphsArray);
 
 	return MCPResult(Result);
@@ -527,7 +580,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ResolveGraph(const TSharedPtr<FJsonOb
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	TArray<UEdGraph*> AllGraphs;
@@ -588,6 +641,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ResolveGraph(const TSharedPtr<FJsonOb
 
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
 	Result->SetStringField(TEXT("path"), AssetPath);
+	AnnotateResolvedBlueprint(Result, Blueprint);
 	Result->SetStringField(TEXT("requestedGraphName"), RequestedName);
 	Result->SetNumberField(TEXT("matchCount"), MatchArray.Num());
 	Result->SetBoolField(TEXT("ambiguous"), MatchArray.Num() > 1);
@@ -1122,7 +1176,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	// #353/#370: per-component property dump on demand. Off by default so the
@@ -1153,6 +1207,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("path"), AssetPath);
+	AnnotateResolvedBlueprint(Result, Blueprint);
 	Result->SetStringField(TEXT("className"), Blueprint->GetName());
 	if (Blueprint->ParentClass)
 	{
@@ -1331,7 +1386,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::AddVariable(const TSharedPtr<FJsonObj
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	// Idempotency: if the variable already exists on the blueprint, short-circuit.
@@ -1399,7 +1454,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::AddComponent(const TSharedPtr<FJsonOb
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	// Idempotency: existing SCS component with same name short-circuits.
@@ -1562,7 +1617,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::CompileBlueprint(const TSharedPtr<FJs
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	// #703: capture the compiler log and report real status instead of always
@@ -1943,15 +1998,217 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ListNodeTypes(const TSharedPtr<FJsonO
 	return MCPResult(Result);
 }
 
+// ---------------------------------------------------------------------------
+// #902 / #931: resolved variable defaults, and whether they are on disk.
+//
+// list_variables could confirm a variable existed but nothing returned the
+// value the generated class actually resolved to, so a write-compile-readback
+// loop was impossible natively and callers dropped to Python for
+// get_default_object(bp.generated_class()).get_editor_property(name).
+//
+// The value lives on the CDO, not on FBPVariableDescription::DefaultValue. The
+// engine documents that string as an "optional new default value", and it is
+// empty for most variables, so reading it answers a different question than
+// the one being asked. Anything that reads it instead reports an empty default
+// for a variable that plainly has one.
+//
+// Persistence is reported separately, and that separation is the point (#931).
+// A write that sets a CDO property and marks the package dirty without saving
+// it reads back correctly for the rest of the session and is gone on the next
+// editor start. UPackage::IsDirty is the engine's own record of exactly that
+// state, so `persisted` is false while the package holds unsaved changes: the
+// readback distinguishes "this value is on disk" from "this value is in this
+// process", instead of echoing the write back at the caller either way.
+// ---------------------------------------------------------------------------
+namespace
+{
+	struct FResolvedVariableDefault
+	{
+		FProperty* Property = nullptr;
+		const void* ValueAddress = nullptr;
+		FString ValueText;
+		TSharedPtr<FJsonValue> Value;
+		FString DeclaringClass;
+		FString DeclaringClassPath;
+		bool bInherited = false;
+	};
+
+	// Resolve one variable's compiled default off the Blueprint's generated
+	// class CDO. Returns false with a caller-facing reason on any miss.
+	bool ResolveVariableDefault(
+		UBlueprint* Blueprint,
+		const FString& VarName,
+		FResolvedVariableDefault& Out,
+		FString& OutError)
+	{
+		if (!Blueprint)
+		{
+			OutError = TEXT("No Blueprint to resolve a variable default from");
+			return false;
+		}
+
+		UClass* GeneratedClass = Blueprint->GeneratedClass.Get();
+		if (!GeneratedClass)
+		{
+			OutError = FString::Printf(
+				TEXT("Blueprint '%s' has no generated class, so it has no resolved defaults yet. Compile it first (blueprint compile)."),
+				*Blueprint->GetName());
+			return false;
+		}
+
+		UObject* CDO = GeneratedClass->GetDefaultObject();
+		if (!CDO)
+		{
+			OutError = FString::Printf(
+				TEXT("Generated class '%s' has no class default object"), *GeneratedClass->GetName());
+			return false;
+		}
+
+		FProperty* Prop = GeneratedClass->FindPropertyByName(FName(*VarName));
+		if (!Prop)
+		{
+			// Name the variables that DO resolve, so a caller that has just
+			// added one can see whether the compile carried it through.
+			TArray<FString> Available;
+			for (TFieldIterator<FProperty> It(GeneratedClass); It && Available.Num() < 60; ++It)
+			{
+				if (*It) Available.Add((*It)->GetName());
+			}
+			OutError = FString::Printf(
+				TEXT("Variable '%s' has no property on generated class '%s'. If it was just added, compile the Blueprint. Resolved properties: [%s]"),
+				*VarName, *GeneratedClass->GetName(), *FString::Join(Available, TEXT(", ")));
+			return false;
+		}
+
+		Out.Property = Prop;
+		Out.ValueAddress = Prop->ContainerPtrToValuePtr<void>(CDO);
+		Prop->ExportText_Direct(Out.ValueText, Out.ValueAddress, Out.ValueAddress, CDO, PPF_None);
+		Out.Value = FMCPJsonSerializer::SerializeValue(Out.ValueAddress, Prop);
+
+		if (UClass* Owner = Prop->GetOwnerClass())
+		{
+			Out.DeclaringClass = Owner->GetName();
+			Out.DeclaringClassPath = Owner->GetPathName();
+			Out.bInherited = Owner != GeneratedClass;
+		}
+		return true;
+	}
+
+	// Write the resolved value onto a JSON object. Shared so list_variables and
+	// get_variable_default cannot report the same value under different names.
+	void WriteResolvedVariableDefault(const TSharedPtr<FJsonObject>& Obj, const FResolvedVariableDefault& Resolved)
+	{
+		if (!Obj.IsValid() || !Resolved.Property) return;
+		Obj->SetField(TEXT("value"), Resolved.Value.IsValid() ? Resolved.Value : MakeShared<FJsonValueNull>());
+		Obj->SetStringField(TEXT("valueText"), Resolved.ValueText);
+		Obj->SetStringField(TEXT("cppType"), Resolved.Property->GetCPPType());
+		if (!Resolved.DeclaringClass.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("declaringClass"), Resolved.DeclaringClass);
+			Obj->SetStringField(TEXT("declaringClassPath"), Resolved.DeclaringClassPath);
+		}
+		Obj->SetBoolField(TEXT("inherited"), Resolved.bInherited);
+	}
+
+	// #931: state whether what was just read is on disk. The package's own
+	// dirty flag is the answer: it is set by every write that reaches the
+	// object and cleared by a successful save, so a value that reads back
+	// correctly out of a dirty package has not been persisted and will be gone
+	// after a restart.
+	void WriteDefaultPersistence(const TSharedPtr<FJsonObject>& Obj, UBlueprint* Blueprint)
+	{
+		if (!Obj.IsValid() || !Blueprint) return;
+		UPackage* Package = Blueprint->GetOutermost();
+		const bool bDirty = Package && Package->IsDirty();
+		if (Package)
+		{
+			Obj->SetStringField(TEXT("packageName"), Package->GetName());
+		}
+		Obj->SetBoolField(TEXT("packageDirty"), bDirty);
+		Obj->SetBoolField(TEXT("persisted"), !bDirty);
+		if (bDirty)
+		{
+			Obj->SetStringField(TEXT("persistenceNote"),
+				TEXT("This value is live in the editor but its package has unsaved changes, so it is not on disk and will revert on the next editor start. Save the Blueprint (blueprint compile_all with save, or asset save) and read again to confirm it persisted."));
+		}
+	}
+}
+
+TSharedPtr<FJsonValue> FBlueprintHandlers::GetVariableDefault(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
+
+	FString VarName;
+	if (auto Err = RequireString(Params, TEXT("name"), VarName)) return Err;
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return BlueprintNotFoundError(AssetPath);
+	}
+
+	FResolvedVariableDefault Resolved;
+	FString ResolveError;
+	if (!ResolveVariableDefault(Blueprint, VarName, Resolved, ResolveError))
+	{
+		return MCPError(ResolveError);
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("path"), AssetPath);
+	AnnotateResolvedBlueprint(Result, Blueprint);
+	Result->SetStringField(TEXT("name"), VarName);
+	WriteResolvedVariableDefault(Result, Resolved);
+	WriteDefaultPersistence(Result, Blueprint);
+
+	// The authored string, when there is one, is reported alongside rather than
+	// instead of the resolved value. It is advisory: the engine treats it as an
+	// optional override, so an empty one is normal and says nothing. A non-empty
+	// one that disagrees with the CDO means the next recompile can move the
+	// value, which is worth seeing in a verification loop.
+	for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+	{
+		if (Var.VarName.ToString() != VarName) continue;
+		Result->SetBoolField(TEXT("declaredOnThisBlueprint"), true);
+		if (Var.DefaultValue.IsEmpty()) break;
+
+		Result->SetStringField(TEXT("authoredDefault"), Var.DefaultValue);
+		FDefaultConstructedPropertyElement Authored(Resolved.Property);
+		// No owning object on purpose: this is a read, and an owner is what
+		// lets the importer construct instanced subobjects under the real
+		// asset. A question about a value must not touch it.
+		const bool bParsed = FBlueprintEditorUtils::PropertyValueFromString_Direct(
+			Resolved.Property,
+			Var.DefaultValue,
+			static_cast<uint8*>(Authored.GetObjAddress()),
+			/*OwningObject=*/nullptr);
+		if (bParsed)
+		{
+			Result->SetBoolField(TEXT("matchesAuthoredDefault"),
+				Resolved.Property->Identical(Resolved.ValueAddress, Authored.GetObjAddress(), PPF_None));
+		}
+		break;
+	}
+
+	return MCPResult(Result);
+}
+
 TSharedPtr<FJsonValue> FBlueprintHandlers::ListBlueprintVariables(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
 
+	// #902: resolved values are opt-in. They cost a CDO property read and a
+	// JSON serialization per variable, and every existing caller of this action
+	// wants the declaration list, so the default payload is unchanged and a
+	// verification loop asks for the values it needs.
+	const bool bIncludeValues = OptionalBool(Params, TEXT("includeValues"), false);
+
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	TArray<TSharedPtr<FJsonValue>> Variables;
@@ -2014,13 +2271,37 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ListBlueprintVariables(const TSharedP
 			(Var.HasMetaData(FBlueprintMetadata::MD_ExposeOnSpawn) &&
 			 Var.GetMetaData(FBlueprintMetadata::MD_ExposeOnSpawn).ToBool()));
 
+		if (bIncludeValues)
+		{
+			FResolvedVariableDefault Resolved;
+			FString ResolveError;
+			if (ResolveVariableDefault(Blueprint, Var.VarName.ToString(), Resolved, ResolveError))
+			{
+				WriteResolvedVariableDefault(VarObj, Resolved);
+			}
+			else
+			{
+				// A variable that has no compiled property is a real state
+				// (added but not compiled yet), so say so per variable rather
+				// than failing the whole listing.
+				VarObj->SetStringField(TEXT("valueError"), ResolveError);
+			}
+		}
+
 		Variables.Add(MakeShared<FJsonValueObject>(VarObj));
 	}
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("path"), AssetPath);
+	AnnotateResolvedBlueprint(Result, Blueprint);
 	Result->SetArrayField(TEXT("variables"), Variables);
 	Result->SetNumberField(TEXT("count"), Variables.Num());
+	if (bIncludeValues)
+	{
+		// Persistence is a property of the package, not of any one variable, so
+		// it is stated once for the whole listing.
+		WriteDefaultPersistence(Result, Blueprint);
+	}
 	return MCPResult(Result);
 }
 TSharedPtr<FJsonValue> FBlueprintHandlers::RemoveComponent(const TSharedPtr<FJsonObject>& Params)
@@ -2034,7 +2315,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::RemoveComponent(const TSharedPtr<FJso
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
@@ -2129,7 +2410,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::DeleteVariable(const TSharedPtr<FJson
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	bool bFound = false;
@@ -2210,7 +2491,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::AddLocalVariable(const TSharedPtr<FJs
 	FString TypeStr = OptionalString(Params, TEXT("varType"), TEXT("bool"));
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	if (!Blueprint) return BlueprintNotFoundError(AssetPath);
 
 	// Find the function graph and its FunctionEntry node.
 	UEdGraph* FuncGraph = nullptr;
@@ -2276,7 +2557,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ListLocalVariables(const TSharedPtr<F
 	if (auto Err = RequireString(Params, TEXT("functionName"), FunctionName)) return Err;
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	if (!Blueprint) return BlueprintNotFoundError(AssetPath);
 
 	UEdGraph* FuncGraph = nullptr;
 	for (UEdGraph* G : Blueprint->FunctionGraphs)
@@ -2317,7 +2598,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ValidateBlueprint(const TSharedPtr<FJ
 	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	if (!Blueprint) return BlueprintNotFoundError(AssetPath);
 
 	// Run compile without saving; collect diagnostics from the compiler result log.
 	FCompilerResultsLog Log;
@@ -2353,6 +2634,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReparentComponent(const TSharedPtr<FJ
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint) return MCPError(TEXT("Blueprint not found"));
+	if (auto Blocked = MCPAssetWriteBlockedError(Blueprint, AssetPath, TEXT("reparent this component"))) return Blocked;
 	USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
 	if (!SCS) return MCPError(TEXT("Blueprint has no SCS"));
 
@@ -2370,12 +2652,15 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReparentComponent(const TSharedPtr<FJ
 	Parent->AddChildNode(Child);
 
 	FKismetEditorUtilities::CompileBlueprint(Blueprint);
-	SaveAssetPackage(Blueprint);
+
+	FString SaveReason;
+	const bool bSaved = SaveAssetPackageChecked(Blueprint, SaveReason);
 
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("componentName"), ComponentName);
 	Result->SetStringField(TEXT("newParent"), NewParent);
+	MCPNoteSaveOutcome(Result, AssetPath, bSaved, SaveReason);
 	return MCPResult(Result);
 }
 
@@ -2390,7 +2675,16 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReparentBlueprint(const TSharedPtr<FJ
 	if (auto Err = RequireString(Params, TEXT("parentClass"), ParentClassName)) return Err;
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	if (!Blueprint) return BlueprintNotFoundError(AssetPath);
+
+	// #932: reparenting reparents, recompiles AND saves, and the save is not
+	// optional. A .uasset that was never checked out of source control is
+	// read-only on disk, and asking the engine to write it turned the failed
+	// save into a FATAL error that took the whole editor process down. The
+	// asset itself was fine and the call replayed cleanly after a checkout, so
+	// the only thing missing was this question, asked before the Blueprint is
+	// touched rather than after it has already been reparented and recompiled.
+	if (auto Blocked = MCPAssetWriteBlockedError(Blueprint, AssetPath, TEXT("reparent this Blueprint"))) return Blocked;
 
 	// Resolve parent class: full path > short name > engine-module implicit.
 	UClass* NewParent = nullptr;
@@ -2436,7 +2730,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReparentBlueprint(const TSharedPtr<FJ
 	UBlueprintEditorLibrary::ReparentBlueprint(Blueprint, NewParent);
 	FKismetEditorUtilities::CompileBlueprint(Blueprint);
 
-	SaveAssetPackage(Blueprint);
+	FString SaveReason;
+	const bool bSaved = SaveAssetPackageChecked(Blueprint, SaveReason);
 
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
@@ -2446,6 +2741,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReparentBlueprint(const TSharedPtr<FJ
 	{
 		Result->SetStringField(TEXT("previousParent"), OldParent->GetPathName());
 	}
+	MCPNoteSaveOutcome(Result, AssetPath, bSaved, SaveReason);
 	return MCPResult(Result);
 }
 
@@ -2459,7 +2755,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::FlushInheritableComponentHandler(cons
 	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	if (!Blueprint) return BlueprintNotFoundError(AssetPath);
 
 	UInheritableComponentHandler* ICH = Blueprint->GetInheritableComponentHandler(/*bCreateIfNecessary=*/false);
 	if (!ICH)
@@ -2505,7 +2801,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::FlushInheritableComponentHandler(cons
 	return MCPResult(Result);
 }
 
-TSharedPtr<FJsonValue> FBlueprintHandlers::RunConstructionScript(const TSharedPtr<FJsonObject>& Params)
+TSharedPtr<FJsonValue> FBlueprintHandlers::FlushComponentTemplates(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
@@ -2514,6 +2810,157 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::RunConstructionScript(const TSharedPt
 	if (!Blueprint)
 	{
 		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	TArray<UK2Node_AddComponent*> ComponentNodes;
+	FBlueprintEditorUtils::GetAllNodesOfClass(Blueprint, ComponentNodes);
+
+	TArray<UActorComponent*> ReferencedTemplates;
+	bool bNeedsUpdate = false;
+	for (UK2Node_AddComponent* ComponentNode : ComponentNodes)
+	{
+		UActorComponent* Template = ComponentNode ? ComponentNode->GetTemplateFromNode() : nullptr;
+		if (!Template)
+		{
+			continue;
+		}
+		if (ReferencedTemplates.Contains(Template))
+		{
+			bNeedsUpdate = true;
+			continue;
+		}
+		ReferencedTemplates.Add(Template);
+		bNeedsUpdate |= !Template->HasAllFlags(RF_ArchetypeObject | RF_Transactional);
+	}
+
+	const int32 RecordsBefore = Blueprint->ComponentTemplates.Num();
+	if (RecordsBefore != ReferencedTemplates.Num())
+	{
+		bNeedsUpdate = true;
+	}
+	else
+	{
+		for (int32 Index = 0; Index < RecordsBefore; ++Index)
+		{
+			if (Blueprint->ComponentTemplates[Index].Get() != ReferencedTemplates[Index])
+			{
+				bNeedsUpdate = true;
+				break;
+			}
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> RemovedTemplates;
+	TArray<UActorComponent*> OrphanTemplates;
+	for (UActorComponent* Template : Blueprint->ComponentTemplates)
+	{
+		if (Template && !ReferencedTemplates.Contains(Template))
+		{
+			OrphanTemplates.AddUnique(Template);
+		}
+	}
+	if (Blueprint->GeneratedClass)
+	{
+		TArray<UObject*> OwnedObjects;
+		GetObjectsWithOuter(Blueprint->GeneratedClass, OwnedObjects, EGetObjectsFlags::None);
+		for (UObject* OwnedObject : OwnedObjects)
+		{
+			UActorComponent* Template = Cast<UActorComponent>(OwnedObject);
+			if (Template
+				&& Template->GetName().StartsWith(UK2Node_AddComponent::ComponentTemplateNamePrefix)
+				&& !ReferencedTemplates.Contains(Template))
+			{
+				OrphanTemplates.AddUnique(Template);
+			}
+		}
+	}
+	bNeedsUpdate |= !OrphanTemplates.IsEmpty();
+
+	for (UActorComponent* Template : OrphanTemplates)
+	{
+		TSharedPtr<FJsonObject> Identity = MakeShared<FJsonObject>();
+		Identity->SetStringField(TEXT("name"), Template->GetName());
+		Identity->SetStringField(TEXT("objectPath"), Template->GetPathName());
+		Identity->SetStringField(TEXT("classPath"), Template->GetClass()->GetPathName());
+		RemovedTemplates.Add(MakeShared<FJsonValueObject>(Identity));
+	}
+
+	if (bNeedsUpdate)
+	{
+		Blueprint->Modify();
+		FBlueprintEditorUtils::UpdateComponentTemplates(Blueprint);
+		if (UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass))
+		{
+			for (UActorComponent* Template : OrphanTemplates)
+			{
+				GeneratedClass->ComponentTemplates.Remove(Template);
+			}
+		}
+		for (UActorComponent* Template : OrphanTemplates)
+		{
+			Template->Modify();
+			Template->ClearFlags(RF_Public | RF_Standalone);
+			if (!Template->Rename(nullptr, GetTransientPackage(),
+				REN_DoNotDirty | REN_DontCreateRedirectors | REN_AllowPackageLinkerMismatch | REN_NonTransactional))
+			{
+				return MCPError(FString::Printf(TEXT("Failed to retire orphan component template: %s"), *Template->GetPathName()));
+			}
+		}
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+		FKismetEditorUtilities::CompileBlueprint(Blueprint);
+		const int32 RecordsAfter = Blueprint->ComponentTemplates.Num();
+		if (!SaveAssetPackage(Blueprint))
+		{
+			return MCPError(FString::Printf(TEXT("Failed to save Blueprint after flushing component templates: %s"), *AssetPath));
+		}
+
+		if (!OrphanTemplates.IsEmpty())
+		{
+			FText ReloadError;
+			TArray<UPackage*> PackagesToReload{Blueprint->GetOutermost()};
+			if (!UPackageTools::ReloadPackages(
+				PackagesToReload, ReloadError, EReloadPackagesInteractionMode::AssumePositive))
+			{
+				return MCPError(FString::Printf(TEXT("Failed to reload Blueprint after retiring orphan templates: %s"), *ReloadError.ToString()));
+			}
+			Blueprint = LoadBlueprint(AssetPath);
+			if (!Blueprint || !SaveAssetPackage(Blueprint))
+			{
+				return MCPError(FString::Printf(TEXT("Failed final Blueprint save after retiring orphan templates: %s"), *AssetPath));
+			}
+		}
+
+		auto Result = MCPSuccess();
+		MCPSetUpdated(Result);
+		Result->SetStringField(TEXT("path"), AssetPath);
+		Result->SetNumberField(TEXT("recordsBefore"), RecordsBefore);
+		Result->SetNumberField(TEXT("recordsAfter"), RecordsAfter);
+		Result->SetNumberField(TEXT("recordsRemoved"), RemovedTemplates.Num());
+		Result->SetArrayField(TEXT("removedTemplates"), RemovedTemplates);
+		Result->SetBoolField(TEXT("reloadedAfterCleanup"), !OrphanTemplates.IsEmpty());
+		return MCPResult(Result);
+	}
+
+	auto Result = MCPSuccess();
+	MCPSetExisted(Result);
+	Result->SetStringField(TEXT("path"), AssetPath);
+	Result->SetNumberField(TEXT("recordsBefore"), RecordsBefore);
+	Result->SetNumberField(TEXT("recordsAfter"), Blueprint->ComponentTemplates.Num());
+	Result->SetNumberField(TEXT("recordsRemoved"), RemovedTemplates.Num());
+	Result->SetArrayField(TEXT("removedTemplates"), RemovedTemplates);
+	Result->SetBoolField(TEXT("reloadedAfterCleanup"), false);
+	return MCPResult(Result);
+}
+
+TSharedPtr<FJsonValue> FBlueprintHandlers::RunConstructionScript(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	UClass* SpawnClass = Blueprint->GeneratedClass;

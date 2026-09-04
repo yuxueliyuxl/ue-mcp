@@ -328,3 +328,40 @@ The server can manage the editor process:
 | `editor(action="stop_editor")` | Gracefully stop the editor |
 | `editor(action="restart_editor")` | Stop and relaunch |
 | `editor(action="build_project")` | Build the project C++ code via UBT |
+| `project(action="build")` | The same build, with `configuration`, `platform` and `clean` parameters |
+
+Both builds run UnrealBuildTool as a separate process, so they work with the
+editor stopped. That is the case that matters: UnrealBuildTool cannot link while
+an editor holds the module DLLs, so a full rebuild has to happen with the editor
+down.
+
+## Which Engine A Project Uses
+
+The engine is resolved once, and the same answer drives the build tool, the
+editor launch, engine plugin discovery and the engine-source readers
+(`project(find_engine_symbol)`, `read_engine_header`, `search_engine_cpp`,
+`list_engine_modules`). Order, most specific first:
+
+1. `UE_MCP_TEST_ENGINE_ROOT` - an engine root pinned for the whole process.
+2. `UE_BUILD_TOOL_PATH` - a `Build.bat` / `Build.sh` pinned for the process.
+3. `editor.buildToolPath` in the project's `ue-mcp.yml` - the per-project form.
+4. `UE_EDITOR_PATH`, then `editor.path` - an editor binary names its own tree.
+5. `EngineAssociation` read as a path, absolute or relative to the project.
+6. An engine tree beside or above the project: the first directory from the
+   project upward that holds `Engine/Build/BatchFiles/`. This is the layout a
+   Perforce stream produces, with `<stream>/Engine` next to
+   `<stream>/MyProject/MyProject.uproject`.
+7. `EngineAssociation` as a registered build (a GUID, looked up in
+   `HKCU\Software\Epic Games\Unreal Engine\Builds`) or a version string such as
+   `5.8`, looked up as a launcher install.
+8. The engine the project's own log says it was last opened with.
+9. The default launcher install locations.
+
+`UE_MCP_PROTECTED_ENGINE_ROOTS` outranks all of it. An engine equal to or nested
+under a protected root is refused, including one that arrives through an
+explicit pin. Entries are separated by the platform path-list delimiter (`;` on
+Windows, `:` on macOS and Linux) and must be absolute.
+
+When nothing resolves, the error lists every path that was probed and where each
+came from, so a missing engine, a wrong root and an unsupported layout do not
+all read the same.

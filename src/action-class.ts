@@ -69,7 +69,7 @@ const MUTATE_VERBS: ReadonlySet<string> = new Set<string>([
   "start", "stop", "restart", "quit", "kill", "launch", "request", "hot", "cook", "deploy",
   // Editor and viewport state a user would see happen in the wrong window.
   "open", "close", "focus", "select", "play", "simulate", "possess", "eject",
-  "pause", "resume", "teleport", "respond", "stage", "capture", "render",
+  "pause", "resume", "teleport", "respond", "stage", "capture", "render", "scrub",
   // Authoring verbs the asset lexicon has no reason to know about.
   "author", "edit", "place", "load", "reload", "force", "regenerate", "recompile",
   "rebuild", "reparent", "auto", "populate", "bind", "rebind", "fill", "append",
@@ -78,8 +78,11 @@ const MUTATE_VERBS: ReadonlySet<string> = new Set<string>([
   "toggle", "reactivate", "reorder", "wrap", "sculpt", "paint", "snap", "aim",
   "undo", "redo", "purge", "begin", "end", "lock", "unlock", "drop", "retarget",
   "install", "uninstall", "restore", "revert", "activate", "deactivate",
+  // "destroy" is what the engine calls deleting an actor, and the asset
+  // lexicon never needed it because assets are deleted rather than destroyed.
+  "destroy",
   "trigger", "emit", "send", "post", "publish", "upload", "convert", "promote",
-  "mark", "dirty", "refresh", "trim", "crop", "resize", "rotate", "translate",
+  "mark", "dirty", "refresh", "trim", "crop", "resize", "rotate", "translate", "nudge",
   "transform", "split", "merge", "patch", "seek", "mute", "unmute",
   // Verbs the wrapped engine surface uses that no native action does. Every one
   // of these names a tool that edits a graph, moves a control, drives the UI, or
@@ -101,7 +104,7 @@ const MUTATE_VERBS: ReadonlySet<string> = new Set<string>([
 const READ_VERBS: ReadonlySet<string> = new Set<string>([
   ...READ_PREFIXES,
   "is", "scan", "sample", "health", "diagnose", "compare", "query", "dump",
-  "fetch", "lookup", "enumerate",
+  "fetch", "lookup", "enumerate", "summarize", "measure", "audit",
 ]);
 
 /**
@@ -140,6 +143,11 @@ const OVERRIDES: Readonly<Record<string, ActionClass>> = {
   // ── Reads whose verb reads as a write ───────────────────────────────
   // Serializers: they render a graph as text or JSON and return it.
   "blueprint.export_nodes_t3d": "read",
+  // Reads call-site nodes across a directory. "search" is a read verb, but
+  // "call" is a mutate verb from the wrapped engine surface, and a mutate verb
+  // anywhere in the name wins - which is wrong for exactly this action. It
+  // loads packages and reads graphs; it authors nothing (#945).
+  "blueprint.search_call_sites": "read",
   "material.export_graph": "read",
   "pcg.export_graph": "read",
   // Reads the actor descriptors of an unloaded World Partition level. Nothing
@@ -149,12 +157,41 @@ const OVERRIDES: Readonly<Record<string, ActionClass>> = {
   "widget.extract_subtree": "read",
   // Cache metadata about the Fab library, not a cache write.
   "fab.cache_info": "read",
+  // Computes bounds, area, volume and topology over mesh data already in the
+  // editor. "measure" is not in the read lexicon, and deliberately stays out of
+  // it: a verb there is a licence for every future action that starts with it.
+  "asset.measure_mesh_geometry": "read",
   // Reads a mirror data table. "mirror" is a mutate verb because the wrapped
   // engine surface uses it as one (mirror_selected_controls), and a mutate verb
   // anywhere in the name wins, which is wrong for exactly this action.
   "animation.read_mirror_data_table": "read",
+  // Reads Control Rig controls and keys from an edit session. The `edit`
+  // segment names the session type; this action does not modify it.
+  "animation.read_control_rig_edit": "read",
+  // Reads animation data, but optionally writes validation artifacts under
+  // the addressed project's Saved directory.
+  "animation.analyze_animation": "unknown",
+  // Evaluates a clip's pose to derive its planted-foot speed. Reads only.
+  // "measure" is in the read lexicon, so this entry is belt and braces rather
+  // than load bearing, and it documents the intent at the point of use.
+  "animation.measure_natural_speed": "read",
+  // ── Level refresh and inspect actions the verb lexicon cannot read ──
+  // "rerun" is not "run" and "recreate" is not "create", so neither reaches
+  // the lexicon. Both destroy and rebuild engine state on placed actors.
+  "level.rerun_construction": "mutate",
+  "level.recreate_physics_state": "mutate",
+  // Compares two components' bounds and transforms. "test" is not a verb the
+  // lexicon knows, and this one only measures.
+  "level.test_component_overlap": "read",
+  // Reads a property off many assets at once. "bulk" is a mutate verb because
+  // every batch action before this one wrote, but the shape word is not the
+  // verb: the read verb after it is.
+  "asset.bulk_read_properties": "read",
   // Reads whose first segment is not a verb at all.
   "level.line_trace": "read",
+  // Batch of the same collision queries. `bulk` is a mutate verb because most
+  // bulk_* actions write; this one only observes.
+  "level.bulk_line_trace": "read",
   "level.nav_project_point": "read",
   "level.count_actors_by_class": "read",
   "gameplay.project_to_nav": "read",
@@ -178,8 +215,24 @@ const OVERRIDES: Readonly<Record<string, ActionClass>> = {
   "audio.extract_pcm": "mutate",
   // Rebuilds the full-text index in the editor's own database.
   "asset.reindex_fts": "mutate",
+  // Loads, rewrites and saves the packages that reference a set of
+  // ObjectRedirectors, then deletes the redirectors that come out unreferenced
+  // (#908). "fixup" is not a verb the lexicon knows, and this is about as far
+  // from a read as an asset action gets.
+  "asset.fixup_redirectors": "mutate",
+  // Runs a CSG boolean over two StaticMeshes and writes the result to an
+  // asset. "mesh" is not a verb at all, so the lexicon cannot see it, and this
+  // is as far from a read as an asset action gets: it creates or overwrites a
+  // StaticMesh package (#916).
+  "asset.mesh_boolean": "mutate",
   // Posts to a public issue tracker.
   "feedback.submit": "mutate",
+  // #956: reads an attribute value, but by default it first registers the
+  // actor's own attribute sets on its AbilitySystemComponent when nothing is
+  // registered yet, which is a change to the addressed editor's live world.
+  // The verb says read; what it can do says mutate, and the gate follows what
+  // it can do.
+  "gas.get_live_attribute_value": "mutate",
 };
 
 /** Split `category.action`, tolerating an action name that contains a dot. */

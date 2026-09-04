@@ -5,11 +5,17 @@ import { readUserAuth } from "../auth.js";
 import { getWorkarounds, clearWorkarounds, type WorkaroundScopeSource } from "../workaround-tracker.js";
 import { scrubSecrets } from "../secret-scrub.js";
 import { privacyScrub } from "../privacy-scrub.js";
-import { deferSubmission } from "../feedback-deferred.js";
+import { deferSubmission, deleteDeferred } from "../feedback-deferred.js";
+import {
+  writeFallbackReport,
+  findByConfirmToken,
+  deleteFallbackReport,
+  type FallbackReport,
+} from "../feedback-fallback.js";
 import { getFeedbackMode, type FeedbackMode } from "../user-state.js";
 import { warn } from "../log.js";
 import { routeFeedback, type RoutingDecision } from "../feedback-routing.js";
-import { CORE_REPO, newIssueUrl, repoSlug, sameRepo, type GitHubRepo } from "../registry-catalog.js";
+import { CORE_REPO, newIssueUrl, parseRepoSlug, repoSlug, sameRepo, type GitHubRepo } from "../registry-catalog.js";
 
 /**
  * Resolve the active feedback mode. Precedence (highest wins):
@@ -390,14 +396,216 @@ function routingLine(routing: RoutingDecision | null, repo: GitHubRepo): string 
   return repoSlug(repo);
 }
 
+/**
+ * The response for every case where the elicitation gate could not reach a
+ * human (#991). The report is already on disk by the time this runs.
+ *
+ * It hands the agent three doors and tells it to relay all of them rather
+ * than pick. Door 1 (the prefilled link) needs nothing from the client, no
+ * GitHub auth, and no CLI, so it is first. Door 3 exists for the user who
+ * simply answers "yes, send it" in chat: the token lives in the report file,
+ * not in this response, so the agent has to actually ask.
+ */
+function elicitationFallbackDirective(
+  header: string,
+  explanation: string[],
+  report: FallbackReport,
+  repo: GitHubRepo,
+  code: string,
+  extraContext: Record<string, unknown> = {},
+) {
+  const clickLine = report.url
+    ? [
+        `  1. Click to file it with the body already written:`,
+        `     ${report.url}`,
+        ...(report.urlTruncated
+          ? [`     (that link carries as much of the body as a URL can hold - the rest`,
+             `      is in the file above, paste it in before submitting)`]
+          : []),
+      ]
+    : [
+        `  1. Open https://github.com/${repoSlug(repo)}/issues/new and paste the report`,
+        `     from the file above. The body is too long to survive a prefilled link,`,
+        `     so no link is offered rather than one that would lose half of it.`,
+      ];
+
+  const lines = [
+    header,
+    ...explanation,
+    ``,
+    `Nothing was posted and nothing was lost. The full report is saved at:`,
+    `  ${report.path}`,
+    ``,
+    `Relay ALL THREE of these to the user and let them choose:`,
+    ...clickLine,
+    `  2. Or run: npx ue-mcp feedback approve ${report.id}`,
+    `  3. Or, if they just say "yes, submit it": the report file above starts with`,
+    `     a confirmation token. Ask the user to read it out, then call`,
+    `     feedback(submit) with confirmToken set to what they told you. That posts`,
+    `     these exact bytes with no further prompting.`,
+    ``,
+    `Do not guess the token and do not read it out of the file yourself. It is the`,
+    `user's answer, not yours.`,
+  ];
+
+  return directive(
+    lines.join("\n"),
+    {
+      submitted: false,
+      code,
+      saved_report: report.path,
+      pending_id: report.id,
+      manual_url: report.url,
+      url_truncated: report.urlTruncated,
+      target_repo: repoSlug(repo),
+      approve_with: `npx ue-mcp feedback approve ${report.id}`,
+      ...extraContext,
+    },
+    {
+      kind: "feedback.fallback",
+      requiredActions: [
+        "surface_prefilled_issue_url_to_user",
+        "surface_saved_report_path_to_user",
+        // Kept from #772: the agent must still ask the human in plain text.
+        // What changed is that "yes" now has somewhere to go.
+        "ask_user_in_text",
+        "ask_user_for_confirm_token_before_retrying",
+        "do_not_self_approve",
+      ],
+      context: { code, pending_id: report.id, saved_report: report.path, ...extraContext },
+    },
+  );
+}
+
+/**
+ * Second half of the confirmation-token path (#991).
+ *
+ * The user was handed a token in a saved report file because the approval
+ * form never reached them. They read it back to the agent, so post the bytes
+ * the token names. Nothing here consults the current call's params: the token
+ * authorizes a specific saved report, and rebuilding the body from params
+ * would post something the user never read.
+ */
+async function submitWithConfirmToken(ctx: ToolContext, token: string) {
+  const entry = findByConfirmToken(token);
+  if (!entry) {
+    return directive(
+      [
+        `[FEEDBACK NOT SUBMITTED - UNKNOWN CONFIRMATION TOKEN]`,
+        `No saved report on this machine carries the token "${token}".`,
+        ``,
+        `A token is printed at the top of the report file the server writes when the`,
+        `approval form cannot be shown, and it is consumed the first time it posts.`,
+        `Ask the user to re-read it from that file, or run \`npx ue-mcp feedback list\``,
+        `to see what is still pending. Do NOT guess a token and do NOT read one out`,
+        `of the file yourself.`,
+      ].join("\n"),
+      { submitted: false, code: "unknown_confirm_token" },
+      {
+        kind: "feedback.blocked",
+        requiredActions: ["ask_user_to_reread_confirm_token", "do_not_guess_confirm_token"],
+        context: { code: "unknown_confirm_token" },
+      },
+    );
+  }
+
+  const repo = parseRepoSlug(entry.repo ?? null) ?? CORE_REPO;
+  const useBot = entry.author === "bot";
+  const manualUrl = newIssueUrl(repo, entry.title, entry.body);
+
+  if (!useBot && !(await readUserAuth())) {
+    return directive(
+      [
+        `[FEEDBACK NOT SUBMITTED - GITHUB AUTH REQUIRED]`,
+        `The saved report is authored as your GitHub user and no OAuth token is`,
+        `cached on this machine. The report is still saved (id ${entry.id}).`,
+        ``,
+        `Options for the user:`,
+        `  1. Open it manually (body prefilled): ${manualUrl}`,
+        `  2. Run \`npx ue-mcp auth\`, then hand the same token back again.`,
+      ].join("\n"),
+      {
+        submitted: false,
+        code: "auth_required",
+        pending_id: entry.id,
+        manual_url: manualUrl,
+      },
+      {
+        kind: "feedback.blocked",
+        requiredActions: ["run_npx_ue_mcp_auth_or_use_manual_url"],
+        context: { code: "auth_required", pending_id: entry.id },
+      },
+    );
+  }
+
+  const result = await submitFeedback(entry.title, entry.body, entry.labels, { useBot, repo });
+
+  if (result.kind !== "submitted") {
+    // Keep the saved report and the token alive: the post failed for reasons
+    // that may clear (tracker closed, signing service down, token revoked),
+    // and discarding the user's approval on a transient failure is how a
+    // report gets lost twice.
+    return directive(
+      [
+        `[FEEDBACK CONFIRMED BUT NOT POSTED]`,
+        `The token was valid and the post was attempted, but GitHub did not take it`,
+        `(${result.kind}).`,
+        ``,
+        `The report is still saved as ${entry.id} and the token still works.`,
+        `Open it manually instead (body prefilled): ${manualUrl}`,
+      ].join("\n"),
+      {
+        submitted: false,
+        code: result.kind,
+        pending_id: entry.id,
+        manual_url: manualUrl,
+        target_repo: repoSlug(repo),
+      },
+      {
+        kind: "feedback.blocked",
+        requiredActions: ["surface_manual_issue_url_to_user"],
+        context: { code: result.kind, pending_id: entry.id },
+      },
+    );
+  }
+
+  deleteDeferred(entry.id);
+  deleteFallbackReport(entry.id);
+  clearWorkarounds(ctx);
+
+  return {
+    message: `Feedback submitted to ${repoSlug(repo)} as ${result.authoredAs === "user" ? `@${result.authoredBy}` : "bot"} (confirmed by token).`,
+    issue_url: result.url,
+    issue_number: result.number,
+    authored_by: result.authoredBy,
+    authored_as: result.authoredAs,
+    labels: entry.labels,
+    target_repo: repoSlug(repo),
+    confirmed_via: "confirm_token",
+    pending_id: entry.id,
+  };
+}
+
 export const feedbackTool: ToolDef = categoryTool(
   "feedback",
   "Submit feedback when a native tool falls short: a missing action, a wrong result, a crash, or a gap you had to work around with execute_python. A python workaround is a common trigger but is not required. Reports are routed to the tracker that owns the surface - ue-mcp core, or the plugin that provides it (PIE Studio, Perforce, Meshy, ...) - by consulting the published plugin registry.",
   {
     submit: {
       description:
-        "Submit feedback about a tool gap (missing action, wrong behavior, crash, or a case you had to work around). Provide a specific title and a summary; pythonWorkaround and idealTool are optional enrichment, not prerequisites. Checks the plugin registry first and files against the owning plugin's repo when one matches, then blocks on an MCP elicitation prompt that asks the USER (not the agent) to approve or decline the exact payload - and to override the tracker - before anything is posted to GitHub.",
+        "Submit feedback about a tool gap (missing action, wrong behavior, crash, or a case you had to work around). Provide a specific title and a summary; pythonWorkaround and idealTool are optional enrichment, not prerequisites. Checks the plugin registry first and files against the owning plugin's repo when one matches, then blocks on an MCP elicitation prompt that asks the USER (not the agent) to approve or decline the exact payload - and to override the tracker - before anything is posted to GitHub. If the client cannot show that form (it never advertised elicitation, it throws, or it auto-answers in milliseconds without rendering anything), nothing is lost: the report is written to disk and the result carries a prefilled GitHub issue URL for the user to click.",
       handler: async (ctx: ToolContext, params: Record<string, unknown>) => {
+        // ── Confirmation-token path (#991) ───────────────────────
+        // The elicitation gate could not reach a human on an earlier call,
+        // so the payload was written to disk with a token in the report
+        // file. The user read that token out and the agent is handing it
+        // back. Post the STORED bytes, not whatever is in params now: the
+        // token authorizes what the user actually read, and re-assembling
+        // from params would let the body drift between approval and post.
+        const confirmToken = (params.confirmToken as string | undefined) ?? "";
+        if (confirmToken.trim()) {
+          return submitWithConfirmToken(ctx, confirmToken.trim());
+        }
+
         const title = (params.title as string | undefined) ?? "";
         const summary = (params.summary as string | undefined) ?? "";
         const pythonWorkaround = params.pythonWorkaround as string | undefined;
@@ -441,31 +649,6 @@ export const feedbackTool: ToolDef = categoryTool(
         // gate, so elicit support is irrelevant.
         const mode = resolveFeedbackMode(ctx);
 
-        if (mode === "interactive" && !ctx.elicit) {
-          return directive(
-            [
-              `[FEEDBACK BLOCKED - NO APPROVAL CHANNEL]`,
-              `This MCP client did not advertise the \`elicitation\` capability,`,
-              `so the server has no deterministic way to obtain the user's approval`,
-              `for posting an issue to a public tracker.`,
-              ``,
-              `Upgrade your client (Claude Code >= 2.1.76), or run`,
-              `\`npx ue-mcp feedback mode auto-approve|defer\` (or set the`,
-              `UE_MCP_FEEDBACK_MODE env var) to skip the prompt for this session.`,
-            ].join("\n"),
-            {
-              submitted: false,
-              code: "elicitation_unsupported",
-              message: "MCP client did not advertise the elicitation capability",
-            },
-            {
-              kind: "feedback.blocked",
-              requiredActions: ["surface_client_limitation_to_user", "do_not_retry"],
-              context: { code: "elicitation_unsupported" },
-            },
-          );
-        }
-
         // ── Routing ────────────────────────────────────────────────
         // Work out whether a published plugin owns the surface being
         // reported before assembling anything. Never fatal: a registry
@@ -492,6 +675,40 @@ export const feedbackTool: ToolDef = categoryTool(
           routing,
           ctx,
         );
+
+        // Everything below needs a channel to the human. Bundle the "save the
+        // report and hand back a link" fallback once so all three
+        // unreachable-gate cases produce the same three doors (#991).
+        const saveFallback = (reason: string): FallbackReport =>
+          writeFallbackReport({
+            title: payload.title,
+            body: payload.body,
+            labels: labelsForRepo(payload.labels, targetRepo),
+            repo: targetRepo,
+            routing: routingLine(routing, targetRepo),
+            project: ctx.project?.projectName ?? null,
+            author,
+            reason,
+          });
+
+        // The client never advertised elicitation, so there is no form to
+        // show. Previously a dead end; now it degrades to the fallback, which
+        // needs nothing from the client at all.
+        if (mode === "interactive" && !ctx.elicit) {
+          const report = saveFallback("client did not advertise the elicitation capability");
+          return elicitationFallbackDirective(
+            `[FEEDBACK NOT SUBMITTED - NO APPROVAL CHANNEL]`,
+            [
+              `This MCP client did not advertise the \`elicitation\` capability, so the`,
+              `server cannot show the user the approval form for posting to a public`,
+              `tracker. That is a client limitation, NOT the user refusing.`,
+            ],
+            report,
+            targetRepo,
+            "elicitation_unsupported",
+            { message: "MCP client did not advertise the elicitation capability" },
+          );
+        }
 
         // Two independent checks: (1) capture intent above, (2) validate
         // auth here. Auth validation only matters when intent is "user".
@@ -733,19 +950,20 @@ export const feedbackTool: ToolDef = categoryTool(
           });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          return directive(
+          // The client took the elicitation request and threw. Same practical
+          // outcome as never supporting it: no human saw anything, so the
+          // report goes to disk and comes back as a link (#991).
+          const report = saveFallback(`client rejected the elicitation request: ${msg}`);
+          return elicitationFallbackDirective(
+            `[FEEDBACK NOT SUBMITTED - APPROVAL PROMPT FAILED]`,
             [
-              `[FEEDBACK BLOCKED - APPROVAL PROMPT FAILED]`,
               `The MCP client rejected the elicitation request: ${msg}`,
-              ``,
-              `Nothing was submitted. Do not retry without user instruction.`,
-            ].join("\n"),
-            { submitted: false, code: "elicitation_failed", message: msg },
-            {
-              kind: "feedback.blocked",
-              requiredActions: ["surface_client_error_to_user", "do_not_retry"],
-              context: { code: "elicitation_failed" },
-            },
+              `Nobody saw a form, so this is NOT the user refusing.`,
+            ],
+            report,
+            targetRepo,
+            "elicitation_failed",
+            { message: msg },
           );
         }
 
@@ -780,27 +998,23 @@ export const feedbackTool: ToolDef = categoryTool(
           const configured = Number(process.env.UE_MCP_ELICIT_MIN_HUMAN_MS);
           const NoHumanCouldRespondMs = Number.isFinite(configured) && configured >= 0 ? configured : 1000;
           if (NoHumanCouldRespondMs > 0 && elapsedMs < NoHumanCouldRespondMs) {
-            return directive(
+            // #991: the detection above was right and still lost the report.
+            // Eight detailed reports died here in one week because the only
+            // thing on the other side of it was "ask the user in plain text",
+            // which leads nowhere on a client that cannot render the form.
+            const report = saveFallback(
+              `client auto-answered "${elicitResult.action}" in ${elapsedMs}ms without rendering a form`,
+            );
+            return elicitationFallbackDirective(
+              `[FEEDBACK NOT SUBMITTED - NO APPROVAL FORM WAS SHOWN]`,
               [
-                `[FEEDBACK NOT SUBMITTED - NO APPROVAL FORM WAS SHOWN]`,
                 `The MCP client answered "${elicitResult.action}" in ${elapsedMs}ms, which is too fast for a human to have seen a form.`,
                 `Treat this as the client not supporting or not rendering elicitation, NOT as the user refusing.`,
-                ``,
-                `Ask the user directly, in plain text, whether to submit this feedback.`,
-                `Do NOT set autoApprove yourself - that bypasses the approval gate. If the user`,
-                `says yes, they can re-run with it, or fix their client's elicitation support.`,
-              ].join("\n"),
-              {
-                submitted: false,
-                code: "form_not_presented",
-                action: elicitResult.action,
-                elapsedMs,
-              },
-              {
-                kind: "feedback.blocked",
-                requiredActions: ["ask_user_in_text", "do_not_self_approve"],
-                context: { code: "form_not_presented", action: elicitResult.action, elapsedMs },
-              },
+              ],
+              report,
+              targetRepo,
+              "form_not_presented",
+              { action: elicitResult.action, elapsedMs },
             );
           }
 
@@ -1077,6 +1291,12 @@ export const feedbackTool: ToolDef = categoryTool(
       .optional()
       .describe(
         'Override the tracker, as "owner/name". Leave it off: submit picks the right repo from the plugin registry on its own. Only ue-mcp core and repos owned by registered plugins are accepted; anything else is ignored and the report files against core.',
+      ),
+    confirmToken: z
+      .string()
+      .optional()
+      .describe(
+        "Confirmation token the USER read out of a saved report file, after a call where the client could not show the approval form. Passing it posts that saved report verbatim and ignores every other parameter. Never invent one and never read one out of the file yourself: it is the user's approval, not yours.",
       ),
   },
 );

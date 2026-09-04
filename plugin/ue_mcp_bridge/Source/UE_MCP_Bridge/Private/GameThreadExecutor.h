@@ -23,6 +23,15 @@ public:
 	// could clear the dialog. Handlers that only read or answer the active
 	// dialog are safe to run in that loop and get unstuck this way; nothing
 	// else should set it.
+	//
+	// #968: it also exempts the call from the "editor is still initializing"
+	// gate and from the GEditor check. A modal raised during startup blocks the
+	// game thread before the editor is ever marked ready, so gating the dialog
+	// handlers on readiness made the block permanent: the gate was held shut by
+	// the dialog those calls exist to dismiss, and the only escape was an OS
+	// kill. The two exemptions travel together because they describe one
+	// property - this handler is how a blocked engine gets unblocked, so no
+	// block may stand in front of it.
 	TSharedPtr<FJsonValue> ExecuteOnGameThread(FHandlerFunction Handler, const TSharedPtr<FJsonObject>& Params, float TimeoutSeconds = 30.0f, bool bModalSafe = false);
 
 	// Run any modal-safe work that was queued while a dialog blocked the

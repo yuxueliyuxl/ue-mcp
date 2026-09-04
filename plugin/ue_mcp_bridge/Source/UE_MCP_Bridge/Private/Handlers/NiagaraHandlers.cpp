@@ -414,6 +414,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::SpawnNiagaraAtLocation(const TSharedPtr
 	if (SpawnedComponent->GetOwner())
 	{
 		Result->SetStringField(TEXT("actorLabel"), SpawnedComponent->GetOwner()->GetActorLabel());
+		Result->SetStringField(TEXT("actorPath"), SpawnedComponent->GetOwner()->GetPathName());
 		Result->SetStringField(TEXT("actorName"), SpawnedComponent->GetOwner()->GetName());
 
 		// Rollback: delete_actor
@@ -491,6 +492,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::SpawnNiagaraActor(const TSharedPtr<FJso
 	MCPSetCreated(Result);
 	Result->SetStringField(TEXT("systemPath"), SystemPath);
 	Result->SetStringField(TEXT("actorLabel"), Actor->GetActorLabel());
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetStringField(TEXT("actorName"), Actor->GetName());
 	Result->SetBoolField(TEXT("activated"), bActivate);
 
@@ -506,15 +508,14 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::SpawnNiagaraActor(const TSharedPtr<FJso
 TSharedPtr<FJsonValue> FNiagaraHandlers::ReactivateNiagara(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* Actor = FindActorByLabel(World, ActorLabel);
-	if (!Actor)
-	{
-		return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
-	}
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+	if (!Actor) return ActorErr;
+	ActorLabel = Actor->GetActorLabel();
 	UNiagaraComponent* Comp = Actor->FindComponentByClass<UNiagaraComponent>();
 	if (!Comp)
 	{
@@ -528,13 +529,14 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::ReactivateNiagara(const TSharedPtr<FJso
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	return MCPResult(Result);
 }
 
 TSharedPtr<FJsonValue> FNiagaraHandlers::SetNiagaraParameter(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	FString ParameterName;
 	if (auto Err = RequireString(Params, TEXT("parameterName"), ParameterName)) return Err;
@@ -543,11 +545,10 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::SetNiagaraParameter(const TSharedPtr<FJ
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* FoundActor = FindActorByLabel(World, ActorLabel);
-	if (!FoundActor)
-	{
-		return MCPError(FString::Printf(TEXT("Actor not found with label: %s"), *ActorLabel));
-	}
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* FoundActor = MCPResolveActor(World, Params, ActorErr);
+	if (!FoundActor) return ActorErr;
+	ActorLabel = FoundActor->GetActorLabel();
 
 	// Get Niagara component from the actor
 	UNiagaraComponent* NiagaraComp = FoundActor->FindComponentByClass<UNiagaraComponent>();
@@ -604,6 +605,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::SetNiagaraParameter(const TSharedPtr<FJ
 
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), FoundActor->GetPathName());
 	Result->SetStringField(TEXT("parameterName"), ParameterName);
 	Result->SetStringField(TEXT("parameterType"), ParameterType);
 	// No rollback: runtime niagara parameter overrides are ephemeral; replaying is safe.
@@ -1344,7 +1346,7 @@ namespace
 		return Src ? Src->NodeGraph : nullptr;
 	}
 
-	TSharedPtr<FJsonObject> PinToJson(const UEdGraphPin* Pin)
+	TSharedPtr<FJsonObject> NiagaraPinToJson(const UEdGraphPin* Pin)
 	{
 		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetStringField(TEXT("name"), Pin->PinName.ToString());
@@ -1618,8 +1620,8 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::ListModuleInputs(const TSharedPtr<FJson
 			for (UEdGraphPin* Pin : FC->Pins)
 			{
 				if (!Pin) continue;
-				if (Pin->Direction == EGPD_Input)  SwitchPins.Add(MakeShared<FJsonValueObject>(PinToJson(Pin)));
-				if (Pin->Direction == EGPD_Output) Outputs.Add(MakeShared<FJsonValueObject>(PinToJson(Pin)));
+				if (Pin->Direction == EGPD_Input)  SwitchPins.Add(MakeShared<FJsonValueObject>(NiagaraPinToJson(Pin)));
+				if (Pin->Direction == EGPD_Output) Outputs.Add(MakeShared<FJsonValueObject>(NiagaraPinToJson(Pin)));
 			}
 			ModObj->SetArrayField(TEXT("inputs"), Inputs);
 			ModObj->SetNumberField(TEXT("inputCount"), Inputs.Num());

@@ -63,6 +63,250 @@
 #include "Materials/MaterialInterface.h"
 #include "EngineUtils.h"
 #include "Widgets/SViewport.h"
+#include "UObject/SoftObjectPath.h"
+
+// ── WidgetBlueprint resolution (#972) ────────────────────────────────────────
+// See the contract and the mechanism note on MCPWidget in WidgetHandlers.h.
+// Everything here is defined exactly once, in this translation unit, and
+// declared in the shared header, because the module is a unity build and a
+// second file-local copy would be a redefinition on some grouping.
+namespace MCPWidget
+{
+
+/**
+ * "WidgetBlueprint'/Game/UI/WBP_Foo.WBP_Foo'", "/Game/UI/WBP_Foo",
+ * "/Game/UI/WBP_Foo.WBP_Foo" and "/Game/UI/WBP_Foo.WBP_Foo_C" all normalise to
+ * "/Game/UI/WBP_Foo.WBP_Foo". A path with no object part gets one inferred from
+ * the package name, which is the convention every asset in the content browser
+ * follows.
+ */
+static FString NormalizeWidgetBlueprintObjectPath(const FString& InAssetPath)
+{
+	FString Path = InAssetPath;
+	Path.TrimStartAndEndInline();
+	if (Path.IsEmpty()) return Path;
+
+	// "Class'/Game/...'" and "Class /Game/..." export forms.
+	int32 QuoteIndex = INDEX_NONE;
+	if (Path.FindChar(TCHAR('\''), QuoteIndex))
+	{
+		Path = Path.RightChop(QuoteIndex + 1);
+		Path.RemoveFromEnd(TEXT("'"));
+	}
+	else
+	{
+		int32 SpaceIndex = INDEX_NONE;
+		if (Path.FindChar(TCHAR(' '), SpaceIndex))
+		{
+			Path = Path.RightChop(SpaceIndex + 1);
+		}
+	}
+	Path.TrimStartAndEndInline();
+
+	// Subobject part ("Package.Asset:Inner") is not ours to resolve.
+	int32 ColonIndex = INDEX_NONE;
+	if (Path.FindChar(TCHAR(':'), ColonIndex))
+	{
+		Path = Path.Left(ColonIndex);
+	}
+
+	const int32 LastSlash = Path.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	const int32 LastDot = Path.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (LastDot <= LastSlash)
+	{
+		// No object part. Infer it from the package name.
+		const FString AssetName = FPackageName::GetLongPackageAssetName(Path);
+		if (AssetName.IsEmpty()) return FString();
+		return Path + TEXT(".") + AssetName;
+	}
+
+	// "/Game/UI/WBP_Foo.WBP_Foo_C" names the generated class. Keep the trailing
+	// _C off the object path; the class is resolved from the blueprint anyway.
+	FString ObjectName = Path.RightChop(LastDot + 1);
+	if (ObjectName.EndsWith(TEXT("_C"), ESearchCase::CaseSensitive))
+	{
+		ObjectName.LeftChopInline(2);
+		Path = Path.Left(LastDot + 1) + ObjectName;
+	}
+	return Path;
+}
+
+/**
+ * Accept a candidate only if it is a WidgetBlueprint the editor still consults.
+ *
+ * RF_NewerVersionExists is the flag a package reload leaves on the object it
+ * replaced. Handing one of those back is exactly the failure #972 describes
+ * after asset(force_reload): every write lands on a corpse, the real asset
+ * never changes, and nothing reports an error. IsValid covers null and garbage.
+ */
+static UWidgetBlueprint* AsLiveWidgetBlueprint(UObject* Candidate, FString& OutFoundClass)
+{
+	if (!IsValid(Candidate)) return nullptr;
+	if (Candidate->HasAnyFlags(RF_NewerVersionExists)) return nullptr;
+
+	if (UWidgetBlueprint* AsBlueprint = Cast<UWidgetBlueprint>(Candidate))
+	{
+		return AsBlueprint;
+	}
+	// A caller who passed the generated class path gets the blueprint behind it.
+	if (UClass* AsClass = Cast<UClass>(Candidate))
+	{
+		if (UWidgetBlueprint* Generated = Cast<UWidgetBlueprint>(AsClass->ClassGeneratedBy))
+		{
+			return Generated;
+		}
+	}
+	OutFoundClass = Candidate->GetClass()->GetName();
+	return nullptr;
+}
+
+/** True when the AssetRegistry or the filesystem says the asset is really there. */
+static bool WidgetBlueprintAssetExists(const FString& ObjectPath, const FString& PackageName)
+{
+	if (!PackageName.IsEmpty() && FPackageName::DoesPackageExist(PackageName))
+	{
+		return true;
+	}
+	// An asset created this session and not yet saved has no file, so the
+	// registry is the only witness. Never load anything to answer this.
+	if (FAssetRegistryModule* ARM =
+		FModuleManager::GetModulePtr<FAssetRegistryModule>(TEXT("AssetRegistry")))
+	{
+		const FAssetData Data = ARM->Get().GetAssetByObjectPath(FSoftObjectPath(ObjectPath));
+		if (Data.IsValid()) return true;
+	}
+	return false;
+}
+
+FWidgetBlueprintResolve ResolveWidgetBlueprint(const FString& AssetPath)
+{
+	FWidgetBlueprintResolve Out;
+	Out.ObjectPath = NormalizeWidgetBlueprintObjectPath(AssetPath);
+	if (Out.ObjectPath.IsEmpty())
+	{
+		Out.Failure = EWidgetBlueprintResolveFailure::NotFound;
+		return Out;
+	}
+
+	const FString PackageName = FPackageName::ObjectPathToPackageName(Out.ObjectPath);
+	Out.bAssetExists = WidgetBlueprintAssetExists(Out.ObjectPath, PackageName);
+
+	// Step 1. The object hash, first and cheapest. An asset already in memory
+	// answers here without the AssetRegistry round trip UEditorAssetLibrary
+	// makes, which is the step that was intermittently returning null.
+	if (UWidgetBlueprint* Live =
+		AsLiveWidgetBlueprint(FindObject<UObject>(nullptr, *Out.ObjectPath), Out.FoundClass))
+	{
+		Out.Blueprint = Live;
+		return Out;
+	}
+
+	// Step 2. The historical path. Kept because it understands more path
+	// spellings than the object hash does and it is what every other handler
+	// in this plugin uses.
+	if (UWidgetBlueprint* Live =
+		AsLiveWidgetBlueprint(UEditorAssetLibrary::LoadAsset(AssetPath), Out.FoundClass))
+	{
+		Out.Blueprint = Live;
+		return Out;
+	}
+
+	// Step 3. Load the object directly, bypassing the registry entirely. Only
+	// worth attempting when something really is there: StaticLoadObject on a
+	// path with no package behind it can force a blocking package search.
+	if (Out.bAssetExists)
+	{
+		if (UWidgetBlueprint* Live =
+			AsLiveWidgetBlueprint(LoadObject<UObject>(nullptr, *Out.ObjectPath), Out.FoundClass))
+		{
+			Out.Blueprint = Live;
+			return Out;
+		}
+
+		// Step 4. "Failed to find object 'Object /Game/x/WBP_Foo.WBP_Foo'" in
+		// the log means the package resolved but the object lookup inside it
+		// did not. Load the package explicitly and look again.
+		if (!PackageName.IsEmpty())
+		{
+			if (UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None))
+			{
+				Package->FullyLoad();
+				const FString ObjectName = FPackageName::ObjectPathToObjectName(Out.ObjectPath);
+				if (UWidgetBlueprint* Live =
+					AsLiveWidgetBlueprint(FindObject<UObject>(Package, *ObjectName), Out.FoundClass))
+				{
+					Out.Blueprint = Live;
+					return Out;
+				}
+			}
+		}
+	}
+
+	if (!Out.FoundClass.IsEmpty())
+	{
+		Out.Failure = EWidgetBlueprintResolveFailure::WrongType;
+	}
+	else if (Out.bAssetExists)
+	{
+		Out.Failure = EWidgetBlueprintResolveFailure::Unresolvable;
+	}
+	else
+	{
+		Out.Failure = EWidgetBlueprintResolveFailure::NotFound;
+	}
+	return Out;
+}
+
+TSharedPtr<FJsonValue> WidgetBlueprintResolveError(
+	const FString& AssetPath,
+	const FWidgetBlueprintResolve& Resolved)
+{
+	switch (Resolved.Failure)
+	{
+	case EWidgetBlueprintResolveFailure::WrongType:
+		return MCPError(FString::Printf(
+			TEXT("'%s' is a %s, not a WidgetBlueprint."),
+			*AssetPath, *Resolved.FoundClass));
+
+	case EWidgetBlueprintResolveFailure::Unresolvable:
+		// The distinction the caller needs: the asset is there, so retrying or
+		// reloading the bridge is the move. Renaming or re-creating it is not.
+		return MCPError(FString::Printf(
+			TEXT("'%s' exists but could not be resolved to a live WidgetBlueprint on this call. ")
+			TEXT("The object handle went stale (a package reload or a GC pass replaced it), the asset is not missing. ")
+			TEXT("Retry the call; if it keeps failing, editor(action=\"reload_bridge\") clears it."),
+			*AssetPath));
+
+	case EWidgetBlueprintResolveFailure::NotFound:
+	default:
+		return MCPError(FString::Printf(
+			TEXT("No asset exists at '%s'. Nothing of that name is in the AssetRegistry and no package of that name is on disk. ")
+			TEXT("Check the path with widget(action=\"list\") or asset(action=\"search\")."),
+			*AssetPath));
+	}
+}
+
+UWidgetBlueprint* ResolveWidgetBlueprintOrError(
+	const FString& AssetPath,
+	TSharedPtr<FJsonValue>& OutError)
+{
+	const FWidgetBlueprintResolve Resolved = ResolveWidgetBlueprint(AssetPath);
+	if (!Resolved.Blueprint)
+	{
+		OutError = WidgetBlueprintResolveError(AssetPath, Resolved);
+	}
+	return Resolved.Blueprint;
+}
+
+TSharedPtr<FJsonValue> MissingWidgetTreeError(const FString& AssetPath)
+{
+	return MCPError(FString::Printf(
+		TEXT("WidgetBlueprint '%s' resolved but has no WidgetTree. The asset is loaded and broken, not missing; ")
+		TEXT("open it in the editor or re-create it."),
+		*AssetPath));
+}
+
+}
 
 void FWidgetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 {
@@ -200,12 +444,9 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ReadWidgetTree(const TSharedPtr<FJsonObj
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
 
 	auto Result = MCPSuccess();
 
@@ -332,11 +573,18 @@ TSharedPtr<FJsonValue> FWidgetHandlers::RunEditorUtilityWidget(const TSharedPtr<
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UEditorUtilityWidgetBlueprint* EUWidget = Cast<UEditorUtilityWidgetBlueprint>(LoadedAsset);
+	// UEditorUtilityWidgetBlueprint derives from UWidgetBlueprint, so it goes
+	// through the same revalidating resolver and gets the same stale-handle
+	// recovery every other widget action gets (#972).
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* ResolvedBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!ResolvedBP) return ResolveError;
+	UEditorUtilityWidgetBlueprint* EUWidget = Cast<UEditorUtilityWidgetBlueprint>(ResolvedBP);
 	if (!EUWidget)
 	{
-		return MCPError(FString::Printf(TEXT("Failed to load EditorUtilityWidgetBlueprint at '%s'"), *AssetPath));
+		return MCPError(FString::Printf(
+			TEXT("'%s' is a %s, not an EditorUtilityWidgetBlueprint."),
+			*AssetPath, *ResolvedBP->GetClass()->GetName()));
 	}
 
 	UEditorUtilitySubsystem* Subsystem = GEditor->GetEditorSubsystem<UEditorUtilitySubsystem>();
@@ -604,17 +852,11 @@ TSharedPtr<FJsonValue> FWidgetHandlers::AddWidget(const TSharedPtr<FJsonObject>&
 	FString ParentWidgetName = OptionalString(Params, TEXT("parentWidgetName"));
 
 	// ── Load the WidgetBlueprint ──
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
 
-	if (!WidgetBP->WidgetTree)
-	{
-		return MCPError(TEXT("WidgetTree is null"));
-	}
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	// ── Resolve the UClass ──
 	UClass* WClass = ResolveWidgetClass(WidgetClassName);
@@ -784,17 +1026,11 @@ TSharedPtr<FJsonValue> FWidgetHandlers::RemoveWidget(const TSharedPtr<FJsonObjec
 	FString WidgetName;
 	if (auto Err = RequireString(Params, TEXT("widgetName"), WidgetName)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
 
-	if (!WidgetBP->WidgetTree)
-	{
-		return MCPError(TEXT("WidgetTree is null"));
-	}
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	// Find the widget
 	UWidget* FoundWidget = nullptr;
@@ -880,12 +1116,10 @@ TSharedPtr<FJsonValue> FWidgetHandlers::MoveWidget(const TSharedPtr<FJsonObject>
 	FString NewParentName;
 	if (auto Err = RequireStringAlt(Params, TEXT("newParentWidgetName"), TEXT("parentWidgetName"), NewParentName)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP || !WidgetBP->WidgetTree)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	// Find the widget to move
 	UWidget* WidgetToMove = nullptr;
@@ -1002,12 +1236,10 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetRoot(const TSharedPtr<FJsonObject>& P
 	FString WidgetName;
 	if (auto Err = RequireString(Params, TEXT("widgetName"), WidgetName)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP || !WidgetBP->WidgetTree)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	UWidget* NewRoot = nullptr;
 	WidgetBP->WidgetTree->ForEachWidget([&](UWidget* W)
@@ -1068,12 +1300,10 @@ TSharedPtr<FJsonValue> FWidgetHandlers::WrapRoot(const TSharedPtr<FJsonObject>& 
 	FString WrapperClassName;
 	if (auto Err = RequireStringAlt(Params, TEXT("wrapperClass"), TEXT("widgetClass"), WrapperClassName)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP || !WidgetBP->WidgetTree)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	UWidget* OldRoot = WidgetBP->WidgetTree->RootWidget;
 	if (!OldRoot)
@@ -1200,6 +1430,14 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ListWidgetClasses(const TSharedPtr<FJson
 // ─────────────────────────────────────────────────────────────
 namespace WidgetRuntime_Internal
 {
+	// These names are deliberately widget-specific. This namespace is opened with
+	// a block-scope using-directive at several call sites, which injects its names
+	// into the global namespace at exactly the point where a unity-blob neighbour's
+	// anonymous-namespace definitions live. GasHandlers_Runtime.cpp defines a
+	// ResolveRuntimeWorld and EditorHandlers_PIERuntime.cpp a VectorJson; those
+	// pairs resolved as overloads only by arity and by the absence of an implicit
+	// FVector/FVector2D conversion. audit:unity cannot see this class of collision,
+	// because it walks anonymous-namespace bodies only.
 	struct FDerivedClipState
 	{
 		bool bHasRect = false;
@@ -1239,7 +1477,7 @@ namespace WidgetRuntime_Internal
 	static TMap<FString, uint64> PreviousLayoutCaptureFrames;
 	static uint64 LayoutCaptureSequence = 0;
 
-	static UWorld* ResolveRuntimeWorld()
+	static UWorld* ResolveWidgetRuntimeWorld()
 	{
 		if (!GEditor) return nullptr;
 		FWorldContext* PIE = GEditor->GetPIEWorldContext();
@@ -1274,7 +1512,7 @@ namespace WidgetRuntime_Internal
 		return TEXT("Unknown");
 	}
 
-	static TSharedPtr<FJsonObject> VectorJson(const FVector2D& Value)
+	static TSharedPtr<FJsonObject> WidgetVector2DJson(const FVector2D& Value)
 	{
 		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
 		Obj->SetNumberField(TEXT("x"), Value.X);
@@ -1348,13 +1586,13 @@ namespace WidgetRuntime_Internal
 			const FVector2D Alignment = CanvasSlot->GetAlignment();
 			TSharedPtr<FJsonObject> Canvas = MakeShared<FJsonObject>();
 			TSharedPtr<FJsonObject> AnchorsObj = MakeShared<FJsonObject>();
-			AnchorsObj->SetObjectField(TEXT("minimum"), VectorJson(Anchors.Minimum));
-			AnchorsObj->SetObjectField(TEXT("maximum"), VectorJson(Anchors.Maximum));
+			AnchorsObj->SetObjectField(TEXT("minimum"), WidgetVector2DJson(Anchors.Minimum));
+			AnchorsObj->SetObjectField(TEXT("maximum"), WidgetVector2DJson(Anchors.Maximum));
 			AnchorsObj->SetBoolField(TEXT("stretchedHorizontally"), !FMath::IsNearlyEqual(Anchors.Minimum.X, Anchors.Maximum.X));
 			AnchorsObj->SetBoolField(TEXT("stretchedVertically"), !FMath::IsNearlyEqual(Anchors.Minimum.Y, Anchors.Maximum.Y));
 			Canvas->SetObjectField(TEXT("anchors"), AnchorsObj);
 			Canvas->SetObjectField(TEXT("offsets"), MarginJson(Offsets));
-			Canvas->SetObjectField(TEXT("alignment"), VectorJson(Alignment));
+			Canvas->SetObjectField(TEXT("alignment"), WidgetVector2DJson(Alignment));
 			Canvas->SetBoolField(TEXT("autoSize"), CanvasSlot->GetAutoSize());
 			Canvas->SetNumberField(TEXT("zOrder"), CanvasSlot->GetZOrder());
 			SlotObj->SetObjectField(TEXT("canvas"), Canvas);
@@ -1577,21 +1815,21 @@ namespace WidgetRuntime_Internal
 
 			TSharedPtr<FJsonObject> GeometryObj = MakeShared<FJsonObject>();
 			GeometryObj->SetBoolField(TEXT("hasCachedSlateWidget"), bHasCachedSlateWidget);
-			GeometryObj->SetObjectField(TEXT("desiredSize"), VectorJson(DesiredSize));
-			GeometryObj->SetObjectField(TEXT("localSize"), VectorJson(LocalSize));
-			GeometryObj->SetObjectField(TEXT("absoluteSize"), VectorJson(AbsoluteSize));
-			GeometryObj->SetObjectField(TEXT("absolutePosition"), VectorJson(AbsolutePosition));
+			GeometryObj->SetObjectField(TEXT("desiredSize"), WidgetVector2DJson(DesiredSize));
+			GeometryObj->SetObjectField(TEXT("localSize"), WidgetVector2DJson(LocalSize));
+			GeometryObj->SetObjectField(TEXT("absoluteSize"), WidgetVector2DJson(AbsoluteSize));
+			GeometryObj->SetObjectField(TEXT("absolutePosition"), WidgetVector2DJson(AbsolutePosition));
 			GeometryObj->SetObjectField(TEXT("layoutBoundingRect"), RectJson(LayoutRect));
 			GeometryObj->SetObjectField(TEXT("renderBoundingRect"), RectJson(RenderRect));
 			GeometryObj->SetNumberField(TEXT("accumulatedLayoutScale"), Geometry.GetAccumulatedLayoutTransform().GetScale());
 			Obj->SetObjectField(TEXT("geometry"), GeometryObj);
 
 			TSharedPtr<FJsonObject> TransformObj = MakeShared<FJsonObject>();
-			TransformObj->SetObjectField(TEXT("translation"), VectorJson(RenderTransform.Translation));
-			TransformObj->SetObjectField(TEXT("scale"), VectorJson(RenderTransform.Scale));
-			TransformObj->SetObjectField(TEXT("shear"), VectorJson(RenderTransform.Shear));
+			TransformObj->SetObjectField(TEXT("translation"), WidgetVector2DJson(RenderTransform.Translation));
+			TransformObj->SetObjectField(TEXT("scale"), WidgetVector2DJson(RenderTransform.Scale));
+			TransformObj->SetObjectField(TEXT("shear"), WidgetVector2DJson(RenderTransform.Shear));
 			TransformObj->SetNumberField(TEXT("angleDegrees"), RenderTransform.Angle);
-			TransformObj->SetObjectField(TEXT("pivot"), VectorJson(Widget->GetRenderTransformPivot()));
+			TransformObj->SetObjectField(TEXT("pivot"), WidgetVector2DJson(Widget->GetRenderTransformPivot()));
 			Obj->SetObjectField(TEXT("renderTransform"), TransformObj);
 
 			TSharedPtr<FJsonObject> ClipObj = MakeShared<FJsonObject>();
@@ -1742,10 +1980,10 @@ namespace WidgetRuntime_Internal
 						bSlotChanged;
 					DeltaObj->SetBoolField(TEXT("hasPreviousCapture"), true);
 					DeltaObj->SetBoolField(TEXT("changed"), bChanged);
-					DeltaObj->SetObjectField(TEXT("absolutePositionDelta"), VectorJson(PositionDelta));
-					DeltaObj->SetObjectField(TEXT("localSizeDelta"), VectorJson(LocalSizeDelta));
-					DeltaObj->SetObjectField(TEXT("absoluteSizeDelta"), VectorJson(AbsoluteSizeDelta));
-					DeltaObj->SetObjectField(TEXT("desiredSizeDelta"), VectorJson(DesiredSizeDelta));
+					DeltaObj->SetObjectField(TEXT("absolutePositionDelta"), WidgetVector2DJson(PositionDelta));
+					DeltaObj->SetObjectField(TEXT("localSizeDelta"), WidgetVector2DJson(LocalSizeDelta));
+					DeltaObj->SetObjectField(TEXT("absoluteSizeDelta"), WidgetVector2DJson(AbsoluteSizeDelta));
+					DeltaObj->SetObjectField(TEXT("desiredSizeDelta"), WidgetVector2DJson(DesiredSizeDelta));
 					DeltaObj->SetBoolField(TEXT("slotPropertiesChanged"), bSlotChanged);
 					if (bChanged)
 					{
@@ -1846,7 +2084,7 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ListRuntimeWidgets(const TSharedPtr<FJso
 {
 	using namespace WidgetRuntime_Internal;
 
-	UWorld* World = ResolveRuntimeWorld();
+	UWorld* World = ResolveWidgetRuntimeWorld();
 	if (!World)
 	{
 		return MCPError(TEXT("No PIE world available. Is Play-In-Editor running?"));
@@ -1898,7 +2136,7 @@ TSharedPtr<FJsonValue> FWidgetHandlers::GetRuntimeWidget(const TSharedPtr<FJsonO
 {
 	using namespace WidgetRuntime_Internal;
 
-	UWorld* World = ResolveRuntimeWorld();
+	UWorld* World = ResolveWidgetRuntimeWorld();
 	if (!World)
 	{
 		return MCPError(TEXT("No PIE world available. Is Play-In-Editor running?"));
@@ -2094,7 +2332,7 @@ TSharedPtr<FJsonValue> FWidgetHandlers::GetRuntimeWidget(const TSharedPtr<FJsonO
 TSharedPtr<FJsonValue> FWidgetHandlers::AddWidgetToViewport(const TSharedPtr<FJsonObject>& Params)
 {
 	using namespace WidgetRuntime_Internal;
-	UWorld* World = ResolveRuntimeWorld();
+	UWorld* World = ResolveWidgetRuntimeWorld();
 	if (!World)
 	{
 		return MCPError(TEXT("No PIE world available. Start Play-In-Editor first (editor pie_control action=play)."));
@@ -2151,7 +2389,7 @@ TSharedPtr<FJsonValue> FWidgetHandlers::AddWidgetToViewport(const TSharedPtr<FJs
 TSharedPtr<FJsonValue> FWidgetHandlers::InvokeRuntimeWidgetFunction(const TSharedPtr<FJsonObject>& Params)
 {
 	using namespace WidgetRuntime_Internal;
-	UWorld* World = ResolveRuntimeWorld();
+	UWorld* World = ResolveWidgetRuntimeWorld();
 	if (!World)
 	{
 		return MCPError(TEXT("No PIE world available. Is Play-In-Editor running?"));
@@ -2242,7 +2480,7 @@ TSharedPtr<FJsonValue> FWidgetHandlers::GetRuntimeDelegates(const TSharedPtr<FJs
 {
 	using namespace WidgetRuntime_Internal;
 
-	UWorld* World = ResolveRuntimeWorld();
+	UWorld* World = ResolveWidgetRuntimeWorld();
 	if (!World)
 	{
 		return MCPError(TEXT("No PIE world available. Is Play-In-Editor running?"));

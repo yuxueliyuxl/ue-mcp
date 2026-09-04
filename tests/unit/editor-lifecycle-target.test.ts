@@ -118,7 +118,7 @@ describe("stopEditor targeting", () => {
     expect(findEditorByPid).toHaveBeenCalledWith(4242);
   });
 
-  it("refuses when the recorded pid now belongs to another project", async () => {
+  it("calls a lockfile that names somebody else's process stale, not a project mismatch", async () => {
     const { projectDir } = makeProject();
     const otherProject = path.join(os.tmpdir(), "SomeoneElse", "Other.uproject");
     writeLockfile(projectDir, { port: 51999, pid: 4242 });
@@ -126,8 +126,42 @@ describe("stopEditor targeting", () => {
 
     const result = await stopEditor(false, projectDir);
     expect(result.success).toBe(false);
+    expect(result.message).toContain("Stale lockfile");
     expect(result.message).toContain("Other.uproject");
-    expect(result.message).toContain("not this project");
+    expect(result.message).toContain("no longer the editor for this project");
+  });
+
+  it("does not refuse the editor that actually has this project open (#967)", async () => {
+    // The regression: the guard fired against the very editor it should match
+    // and quoted that editor's own .uproject back as proof of a mismatch.
+    const { projectDir, projectPath } = makeProject();
+    writeLockfile(projectDir, { port: 51999, pid: 4242 });
+    findEditorByPid.mockResolvedValue(editor(4242, projectPath));
+    findInteractiveEditors.mockResolvedValue([editor(4242, projectPath)]);
+
+    const result = await stopEditor(false, projectDir);
+    // Nothing is listening on 51999 in a unit test, so the stop cannot finish.
+    // What matters is that it got past ownership rather than refusing there.
+    expect(result.message).not.toContain("Stale lockfile");
+    expect(result.message).not.toContain("Delete that file");
+    expect(result.message).toContain("bridge is unreachable");
+  });
+
+  it("self-heals to the live editor's own record instead of blaming the lockfile", async () => {
+    // A stale pid in port.json while a healthy editor of this project is up:
+    // telling the user to delete the file would discard the bridge's only
+    // handle on it (#967/#934).
+    const { projectDir, projectPath } = makeProject();
+    writeLockfile(projectDir, { port: 51999, pid: 4242 });
+    findEditorByPid.mockResolvedValue(null);
+    findInteractiveEditors.mockResolvedValue([editor(777, projectPath)]);
+    const record = path.join(projectDir, "Saved", "UE_MCP_Bridge", "instances", "777.json");
+    fs.mkdirSync(path.dirname(record), { recursive: true });
+    fs.writeFileSync(record, JSON.stringify({ pid: 777, port: 52222, state: "listening" }));
+
+    const result = await stopEditor(false, projectDir);
+    expect(result.message).not.toContain("Stale lockfile");
+    expect(result.message).toContain("bridge is unreachable");
   });
 
   it("refuses a pidless lockfile when no editor for the project is running", async () => {
@@ -153,5 +187,34 @@ describe("start and restart without a loaded project", () => {
     expect(result.success).toBe(false);
     expect(result.message).toContain("set_project");
     expect(findInteractiveEditors).not.toHaveBeenCalled();
+  });
+});
+
+describe("native editor shutdown", () => {
+  it("uses MainFrame so standalone asset editors close before subsystem teardown", () => {
+    const source = fs.readFileSync(
+      new URL(
+        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/EditorHandlers.cpp",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const buildRules = fs.readFileSync(
+      new URL(
+        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/UE_MCP_Bridge.Build.cs",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const shutdownHandler = source.slice(
+      source.indexOf("FEditorHandlers::RequestEditorShutdown"),
+      source.indexOf("FEditorHandlers::FocusViewportOnActor"),
+    );
+
+    expect(source).toContain('#include "Interfaces/IMainFrameModule.h"');
+    expect(buildRules).toContain('"MainFrame",');
+    expect(shutdownHandler).toContain("FModuleManager::LoadModuleChecked<IMainFrameModule>");
+    expect(shutdownHandler).toContain("MainFrameModule.RequestCloseEditor()");
+    expect(shutdownHandler).not.toContain("UKismetSystemLibrary::QuitEditor()");
   });
 });

@@ -42,6 +42,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { isAbsolute, join } from "node:path";
 
 /**
  * The character under ban, written as an escape so this file is not itself a
@@ -133,11 +134,20 @@ export function readTextFile(path) {
   return buf.toString("utf8");
 }
 
+/** Resolves a caller-supplied path against the repo root, leaving absolute
+ *  paths alone. Git hands the hooks an ABSOLUTE COMMIT_EDITMSG path when the
+ *  commit happens inside a worktree, and gluing the cwd onto the front of it
+ *  produced an unreadable path, so the hook rejected every commit made from a
+ *  worktree. */
+function resolveUnder(cwd, file) {
+  return isAbsolute(file) ? file : join(cwd, file);
+}
+
 /** Scans the given files. Returns `{ file, line, column, text }` findings. */
 export function scanFiles(files, cwd = process.cwd()) {
   const findings = [];
   for (const file of files) {
-    const text = readTextFile(`${cwd}/${file}`);
+    const text = readTextFile(resolveUnder(cwd, file));
     if (text === null) continue;
     for (const f of scanText(text)) findings.push({ file, ...f });
   }
@@ -207,7 +217,7 @@ function main() {
   // something that was never read. The git hooks depend on this distinction,
   // because they pass paths and trust the exit code.
   if (named) {
-    const unreadable = named.filter((f) => readTextFile(`${process.cwd()}/${f}`) === null);
+    const unreadable = named.filter((f) => readTextFile(resolveUnder(process.cwd(), f)) === null);
     if (unreadable.length > 0) {
       for (const f of unreadable) {
         console.error(`::error::Could not read '${f}'. Paths are resolved relative to the repository root.`);

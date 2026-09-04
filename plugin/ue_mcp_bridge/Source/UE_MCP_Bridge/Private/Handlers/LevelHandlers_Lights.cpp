@@ -168,6 +168,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnLight(const TSharedPtr<FJsonObject>&
 	auto Result = MCPSuccess();
 	MCPSetCreated(Result);
 	Result->SetStringField(TEXT("actorLabel"), FinalLabel);
+	Result->SetStringField(TEXT("actorPath"), NewLight->GetPathName());
 	Result->SetStringField(TEXT("actorName"), NewLight->GetName());
 	Result->SetStringField(TEXT("lightType"), LightType);
 
@@ -182,15 +183,14 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnLight(const TSharedPtr<FJsonObject>&
 TSharedPtr<FJsonValue> FLevelHandlers::SetLightProperties(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* Actor = FindActorByLabel(World, ActorLabel);
-	if (!Actor)
-	{
-		return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
-	}
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+	if (!Actor) return ActorErr;
+	ActorLabel = Actor->GetActorLabel();
 
 	ULightComponent* LightComponent = Actor->FindComponentByClass<ULightComponent>();
 	// #608: USkyLightComponent is not a ULightComponent, so it was previously
@@ -447,6 +447,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetLightProperties(const TSharedPtr<FJson
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetNumberField(TEXT("intensity"), LightComponent ? (double)LightComponent->Intensity : (SkyForProps ? (double)SkyForProps->Intensity : 0.0));
 	Result->SetBoolField(TEXT("isSkyLight"), LightComponent == nullptr && SkyForProps != nullptr);
 	Result->SetStringField(TEXT("mobility"), MobilityToString(PropertyComponent->Mobility));
@@ -517,16 +518,45 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetFogProperties(const TSharedPtr<FJsonOb
 	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
 	if (!World) return MCPError(TEXT("World not available"));
 
-	FString ActorLabel = OptionalString(Params, TEXT("actorLabel"));
-
+	// #983: a named selector goes through the shared resolver, so a duplicated
+	// label is refused with the candidate paths rather than tuning whichever
+	// fog the actor iterator reached first. Without one, "the only fog in the
+	// level" is a default this action is entitled to, and several is reported
+	// rather than picked between.
 	AExponentialHeightFog* Fog = nullptr;
-	for (TActorIterator<AExponentialHeightFog> It(World); It; ++It)
+	FMCPActorSelector FogSelector;
+	FogSelector.bRequired = false;
+	TSharedPtr<FJsonValue> FogError;
+	if (AActor* Named = MCPResolveActor(World, Params, FogError, FogSelector))
 	{
-		if (ActorLabel.IsEmpty() || It->GetActorLabel() == ActorLabel)
+		Fog = Cast<AExponentialHeightFog>(Named);
+		if (!Fog)
 		{
-			Fog = *It;
-			break;
+			return MCPError(FString::Printf(
+				TEXT("Actor '%s' is a %s, not an ExponentialHeightFog"),
+				*Named->GetActorLabel(), *Named->GetClass()->GetName()));
 		}
+	}
+	else if (FogError.IsValid())
+	{
+		return FogError;
+	}
+	else
+	{
+		TArray<AExponentialHeightFog*> Fogs;
+		for (TActorIterator<AExponentialHeightFog> It(World); It; ++It)
+		{
+			if (IsValid(*It)) Fogs.Add(*It);
+		}
+		if (Fogs.Num() > 1)
+		{
+			TArray<FString> Labels;
+			for (AExponentialHeightFog* Candidate : Fogs) Labels.Add(Candidate->GetActorLabel());
+			return MCPError(FString::Printf(
+				TEXT("%d ExponentialHeightFog actors in the level; pass actorLabel or actorPath to choose. Available: [%s]"),
+				Fogs.Num(), *FString::Join(Labels, TEXT(", "))));
+		}
+		Fog = Fogs.Num() == 1 ? Fogs[0] : nullptr;
 	}
 	if (!Fog) return MCPError(TEXT("No ExponentialHeightFog actor found"));
 
@@ -594,6 +624,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetFogProperties(const TSharedPtr<FJsonOb
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), Fog->GetActorLabel());
+	Result->SetStringField(TEXT("actorPath"), Fog->GetPathName());
 	Result->SetNumberField(TEXT("fogDensity"), FC->FogDensity);
 	Result->SetNumberField(TEXT("fogHeightFalloff"), FC->FogHeightFalloff);
 	return MCPResult(Result);

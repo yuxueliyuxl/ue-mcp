@@ -18,49 +18,16 @@
 
 namespace
 {
-FString MakeExtractionWidgetBlueprintObjectPath(const FString& InAssetPath)
-{
-	FString ObjectPath = InAssetPath;
-	ObjectPath.TrimStartAndEndInline();
-	ObjectPath.RemoveFromStart(TEXT("WidgetBlueprint'"));
-	ObjectPath.RemoveFromEnd(TEXT("'"));
-
-	const int32 LastSlashIndex = ObjectPath.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-	const int32 DotIndex = ObjectPath.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-	if (DotIndex <= LastSlashIndex)
-	{
-		const FString AssetName = FPackageName::GetLongPackageAssetName(ObjectPath);
-		if (!AssetName.IsEmpty())
-		{
-			ObjectPath += TEXT(".") + AssetName;
-		}
-	}
-	return ObjectPath;
-}
-
+/**
+ * Extraction's loader. Delegates to the one shared resolver (#972) rather than
+ * carrying a second path-normalising, second-chance-loading copy of it: the
+ * module is a unity build, and two file-local copies of the same helper both
+ * collide and drift. A null return is still the normal "destination does not
+ * exist yet, create it" outcome here.
+ */
 UWidgetBlueprint* LoadWidgetBlueprintForExtraction(const FString& AssetPath)
 {
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	// A missing destination is the normal create path. StaticLoadObject on a
-	// non-existent package can force a blocking package search, so only use the
-	// fallback for explicit object/generated-class paths supplied by callers.
-	if (!LoadedAsset && AssetPath.Contains(TEXT(".")))
-	{
-		const FString ObjectPath = MakeExtractionWidgetBlueprintObjectPath(AssetPath);
-		LoadedAsset = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjectPath);
-	}
-
-	if (UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(LoadedAsset))
-	{
-		return WidgetBlueprint;
-	}
-
-	if (UClass* LoadedClass = Cast<UClass>(LoadedAsset))
-	{
-		return Cast<UWidgetBlueprint>(LoadedClass->ClassGeneratedBy);
-	}
-
-	return nullptr;
+	return MCPWidget::ResolveWidgetBlueprint(AssetPath).Blueprint;
 }
 
 struct FExtractedWidgetPlanEntry

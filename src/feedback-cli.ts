@@ -18,6 +18,7 @@ import {
   loadDeferred,
   type DeferredFeedback,
 } from "./feedback-deferred.js";
+import { deleteFallbackReport } from "./feedback-fallback.js";
 import { takeEditorTarget, EditorFlagError } from "./editor-flag.js";
 import { submitFeedback } from "./github-app.js";
 import {
@@ -270,6 +271,7 @@ async function approveEntry(entry: DeferredFeedback): Promise<ApproveOutcome> {
     };
   }
   deleteDeferred(entry.id);
+  deleteFallbackReport(entry.id);
   return { kind: "posted", number: result.number, url: result.url, repo: result.repo };
 }
 
@@ -363,6 +365,7 @@ async function cmdReview(): Promise<void> {
 
       if (action === "d") {
         if (deleteDeferred(entry.id)) {
+          deleteFallbackReport(entry.id);
           ok(`Discarded ${entry.id}.`);
           discarded++;
         } else {
@@ -429,6 +432,7 @@ function cmdDiscard(id: string): void {
     process.exit(1);
   }
   if (deleteDeferred(id)) {
+    deleteFallbackReport(id);
     ok(`Discarded ${id} (was: "${entry.title}").`);
   } else {
     fail(`Failed to delete ${id}.`);

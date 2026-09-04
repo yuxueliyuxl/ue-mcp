@@ -84,7 +84,18 @@ void FMCPGameThreadExecutor::DrainModalSafeQueue()
 
 TSharedPtr<FJsonValue> FMCPGameThreadExecutor::ExecuteOnGameThread(FHandlerFunction Handler, const TSharedPtr<FJsonObject>& Params, float TimeoutSeconds, bool bModalSafe)
 {
-	if (!bEditorReady)
+	// #968: the readiness gate does not apply to the handlers whose job is to
+	// clear a block. A modal raised during startup (the "Restore Packages"
+	// prompt after an unclean shutdown) holds the game thread before the editor
+	// is ready, and this gate then rejected respond_to_dialog and
+	// set_dialog_policy - the two calls that could dismiss it - with "Editor is
+	// still initializing", while get_engine_state cheerfully described the
+	// dialog down to its button labels because it answers off the game thread.
+	// The gate was blocked by the very dialog the call would have dismissed,
+	// and the only way out was an OS kill that discarded the user's autosave
+	// choice. Modal-safe handlers read or answer the active dialog through
+	// Slate and touch nothing that startup has yet to build, so they run.
+	if (!bEditorReady && !bModalSafe)
 	{
 		TSharedPtr<FJsonObject> ErrorObject = MakeShared<FJsonObject>();
 		ErrorObject->SetStringField(TEXT("error"), TEXT("Editor is still initializing. Please wait and retry."));
@@ -106,7 +117,7 @@ TSharedPtr<FJsonValue> FMCPGameThreadExecutor::ExecuteOnGameThread(FHandlerFunct
 
 	// Capture Handler and Params by value so they outlive the caller's stack
 	// if the caller abandons the wait.
-	auto RunOnce = [State, Handler, Params]()
+	auto RunOnce = [State, Handler, Params, bModalSafe]()
 	{
 		// Caller already gave up - skip the work entirely. Python may
 		// still be mid-execution; we cannot safely cancel it, but we
@@ -122,8 +133,14 @@ TSharedPtr<FJsonValue> FMCPGameThreadExecutor::ExecuteOnGameThread(FHandlerFunct
 			return;
 		}
 
-		// Safety: verify GEditor is available before running handlers
-		if (!GEditor)
+		// Safety: verify GEditor is available before running handlers.
+		//
+		// #968: except for the modal-safe ones. They go through Slate and check
+		// FSlateApplication for themselves, so GEditor is not something they
+		// need, and refusing them here would put the startup deadlock back one
+		// layer down: a dialog raised before GEditor exists is exactly the one
+		// nothing else can clear.
+		if (!GEditor && !bModalSafe)
 		{
 			TSharedPtr<FJsonObject> ErrorObject = MakeShared<FJsonObject>();
 			ErrorObject->SetStringField(TEXT("error"), TEXT("Editor world not ready yet. Retry in a moment."));

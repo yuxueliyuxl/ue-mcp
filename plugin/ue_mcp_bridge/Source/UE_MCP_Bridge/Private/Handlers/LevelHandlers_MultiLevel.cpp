@@ -1,6 +1,7 @@
 #include "LevelHandlers.h"
 
 #include "HandlerUtils.h"
+#include "HandlerEditorState.h"
 
 #include "Editor.h"
 #include "Engine/Brush.h"
@@ -39,41 +40,6 @@ namespace
 		TArray<FString> NonPersistentLabels;
 		TArray<FString> ProtectedLabels;
 	};
-
-	TArray<TSharedPtr<FJsonValue>> StringListToJson(const TArray<FString>& Values)
-	{
-		TArray<TSharedPtr<FJsonValue>> Result;
-		Result.Reserve(Values.Num());
-		for (const FString& Value : Values)
-		{
-			Result.Add(MakeShared<FJsonValueString>(Value));
-		}
-		return Result;
-	}
-
-	void CollectDirtyEditorPackageNames(TArray<FString>& OutPackageNames)
-	{
-		OutPackageNames.Reset();
-		TArray<UPackage*> DirtyPackages;
-		FEditorFileUtils::GetDirtyContentPackages(DirtyPackages);
-		FEditorFileUtils::GetDirtyWorldPackages(DirtyPackages);
-		for (UPackage* Package : DirtyPackages)
-		{
-			if (!Package || !Package->IsDirty())
-			{
-				continue;
-			}
-
-			const FString PackageName = Package->GetName();
-			if (PackageName.StartsWith(TEXT("/Script/")))
-			{
-				continue;
-			}
-
-			OutPackageNames.AddUnique(PackageName);
-		}
-		OutPackageNames.Sort();
-	}
 
 	UClass* ResolveExpectedActorClass(const FString& ClassPath, FString& OutError)
 	{
@@ -209,12 +175,12 @@ namespace
 		Result->SetNumberField(TEXT("matched"), Request.MatchedLabels.Num());
 		Result->SetNumberField(TEXT("deleted"), Request.Deleted);
 		Result->SetBoolField(TEXT("saved"), Request.bSaved);
-		Result->SetArrayField(TEXT("matchedLabels"), StringListToJson(Request.MatchedLabels));
-		Result->SetArrayField(TEXT("missingLabels"), StringListToJson(Request.MissingLabels));
-		Result->SetArrayField(TEXT("duplicateLabels"), StringListToJson(Request.DuplicateLabels));
-		Result->SetArrayField(TEXT("wrongClassLabels"), StringListToJson(Request.WrongClassLabels));
-		Result->SetArrayField(TEXT("nonPersistentLabels"), StringListToJson(Request.NonPersistentLabels));
-		Result->SetArrayField(TEXT("protectedLabels"), StringListToJson(Request.ProtectedLabels));
+		Result->SetArrayField(TEXT("matchedLabels"), MCPStringListToJson(Request.MatchedLabels));
+		Result->SetArrayField(TEXT("missingLabels"), MCPStringListToJson(Request.MissingLabels));
+		Result->SetArrayField(TEXT("duplicateLabels"), MCPStringListToJson(Request.DuplicateLabels));
+		Result->SetArrayField(TEXT("wrongClassLabels"), MCPStringListToJson(Request.WrongClassLabels));
+		Result->SetArrayField(TEXT("nonPersistentLabels"), MCPStringListToJson(Request.NonPersistentLabels));
+		Result->SetArrayField(TEXT("protectedLabels"), MCPStringListToJson(Request.ProtectedLabels));
 		if (!Request.ExpectedClassPath.IsEmpty())
 		{
 			Result->SetStringField(TEXT("expectedClassPath"), Request.ExpectedClassPath);
@@ -399,7 +365,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::DeleteExactLabeledActorsInLevels(
 	}
 
 	TArray<FString> InitialDirtyPackages;
-	CollectDirtyEditorPackageNames(InitialDirtyPackages);
+	MCPEditorState::CollectDirtyEditorPackageNames(InitialDirtyPackages);
 	if (!InitialDirtyPackages.IsEmpty())
 	{
 		auto Result = MCPSuccess();
@@ -407,7 +373,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::DeleteExactLabeledActorsInLevels(
 		Result->SetStringField(
 			TEXT("error"),
 			TEXT("Refusing to load levels while content or map packages are dirty"));
-		Result->SetArrayField(TEXT("dirtyPackages"), StringListToJson(InitialDirtyPackages));
+		Result->SetArrayField(TEXT("dirtyPackages"), MCPStringListToJson(InitialDirtyPackages));
 		return MCPResult(Result);
 	}
 
@@ -477,7 +443,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::DeleteExactLabeledActorsInLevels(
 		Result->SetArrayField(TEXT("levels"), LevelResults);
 		if (!DirtyPackages.IsEmpty())
 		{
-			Result->SetArrayField(TEXT("dirtyPackages"), StringListToJson(DirtyPackages));
+			Result->SetArrayField(TEXT("dirtyPackages"), MCPStringListToJson(DirtyPackages));
 		}
 		return MCPResult(Result);
 	};
@@ -529,7 +495,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::DeleteExactLabeledActorsInLevels(
 		}
 
 		TArray<FString> DirtyAfterLoad;
-		CollectDirtyEditorPackageNames(DirtyAfterLoad);
+		MCPEditorState::CollectDirtyEditorPackageNames(DirtyAfterLoad);
 		if (!DirtyAfterLoad.IsEmpty())
 		{
 			return BuildResult(
@@ -605,7 +571,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::DeleteExactLabeledActorsInLevels(
 		}
 
 		TArray<FString> DirtyAfterLoad;
-		CollectDirtyEditorPackageNames(DirtyAfterLoad);
+		MCPEditorState::CollectDirtyEditorPackageNames(DirtyAfterLoad);
 		if (!DirtyAfterLoad.IsEmpty())
 		{
 			return BuildResult(
@@ -717,7 +683,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::DeleteExactLabeledActorsInLevels(
 		Request.bSaved = true;
 
 		TArray<FString> DirtyAfterSave;
-		CollectDirtyEditorPackageNames(DirtyAfterSave);
+		MCPEditorState::CollectDirtyEditorPackageNames(DirtyAfterSave);
 		if (!DirtyAfterSave.IsEmpty())
 		{
 			return BuildResult(

@@ -2,9 +2,10 @@ import { checkPluginFreshness } from "../plugin-freshness.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
-import { categoryTool, bp, type ToolDef } from "../types.js";
-import { deploy, deploySummary, attach, attachSummary, findEngineInstall } from "../deployer.js";
-import { startEditor, isBridgeReachable } from "../editor-control.js";
+import { categoryTool, bp, type ToolContext, type ToolDef } from "../types.js";
+import { deploy, deploySummary, attach, attachSummary } from "../deployer.js";
+import { selectEngine } from "../engine-root.js";
+import { buildProject, startEditor, isBridgeReachable } from "../editor-control.js";
 import { resolveConfigPath, findIniFiles, parseIni, buildTagTree } from "../config-parser.js";
 import { parseHeader, collectFiles, findSourceRoots, resolveModuleDir } from "../cpp-parser.js";
 import { readDeployedBridgeApiVersion } from "../plugin/bridge-api.js";
@@ -13,6 +14,22 @@ import { searchTools, type ToolSearchHit } from "../tool-search.js";
 import { getWorkarounds } from "../workaround-tracker.js";
 import { readLogState, readEngineSnapshot } from "../engine-observer.js";
 import { switchProject, isTargetDiverged } from "../project-switch.js";
+
+/**
+ * The engine tree the engine-source readers work against.
+ *
+ * These used to ask the .uproject's EngineAssociation and nothing else, so a
+ * project whose engine is a source build beside it got "Could not resolve
+ * engine install path" while `Build.bat` sat one directory up (#962). They now
+ * go through the same resolver `build_project` uses, and the failure it throws
+ * names every path probed instead of one env var.
+ */
+function requireEngineRoot(ctx: ToolContext): string {
+  ctx.project.ensureLoaded();
+  const engineRoot = selectEngine(ctx.project.engineLookup(), "engineRoot").engineRoot;
+  if (!engineRoot) throw new Error("Could not resolve engine install path");
+  return engineRoot;
+}
 
 /**
  * Resolve a module name to its Source/<Module> directory, searching the project
@@ -461,9 +478,7 @@ export const projectTool: ToolDef = categoryTool(
     read_engine_header: {
       description: "Parse a .h file from the engine source tree. Params: headerPath (relative to Engine/Source, or absolute)",
       handler: async (ctx, p) => {
-        ctx.project.ensureLoaded();
-        const engineRoot = findEngineInstall(ctx.project.engineAssociation ?? null);
-        if (!engineRoot) throw new Error("Could not resolve engine install path");
+        const engineRoot = requireEngineRoot(ctx);
         const headerPath = p.headerPath as string;
         const resolved = path.isAbsolute(headerPath)
           ? headerPath
@@ -476,9 +491,7 @@ export const projectTool: ToolDef = categoryTool(
     find_engine_symbol: {
       description: "Grep engine headers for a symbol. Params: symbol, maxResults?",
       handler: async (ctx, p) => {
-        ctx.project.ensureLoaded();
-        const engineRoot = findEngineInstall(ctx.project.engineAssociation ?? null);
-        if (!engineRoot) throw new Error("Could not resolve engine install path");
+        const engineRoot = requireEngineRoot(ctx);
         const engineSource = path.join(engineRoot, "Engine", "Source", "Runtime");
         if (!fs.existsSync(engineSource)) throw new Error(`Engine source not found: ${engineSource}`);
         const symbol = p.symbol as string;
@@ -508,9 +521,7 @@ export const projectTool: ToolDef = categoryTool(
     list_engine_modules: {
       description: "List modules in Engine/Source/Runtime",
       handler: async (ctx) => {
-        ctx.project.ensureLoaded();
-        const engineRoot = findEngineInstall(ctx.project.engineAssociation ?? null);
-        if (!engineRoot) throw new Error("Could not resolve engine install path");
+        const engineRoot = requireEngineRoot(ctx);
         const runtimeDir = path.join(engineRoot, "Engine", "Source", "Runtime");
         if (!fs.existsSync(runtimeDir)) throw new Error(`Runtime dir not found: ${runtimeDir}`);
         const modules = fs.readdirSync(runtimeDir, { withFileTypes: true })
@@ -522,10 +533,7 @@ export const projectTool: ToolDef = categoryTool(
     search_engine_cpp: {
       description: "Search engine .h/.cpp/.inl files across Runtime/Editor/Developer/Plugins. Params: query, tree? (Runtime|Editor|Developer|Plugins|all - default Runtime), subdirectory?, maxResults? (default 500)",
       handler: async (ctx, p) => {
-        ctx.project.ensureLoaded();
-        const resolvedEngineRoot = findEngineInstall(ctx.project.engineAssociation ?? null);
-        if (!resolvedEngineRoot) throw new Error("Could not resolve engine install path");
-        const engineRoot: string = resolvedEngineRoot;
+        const engineRoot: string = requireEngineRoot(ctx);
         const query = (p.query as string)?.toLowerCase();
         if (!query) throw new Error("Missing required parameter 'query'");
         const tree = (p.tree as string) ?? "Runtime";
@@ -643,7 +651,27 @@ export const projectTool: ToolDef = categoryTool(
       },
     },
     set_config: bp("Write to INI. Params: configName, section, key, value", "set_config"),
-    build: bp("Build C++ project. Params: configuration?, platform?, clean?", "build_project"),
+    build: {
+      // #958: this used to be dispatched over the editor bridge, so it failed
+      // with ECONNREFUSED whenever the editor was down. That made it unusable
+      // for its only real job: UnrealBuildTool refuses to link while an editor
+      // holds the module DLLs, so a full rebuild has to happen with the editor
+      // stopped. It runs UnrealBuildTool out of process instead, which needs no
+      // editor at all.
+      description:
+        "Build the project's C++ out of process with UnrealBuildTool. Works with the editor STOPPED, which a full rebuild requires (UBT cannot link while an editor holds the module DLLs). Blocks until the build finishes and returns the compiler output. Params: configuration? (default Development), platform? (default the host platform), clean? (#958)",
+      handler: async (ctx, p) => {
+        ctx.project.ensureLoaded();
+        const lines: string[] = [];
+        const result = await buildProject(ctx.project.projectPath!, {
+          onOutput: (text) => lines.push(text),
+          configuration: p.configuration as string | undefined,
+          platform: p.platform as string | undefined,
+          clean: p.clean as boolean | undefined,
+        });
+        return { ...result, output: lines.join("") };
+      },
+    },
     generate_project_files: bp("Generate IDE project files (Visual Studio, Xcode, etc.)", "generate_project_files"),
 
     // v0.7.13 - native C++ authoring. Bridge handlers wrap
@@ -688,6 +716,11 @@ export const projectTool: ToolDef = categoryTool(
       "Report Live Coding availability/state (available, started, enabledForSession, compiling). Helps choose between live_coding_compile and build_project.",
       "live_coding_status",
       () => ({}),
+    ),
+    resolve_collision_profile: bp(
+      "Read one collision profile's resolved per-channel responses: collisionEnabled, objectType, and every channel with Block/Overlap/Ignore. This is the project-side half of blueprint(get_component_collision) (#925): a component's ResponseArray only lists the channels it OVERRIDES, so the profile is where an inherited response actually comes from. Project trace and object channels appear under their configured names, with enumName (ECC_GameTraceChannel1) alongside so a caller can key on something stable. By default the eight engine channels plus every channel the project configured are returned; includeAllChannels=true adds the unused slots. channel narrows it to one. A profile that does not exist lists the ones that do. Params: profileName, channel?, includeAllChannels?",
+      "resolve_collision_profile",
+      (p) => ({ profileName: p.profileName, channel: p.channel, includeAllChannels: p.includeAllChannels }),
     ),
 
     write_cpp_file: {
@@ -985,5 +1018,8 @@ export const projectTool: ToolDef = categoryTool(
     declaration: z.string().optional().describe("For add_cpp_member: full UPROPERTY(...) / UFUNCTION(...) block plus the member or function signature."),
     memberName: z.string().optional().describe("For add_cpp_member: the identifier the declaration introduces (used for idempotency)."),
     access: z.enum(["public", "private"]).optional().describe("For add_module_dependency: 'public' (PublicDependencyModuleNames) or 'private' (default)."),
+    profileName: z.string().optional().describe("For resolve_collision_profile: the profile to resolve, e.g. 'Pawn', 'BlockAll', or one the project defined."),
+    channel: z.string().optional().describe("For resolve_collision_profile: narrow the answer to one channel. Accepts the configured name ('Camera', 'Weapon'), the C++ enumerator ('ECC_Camera'), or the container index."),
+    includeAllChannels: z.boolean().optional().describe("For resolve_collision_profile: include the unused GameTraceChannel slots as well as the engine channels and the project's own. Default false."),
   },
 );

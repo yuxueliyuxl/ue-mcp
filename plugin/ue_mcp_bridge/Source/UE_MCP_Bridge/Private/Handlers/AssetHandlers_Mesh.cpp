@@ -47,13 +47,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetMeshMaterial(const TSharedPtr<FJsonObj
 
 	int32 SlotIndex = OptionalInt(Params, TEXT("slotIndex"), 0);
 
-	UStaticMesh* Mesh = Cast<UStaticMesh>(StaticLoadObject(UStaticMesh::StaticClass(), nullptr, *AssetPath));
+	UStaticMesh* Mesh = LoadAssetByPath<UStaticMesh>(AssetPath);
 	if (!Mesh)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load static mesh at '%s'"), *AssetPath));
 	}
 
-	UMaterialInterface* Material = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, *MaterialPath));
+	UMaterialInterface* Material = LoadAssetByPath<UMaterialInterface>(MaterialPath);
 	if (!Material)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
@@ -645,7 +645,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::RecenterPivot(const TSharedPtr<FJsonObjec
 	TArray<UStaticMesh*> Meshes;
 	for (const FString& Path : AssetPaths)
 	{
-		UStaticMesh* Mesh = Cast<UStaticMesh>(StaticLoadObject(UStaticMesh::StaticClass(), nullptr, *Path));
+		UStaticMesh* Mesh = LoadAssetByPath<UStaticMesh>(Path);
 		if (!Mesh)
 		{
 			return MCPError(FString::Printf(TEXT("Failed to load static mesh at '%s'"), *Path));
@@ -731,7 +731,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetSkeletalMeshMaterialSlots(const TShare
 		return MCPError(TEXT("Missing 'slots' array parameter"));
 	}
 
-	USkeletalMesh* Mesh = Cast<USkeletalMesh>(StaticLoadObject(USkeletalMesh::StaticClass(), nullptr, *AssetPath));
+	USkeletalMesh* Mesh = LoadAssetByPath<USkeletalMesh>(AssetPath);
 	if (!Mesh) return MCPError(FString::Printf(TEXT("SkeletalMesh not found: %s"), *AssetPath));
 
 	Mesh->Modify();
@@ -753,7 +753,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetSkeletalMeshMaterialSlots(const TShare
 			continue;
 		}
 
-		UMaterialInterface* Material = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, *MaterialPath));
+		UMaterialInterface* Material = LoadAssetByPath<UMaterialInterface>(MaterialPath);
 		if (!Material)
 		{
 			Errors.Add(FString::Printf(TEXT("material not found: %s"), *MaterialPath));

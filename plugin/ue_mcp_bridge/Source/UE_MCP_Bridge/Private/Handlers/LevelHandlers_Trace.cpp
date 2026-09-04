@@ -21,6 +21,29 @@
 namespace
 {
 	/**
+	 * #933: the world a trace runs in, taken from the request's own `world`
+	 * (editor|pie|game|auto) plus `pieInstance`, through ResolveWorldFromParams -
+	 * the one resolver every other world-scoped action in this category already
+	 * goes through. Written once here because all three trace actions need it and
+	 * a second copy of the resolution is how the two would drift apart again.
+	 *
+	 * On failure OutError carries the response to return, so the caller does not
+	 * restate the message and the three actions cannot disagree about it.
+	 */
+	static UWorld* ResolveTraceWorld(const TSharedPtr<FJsonObject>& Params, TSharedPtr<FJsonValue>& OutError)
+	{
+		const FString Scope = OptionalString(Params, TEXT("world"), TEXT("editor"));
+		UWorld* World = ResolveWorldFromParams(Params, *Scope);
+		if (!World)
+		{
+			OutError = MCPError(FString::Printf(
+				TEXT("World not available for scope '%s'. world='pie' needs a running PIE session; see editor(list_pie_instances)."),
+				*Scope));
+		}
+		return World;
+	}
+
+	/**
 	 * Channel display names come from the project's collision settings, so a project
 	 * that renamed GameTraceChannel1 to "Weapon" can be traced by that name. The
 	 * built-in table is the fallback for the case where the profile config has not
@@ -90,6 +113,20 @@ namespace
 		return FString::Join(Names, TEXT(", "));
 	}
 
+	/** Which world answered: "editor", "pie", "game" or "other". */
+	static FString DescribeTracedWorld(const UWorld* World)
+	{
+		if (!World) return TEXT("none");
+		switch (World->WorldType)
+		{
+			case EWorldType::Editor:        return TEXT("editor");
+			case EWorldType::EditorPreview: return TEXT("editorPreview");
+			case EWorldType::PIE:           return TEXT("pie");
+			case EWorldType::Game:          return TEXT("game");
+			default:                        return TEXT("other");
+		}
+	}
+
 	static void EmitHitFields(TSharedPtr<FJsonObject> Result, const FHitResult& Hit)
 	{
 		AActor* HitActor = Hit.GetActor();
@@ -97,6 +134,9 @@ namespace
 		if (HitActor)
 		{
 			Result->SetStringField(TEXT("actorLabel"), HitActor->GetActorLabel());
+			// #983: a trace hit is exactly where a caller needs the precise
+			// selector, since it did not choose the actor at all.
+			Result->SetStringField(TEXT("actorPath"), HitActor->GetPathName());
 			Result->SetStringField(TEXT("actorClass"), HitActor->GetClass()->GetName());
 		}
 		if (HitComp)
@@ -115,92 +155,170 @@ namespace
 		if (Hit.BoneName != NAME_None) Result->SetStringField(TEXT("boneName"), Hit.BoneName.ToString());
 		if (Hit.PhysMaterial.IsValid()) Result->SetStringField(TEXT("physicalMaterial"), Hit.PhysMaterial->GetPathName());
 	}
+
+	/** One line_trace. Shared by the single-item handler and bulk_line_trace. */
+	static TSharedPtr<FJsonValue> ExecuteLineTrace(UWorld* World, const TSharedPtr<FJsonObject>& Params)
+	{
+		if (!Params->HasField(TEXT("start")))
+		{
+			return MCPError(TEXT("Missing 'start' vector"));
+		}
+		const FVector Start = OptionalVec3(Params, TEXT("start"));
+		FVector End;
+		if (Params->HasField(TEXT("end")))
+		{
+			End = OptionalVec3(Params, TEXT("end"));
+		}
+		else if (Params->HasField(TEXT("direction")))
+		{
+			FVector Dir = OptionalVec3(Params, TEXT("direction"));
+			if (!Dir.Normalize())
+			{
+				return MCPError(TEXT("'direction' must be a non-zero vector"));
+			}
+			const double Distance = OptionalNumber(Params, TEXT("distance"), 200000.0);
+			End = Start + Dir * Distance;
+		}
+		else
+		{
+			return MCPError(TEXT("Pass either 'end' (Vec3) or 'direction' (Vec3) + 'distance?'"));
+		}
+
+		// Gameplay traces run against simple collision unless they ask otherwise, so a
+		// trace taken here to verify in-game behaviour has to do the same by default.
+		// Complex geometry and its simple hull can be far apart, and a per-triangle hit
+		// the running game never produces reads as a confirmed impact point.
+		const bool bTraceComplex = OptionalBool(Params, TEXT("traceComplex"), false);
+
+		// Visibility is the editor picking channel. A gameplay trace usually runs on
+		// another one, and blocking differs per channel, so the channel has to be
+		// selectable for the result to mean anything about the game.
+		ECollisionChannel Channel = ECC_Visibility;
+		FString ChannelName = TEXT("Visibility");
+		const FString RequestedChannel = OptionalString(Params, TEXT("channel"));
+		if (!RequestedChannel.IsEmpty() && !ResolveTraceChannel(RequestedChannel, Channel, ChannelName))
+		{
+			return MCPError(FString::Printf(
+				TEXT("Unknown collision channel '%s'. Available channels: %s"),
+				*RequestedChannel, *DescribeTraceChannels()));
+		}
+
+		FCollisionQueryParams Query(SCENE_QUERY_STAT(MCPLineTrace), bTraceComplex);
+		Query.bReturnPhysicalMaterial = true;
+		Query.bReturnFaceIndex = bTraceComplex;
+
+		const TArray<TSharedPtr<FJsonValue>>* IgnoreArr = nullptr;
+		if (Params->TryGetArrayField(TEXT("ignoreActors"), IgnoreArr) && IgnoreArr)
+		{
+			for (const TSharedPtr<FJsonValue>& V : *IgnoreArr)
+			{
+				FString Label;
+				if (!V->TryGetString(Label)) continue;
+				// #983: an ignore list is the plural case. A label naming
+				// three actors ignores all three, which is what the caller
+				// meant and what ignoring one of them silently was not.
+				TArray<AActor*> Matches;
+				MCPCollectActorsByToken(World, Label, EMCPActorMatch::LabelNameOrPath, Matches);
+				for (AActor* A : Matches) Query.AddIgnoredActor(A);
+			}
+		}
+
+		FHitResult Hit;
+		const bool bHit = World->LineTraceSingleByChannel(Hit, Start, End, Channel, Query);
+
+		auto Result = MCPSuccess();
+		Result->SetBoolField(TEXT("hit"), bHit);
+		Result->SetObjectField(TEXT("start"), MCPVec3ToJsonObject(Start));
+		Result->SetObjectField(TEXT("end"), MCPVec3ToJsonObject(End));
+		// Report the collision semantics the result was produced under, so a caller
+		// comparing against the game can see which one it got.
+		Result->SetBoolField(TEXT("traceComplex"), bTraceComplex);
+		Result->SetStringField(TEXT("channel"), ChannelName);
+		// #933: name the world that actually answered. A caller comparing a PIE
+		// trace against an editor trace has no other way to tell them apart, and
+		// silently answering from the wrong one is the bug this closes.
+		Result->SetStringField(TEXT("world"), DescribeTracedWorld(World));
+		if (bHit) EmitHitFields(Result, Hit);
+		return MCPResult(Result);
+	}
 }
 
 
+// #933: `world` selects the world the trace runs against, the same way every
+// other PIE-aware action in this category does. REQUIRE_EDITOR_WORLD ignored the
+// parameter, so a trace asked for during PIE answered from the editor world and
+// reported the pre-play geometry as though it were the running game's. That is
+// the worst shape of wrong answer: nothing about it looks wrong.
 TSharedPtr<FJsonValue> FLevelHandlers::LineTrace(const TSharedPtr<FJsonObject>& Params)
 {
-	REQUIRE_EDITOR_WORLD(World);
+	TSharedPtr<FJsonValue> WorldError;
+	UWorld* World = ResolveTraceWorld(Params, WorldError);
+	if (!World) return WorldError;
+	return ExecuteLineTrace(World, Params);
+}
 
-	const FVector Start = OptionalVec3(Params, TEXT("start"));
-	FVector End;
-	if (Params->HasField(TEXT("end")))
-	{
-		End = OptionalVec3(Params, TEXT("end"));
-	}
-	else if (Params->HasField(TEXT("direction")))
-	{
-		FVector Dir = OptionalVec3(Params, TEXT("direction"));
-		if (!Dir.Normalize())
-		{
-			return MCPError(TEXT("'direction' must be a non-zero vector"));
-		}
-		const double Distance = OptionalNumber(Params, TEXT("distance"), 200000.0);
-		End = Start + Dir * Distance;
-	}
-	else
-	{
-		return MCPError(TEXT("Pass either 'end' (Vec3) or 'direction' (Vec3) + 'distance?'"));
-	}
 
-	// Gameplay traces run against simple collision unless they ask otherwise, so a
-	// trace taken here to verify in-game behaviour has to do the same by default.
-	// Complex geometry and its simple hull can be far apart, and a per-triangle hit
-	// the running game never produces reads as a confirmed impact point.
-	const bool bTraceComplex = OptionalBool(Params, TEXT("traceComplex"), false);
+TSharedPtr<FJsonValue> FLevelHandlers::BulkLineTrace(const TSharedPtr<FJsonObject>& Params)
+{
+	// #933: one world for the whole batch, chosen by the top-level `world`. A
+	// per-item scope would let one batch straddle two worlds and report the
+	// results in one array as though they were comparable.
+	TSharedPtr<FJsonValue> WorldError;
+	UWorld* World = ResolveTraceWorld(Params, WorldError);
+	if (!World) return WorldError;
 
-	// Visibility is the editor picking channel. A gameplay trace usually runs on
-	// another one, and blocking differs per channel, so the channel has to be
-	// selectable for the result to mean anything about the game.
-	ECollisionChannel Channel = ECC_Visibility;
-	FString ChannelName = TEXT("Visibility");
-	const FString RequestedChannel = OptionalString(Params, TEXT("channel"));
-	if (!RequestedChannel.IsEmpty() && !ResolveTraceChannel(RequestedChannel, Channel, ChannelName))
+	constexpr int32 MaxBulkLineTraces = 256;
+	const TArray<TSharedPtr<FJsonValue>>* Traces = nullptr;
+	if (!Params->TryGetArrayField(TEXT("traces"), Traces) || !Traces)
+	{
+		return MCPError(TEXT("Missing 'traces' array"));
+	}
+	if (Traces->Num() == 0)
+	{
+		return MCPError(TEXT("'traces' must contain at least one line trace"));
+	}
+	if (Traces->Num() > MaxBulkLineTraces)
 	{
 		return MCPError(FString::Printf(
-			TEXT("Unknown collision channel '%s'. Available channels: %s"),
-			*RequestedChannel, *DescribeTraceChannels()));
+			TEXT("'traces' exceeds the maximum batch size of %d (received %d)"),
+			MaxBulkLineTraces, Traces->Num()));
 	}
 
-	FCollisionQueryParams Query(SCENE_QUERY_STAT(MCPLineTrace), bTraceComplex);
-	Query.bReturnPhysicalMaterial = true;
-	Query.bReturnFaceIndex = bTraceComplex;
-
-	const TArray<TSharedPtr<FJsonValue>>* IgnoreArr = nullptr;
-	if (Params->TryGetArrayField(TEXT("ignoreActors"), IgnoreArr) && IgnoreArr)
+	TArray<TSharedPtr<FJsonValue>> Results;
+	Results.Reserve(Traces->Num());
+	for (int32 Index = 0; Index < Traces->Num(); ++Index)
 	{
-		for (const TSharedPtr<FJsonValue>& V : *IgnoreArr)
+		const TSharedPtr<FJsonValue>& Entry = (*Traces)[Index];
+		const TSharedPtr<FJsonObject> Item = Entry.IsValid() ? Entry->AsObject() : nullptr;
+		if (!Item.IsValid())
 		{
-			FString Label;
-			if (!V->TryGetString(Label)) continue;
-			if (AActor* A = FindActorByLabel(World, Label)) Query.AddIgnoredActor(A);
+			Results.Add(MCPError(FString::Printf(TEXT("traces[%d] must be an object"), Index)));
+			continue;
 		}
+		Results.Add(ExecuteLineTrace(World, Item));
 	}
-
-	FHitResult Hit;
-	const bool bHit = World->LineTraceSingleByChannel(Hit, Start, End, Channel, Query);
 
 	auto Result = MCPSuccess();
-	Result->SetBoolField(TEXT("hit"), bHit);
-	Result->SetObjectField(TEXT("start"), MCPVec3ToJsonObject(Start));
-	Result->SetObjectField(TEXT("end"), MCPVec3ToJsonObject(End));
-	// Report the collision semantics the result was produced under, so a caller
-	// comparing against the game can see which one it got.
-	Result->SetBoolField(TEXT("traceComplex"), bTraceComplex);
-	Result->SetStringField(TEXT("channel"), ChannelName);
-	if (bHit) EmitHitFields(Result, Hit);
+	Result->SetArrayField(TEXT("results"), Results);
+	Result->SetNumberField(TEXT("count"), Results.Num());
 	return MCPResult(Result);
 }
 
 
 TSharedPtr<FJsonValue> FLevelHandlers::SnapActorToFloor(const TSharedPtr<FJsonObject>& Params)
 {
-	REQUIRE_EDITOR_WORLD(World);
+	// #933: same defect as line_trace. The actor is looked up in this world and
+	// the downward trace runs in it, so both halves have to agree on which one.
+	TSharedPtr<FJsonValue> WorldError;
+	UWorld* World = ResolveTraceWorld(Params, WorldError);
+	if (!World) return WorldError;
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
-	AActor* Actor = FindActorByLabel(World, ActorLabel);
-	if (!Actor) return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+	if (!Actor) return ActorErr;
+	ActorLabel = Actor->GetActorLabel();
 
 	const double Offset = OptionalNumber(Params, TEXT("floorOffset"), 0.0);
 	const double MaxDistance = OptionalNumber(Params, TEXT("maxDistance"), 100000.0);
@@ -231,6 +349,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SnapActorToFloor(const TSharedPtr<FJsonOb
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetObjectField(TEXT("from"), MCPVec3ToJsonObject(PrevLoc));
 	Result->SetObjectField(TEXT("to"), MCPVec3ToJsonObject(NewLoc));
 	Result->SetObjectField(TEXT("impactPoint"), MCPVec3ToJsonObject(Hit.ImpactPoint));
@@ -239,6 +358,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SnapActorToFloor(const TSharedPtr<FJsonOb
 
 	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Payload->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	TSharedPtr<FJsonObject> Loc = MakeShared<FJsonObject>();
 	Loc->SetNumberField(TEXT("x"), PrevLoc.X);
 	Loc->SetNumberField(TEXT("y"), PrevLoc.Y);

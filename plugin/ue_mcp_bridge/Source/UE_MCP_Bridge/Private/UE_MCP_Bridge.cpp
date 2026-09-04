@@ -7,8 +7,11 @@
 #include "Handlers/DialogHandlers.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
+#include "HAL/PlatformMisc.h"
+#include "Misc/CommandLine.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/CoreDelegates.h"
+#include "Misc/Parse.h"
 #include "Containers/Ticker.h"
 
 DEFINE_LOG_CATEGORY(LogMCPBridge);
@@ -19,6 +22,76 @@ static TSharedPtr<FMCPBridgeServer> G_BridgeServer;
 FMCPBridgeServer* FUE_MCP_BridgeModule::GetBridgeServer()
 {
 	return G_BridgeServer.Get();
+}
+
+namespace
+{
+	/**
+	 * #968: dialog policies supplied at launch, before anything can wedge.
+	 *
+	 * A modal raised during startup blocks the game thread, and while the
+	 * dialog handlers can now clear one from outside, an agent that already
+	 * knows the answer should not have to. `UE_MCP_DIALOG_POLICY` (or
+	 * `-MCPDialogPolicy=`) is a semicolon separated list of `pattern=response`
+	 * pairs, applied here at module startup so the very first prompt is already
+	 * covered:
+	 *
+	 *     UE_MCP_DIALOG_POLICY="Restore=no;Would you like to rebuild=yes"
+	 *
+	 * The response words are exactly the ones set_dialog_policy accepts,
+	 * because each entry is applied by dispatching set_dialog_policy itself
+	 * rather than by a second copy of its parsing. An entry that is not a
+	 * pattern=response pair is skipped and said out loud: a policy that
+	 * silently does nothing is worse than no policy at all.
+	 */
+	FString ReadConfiguredDialogPolicy()
+	{
+		FString FromCommandLine;
+		if (FParse::Value(FCommandLine::Get(), TEXT("MCPDialogPolicy="), FromCommandLine) && !FromCommandLine.IsEmpty())
+		{
+			return FromCommandLine;
+		}
+		return FPlatformMisc::GetEnvironmentVariable(TEXT("UE_MCP_DIALOG_POLICY"));
+	}
+
+	void ApplyConfiguredDialogPolicies(FMCPHandlerRegistry& Registry)
+	{
+		const FString Spec = ReadConfiguredDialogPolicy();
+		if (Spec.IsEmpty())
+		{
+			return;
+		}
+
+		TArray<FString> Entries;
+		Spec.ParseIntoArray(Entries, TEXT(";"), /*InCullEmpty*/ true);
+		for (const FString& Entry : Entries)
+		{
+			// Split on the LAST '=' so a pattern may contain one.
+			int32 Separator = INDEX_NONE;
+			if (!Entry.FindLastChar(TEXT('='), Separator))
+			{
+				UE_LOG(LogMCPBridge, Warning,
+					TEXT("[UE-MCP] Dialog policy entry '%s' has no 'pattern=response' separator and was ignored."), *Entry);
+				continue;
+			}
+			const FString Pattern = Entry.Left(Separator).TrimStartAndEnd();
+			const FString Response = Entry.Mid(Separator + 1).TrimStartAndEnd();
+			if (Pattern.IsEmpty() || Response.IsEmpty())
+			{
+				UE_LOG(LogMCPBridge, Warning,
+					TEXT("[UE-MCP] Dialog policy entry '%s' names an empty pattern or response and was ignored."), *Entry);
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> PolicyParams = MakeShared<FJsonObject>();
+			PolicyParams->SetStringField(TEXT("pattern"), Pattern);
+			PolicyParams->SetStringField(TEXT("response"), Response);
+			Registry.ExecuteHandler(TEXT("set_dialog_policy"), PolicyParams);
+
+			UE_LOG(LogMCPBridge, Log,
+				TEXT("[UE-MCP] Startup dialog policy applied: '%s' answers '%s'"), *Pattern, *Response);
+		}
+	}
 }
 
 void FUE_MCP_BridgeModule::StartupModule()
@@ -55,6 +128,13 @@ void FUE_MCP_BridgeModule::StartupModule()
 	FDialogHandlers::AddDefaultPolicy(TEXT("Untitled"), EAppReturnType::No);
 	FDialogHandlers::AddDefaultPolicy(TEXT("save your changes"), EAppReturnType::No);
 	FDialogHandlers::AddDefaultPolicy(TEXT("save the level"), EAppReturnType::No);
+
+	// #968: policies the launcher asked for, applied before the socket is even
+	// listening, so a prompt raised during startup is answered rather than
+	// waited on. Matching is first-registered-wins, so these sit behind the
+	// safety nets above and add to them rather than reopening a save prompt
+	// that already has a settled answer.
+	ApplyConfiguredDialogPolicies(G_BridgeServer->GetHandlerRegistry());
 
 	if (G_BridgeServer->Start())
 	{

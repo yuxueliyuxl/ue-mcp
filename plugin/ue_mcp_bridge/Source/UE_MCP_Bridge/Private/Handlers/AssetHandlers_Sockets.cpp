@@ -49,7 +49,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::AddSocket(const TSharedPtr<FJsonObject>& 
 		RelScale.Z = (*ScaleObj)->GetNumberField(TEXT("z"));
 	}
 
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+	UObject* Asset = MCPLoadAssetObject(AssetPath);
 	if (!Asset)
 	{
 		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
@@ -306,7 +306,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::RemoveSocket(const TSharedPtr<FJsonObject
 	FString SocketName;
 	if (auto Err = RequireString(Params, TEXT("socketName"), SocketName)) return Err;
 
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+	UObject* Asset = MCPLoadAssetObject(AssetPath);
 	if (!Asset)
 	{
 		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
@@ -405,7 +405,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListSockets(const TSharedPtr<FJsonObject>
 	FString AssetPath;
 	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;
 
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+	UObject* Asset = MCPLoadAssetObject(AssetPath);
 	if (!Asset)
 	{
 		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
@@ -545,7 +545,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetSocketTransform(const TSharedPtr<FJson
 	FString SocketName;
 	if (auto Err = RequireString(Params, TEXT("socketName"), SocketName)) return Err;
 
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+	UObject* Asset = MCPLoadAssetObject(AssetPath);
 	if (!Asset)
 	{
 		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));

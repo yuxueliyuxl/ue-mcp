@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  bridgeInstancesDir,
   bridgeLockfilePath,
   isPidAlive,
   lockfileIsFromThisLaunch,
@@ -121,6 +122,81 @@ describe("resolveBridgeTarget", () => {
     writeLockfile(projectDir, { port: -1, pid: 5 });
     const target = resolveBridgeTarget(projectDir);
     expect(target.ok).toBe(false);
+  });
+});
+
+describe("resolveBridgeTarget instance-record fallback (#934)", () => {
+  function writeInstanceRecord(projectDir: string, contents: Record<string, unknown>): string {
+    const file = path.join(bridgeInstancesDir(projectDir), `${contents.pid}.json`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(contents));
+    return file;
+  }
+
+  it("recovers the surviving editor's port after the other one removed port.json", () => {
+    // Stopping one editor of a project used to leave the other unreachable:
+    // the quitting instance took the shared lockfile with it, and nothing read
+    // the per-process record the survivor had published for itself.
+    const projectDir = makeProjectDir();
+    const record = writeInstanceRecord(projectDir, { pid: 4242, port: 51999, state: "listening" });
+
+    const target = resolveBridgeTarget(projectDir, (pid) => pid === 4242);
+    expect(target.ok).toBe(true);
+    if (!target.ok) return;
+    expect(target.port).toBe(51999);
+    expect(target.pid).toBe(4242);
+    expect(target.source).toBe("instance-record");
+    expect(target.recordPath).toBe(record);
+  });
+
+  it("prefers the shared lockfile when there is one", () => {
+    const projectDir = makeProjectDir();
+    writeLockfile(projectDir, { port: 52001, pid: 99 });
+    writeInstanceRecord(projectDir, { pid: 4242, port: 51999, state: "listening" });
+
+    const target = resolveBridgeTarget(projectDir, () => true);
+    expect(target.ok).toBe(true);
+    if (!target.ok) return;
+    expect(target.port).toBe(52001);
+    expect(target.source).toBe("port.json");
+  });
+
+  it("ignores a record whose process is gone", () => {
+    const projectDir = makeProjectDir();
+    writeInstanceRecord(projectDir, { pid: 4242, port: 51999, state: "listening" });
+    expect(resolveBridgeTarget(projectDir, () => false).ok).toBe(false);
+  });
+
+  it("never dials a bind-failed record, which names no listening port", () => {
+    const projectDir = makeProjectDir();
+    writeInstanceRecord(projectDir, { pid: 4242, port: 51999, state: "bind-failed" });
+    expect(resolveBridgeTarget(projectDir, () => true).ok).toBe(false);
+  });
+
+  it("takes the newest live record when two editors of one project are up", () => {
+    const projectDir = makeProjectDir();
+    const older = writeInstanceRecord(projectDir, { pid: 111, port: 51001, state: "listening" });
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(older, past, past);
+    writeInstanceRecord(projectDir, { pid: 222, port: 51002, state: "listening" });
+
+    const target = resolveBridgeTarget(projectDir, () => true);
+    expect(target.ok).toBe(true);
+    if (!target.ok) return;
+    expect(target.pid).toBe(222);
+  });
+
+  it("skips an unreadable record rather than losing the readable one next to it", () => {
+    const projectDir = makeProjectDir();
+    const dir = bridgeInstancesDir(projectDir);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "half-written.json"), "{ not json");
+    writeInstanceRecord(projectDir, { pid: 4242, port: 51999, state: "listening" });
+
+    const target = resolveBridgeTarget(projectDir, () => true);
+    expect(target.ok).toBe(true);
+    if (!target.ok) return;
+    expect(target.port).toBe(51999);
   });
 });
 

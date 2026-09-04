@@ -16,6 +16,75 @@
 #include "GameplayEffect.h"
 #include "GameplayEffectTypes.h"
 #include "GameplayTagContainer.h"
+#include "UObject/UObjectHash.h"
+#include "UObject/UnrealType.h"
+
+namespace MCPGas
+{
+
+int32 AdoptOwnerAttributeSets(
+	UAbilitySystemComponent* ASC,
+	AActor* Actor,
+	TArray<FString>& OutAdoptedClassNames)
+{
+	if (!ASC || !Actor) return 0;
+
+	TArray<UObject*> Subobjects;
+	GetObjectsWithOuter(Actor, Subobjects);
+
+	int32 Adopted = 0;
+	for (UObject* Object : Subobjects)
+	{
+		UAttributeSet* Set = Cast<UAttributeSet>(Object);
+		if (!IsValid(Set)) continue;
+		// Already registered: leave the existing entry alone. Re-adding would
+		// not duplicate it, but skipping keeps the "newly registered" count
+		// honest, and that count is what the result reports.
+		if (ASC->GetSpawnedAttributes().Contains(Set)) continue;
+		ASC->AddSpawnedAttribute(Set);
+		OutAdoptedClassNames.Add(Set->GetClass()->GetName());
+		++Adopted;
+	}
+	return Adopted;
+}
+
+FStructProperty* FindAttributeDataProperty(UClass* SetClass, const FString& Name)
+{
+	if (!SetClass) return nullptr;
+	const FString SetName = SetClass->GetName();
+	for (TFieldIterator<FProperty> It(SetClass); It; ++It)
+	{
+		FStructProperty* SProp = CastField<FStructProperty>(*It);
+		if (!SProp || SProp->Struct != FGameplayAttributeData::StaticStruct()) continue;
+		const FString PropName = SProp->GetName();
+		if (PropName == Name
+			|| (SetName + TEXT(".") + PropName) == Name
+			|| (SetName + TEXT(":") + PropName) == Name)
+		{
+			return SProp;
+		}
+	}
+	return nullptr;
+}
+
+FString ListAttributeDataPropertyNames(UClass* SetClass)
+{
+	TArray<FString> Names;
+	if (SetClass)
+	{
+		for (TFieldIterator<FProperty> It(SetClass); It; ++It)
+		{
+			FStructProperty* SProp = CastField<FStructProperty>(*It);
+			if (SProp && SProp->Struct == FGameplayAttributeData::StaticStruct())
+			{
+				Names.Add(SProp->GetName());
+			}
+		}
+	}
+	return Names.Num() > 0 ? FString::Join(Names, TEXT(", ")) : FString(TEXT("(none)"));
+}
+
+}
 
 namespace
 {
@@ -26,7 +95,7 @@ namespace
 		return ResolveWorldScope(OptionalString(Params, TEXT("world"), TEXT("auto")));
 	}
 
-	// Find the actor (by label or name) in the resolved world and return its
+	// Find the actor in the resolved world and return its
 	// AbilitySystemComponent. On any failure writes a structured error to
 	// OutError and returns nullptr.
 	UAbilitySystemComponent* ResolveASC(
@@ -35,7 +104,7 @@ namespace
 		TSharedPtr<FJsonValue>& OutError)
 	{
 		FString ActorLabel;
-		if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel))
+		if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel))
 		{
 			OutError = Err;
 			return nullptr;
@@ -48,12 +117,17 @@ namespace
 			return nullptr;
 		}
 
-		AActor* Actor = FindActorByLabelOrName(World, ActorLabel);
-		if (!Actor)
-		{
-			OutError = MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
-			return nullptr;
-		}
+		// #956: label, internal name, or full object path, in that fixed order.
+		// A verification actor spawned into the editor world often has no label
+		// worth guessing, so the path has to be a first-class way to name it.
+		// #983: actorPath is its own parameter now, and a label that names more
+		// than one actor is refused rather than answered from one of them.
+		FMCPActorSelector ActorSel;
+		ActorSel.Match = EMCPActorMatch::LabelNameOrPath;
+		ActorSel.WorldLabel = World->IsPlayInEditor() ? TEXT("PIE") : TEXT("editor");
+		AActor* Actor = MCPResolveActor(World, Params, OutError, ActorSel);
+		if (!Actor) return nullptr;
+		ActorLabel = Actor->GetActorLabel();
 		OutActor = Actor;
 
 		UAbilitySystemComponent* ASC =
@@ -107,6 +181,76 @@ namespace
 		Obj->SetStringField(TEXT("attribute"), Attr.GetName());
 		Obj->SetNumberField(TEXT("baseValue"), ASC->GetNumericAttributeBase(Attr));
 		Obj->SetNumberField(TEXT("currentValue"), ASC->GetNumericAttribute(Attr));
+	}
+
+	// ── Registered attribute sets (#956) ──────────────────────────────
+	//
+	// UAbilitySystemComponent::GetAttributeSet / GetSet<T>() search
+	// SpawnedAttributes, and SpawnedAttributes IS the registry the gameplay
+	// code consults. Nothing else is. An actor's own UPROPERTY pointer to a
+	// CreateDefaultSubobject-created set is NOT proof the ASC knows about it.
+	//
+	// Those two only agree once InitializeComponent has run. It is
+	// InitializeComponent that scans the owner's default subobjects and calls
+	// AddSpawnedAttribute on every UAttributeSet it finds, and an actor spawned
+	// into the pure editor world never reaches it: there is no BeginPlay and no
+	// InitializeComponent in a world that has not begun play. So in the editor
+	// world the ASC has ZERO registered sets while the actor plainly has one.
+	//
+	// The trap that follows, and the reason this comment is this long: the
+	// obvious fallback at that point is "the ASC has none, so make one", which
+	// constructs a SECOND, disconnected instance next to the actor's own. Every
+	// read and write then lands on an object no gameplay code will ever look
+	// at, no error is reported, and the verification says the change worked. So
+	// we adopt the actor's EXISTING subobject into the ASC instead, which is
+	// exactly what InitializeComponent would have done, and we only ever hand
+	// back what GetAttributeSet returns afterwards.
+
+	/**
+	 * The instance the gameplay code consults, and nothing else.
+	 *
+	 * Always answered by ASC->GetAttributeSet (the non-template form of
+	 * ASC->GetSet<T>()). When the ASC has not registered one and adoption is
+	 * allowed, the actor's own subobject is registered first and the ASC is
+	 * asked again, so the pointer that comes back is still the registered one.
+	 * A new set is never constructed here.
+	 */
+	UAttributeSet* ResolveRegisteredAttributeSet(
+		UAbilitySystemComponent* ASC,
+		AActor* Actor,
+		UClass* SetClass,
+		bool bAllowAdopt,
+		bool& bOutAdopted,
+		TArray<FString>& OutAdoptedClassNames,
+		TSharedPtr<FJsonValue>& OutError)
+	{
+		bOutAdopted = false;
+		if (const UAttributeSet* Registered = ASC->GetAttributeSet(SetClass))
+		{
+			// const_cast is the only way to a mutable registered set: the ASC
+			// hands out const pointers and keeps no non-const accessor. The
+			// object is not const, only the view of it.
+			return const_cast<UAttributeSet*>(Registered);
+		}
+
+		if (bAllowAdopt && MCPGas::AdoptOwnerAttributeSets(ASC, Actor, OutAdoptedClassNames) > 0)
+		{
+			if (const UAttributeSet* Registered = ASC->GetAttributeSet(SetClass))
+			{
+				bOutAdopted = true;
+				return const_cast<UAttributeSet*>(Registered);
+			}
+		}
+
+		OutError = MCPError(FString::Printf(
+			TEXT("No '%s' is registered on '%s' AbilitySystemComponent%s. ")
+			TEXT("A set the actor owns is only registered once InitializeComponent runs, which never happens in a world that has not begun play. ")
+			TEXT("Start PIE, or call gas(action=\"init_asc\") with attributeSet=\"%s\" to register it."),
+			*SetClass->GetName(),
+			*Actor->GetActorLabel(),
+			bAllowAdopt ? TEXT(", and the actor owns no instance of it either") : TEXT(" (registerOwnerSets was false)"),
+			*SetClass->GetName()));
+		return nullptr;
 	}
 
 	// Resolve a UClass deriving from Base from a content path or short class name.
@@ -298,6 +442,191 @@ TSharedPtr<FJsonValue> FGasHandlers::GetAttribute(const TSharedPtr<FJsonObject>&
 	return MCPResult(Result);
 }
 
+// ── Live attribute values on the REGISTERED set (#956) ───────────────────────
+//
+// gas(get_attribute) / gas(set_attribute) walk whatever the ASC already has
+// registered and match by attribute name. That is the right shape once a game
+// has begun play and its sets are registered. It answers nothing at all for an
+// actor spawned into the editor world for a verification pass, because nothing
+// is registered there yet.
+//
+// These two name the attribute set explicitly, resolve the instance THROUGH THE
+// ASC, and register the actor's own subobject when the ASC has not (see the
+// long note on ResolveRegisteredAttributeSet above for why constructing a new
+// set instead is the trap that silently reads and writes an object no gameplay
+// code consults). Both report the registered instance's object path, so a
+// caller can prove which object was touched.
+
+namespace
+{
+	/** Params shared by both live-attribute actions. */
+	struct FLiveAttributeRequest
+	{
+		AActor* Actor = nullptr;
+		UAbilitySystemComponent* ASC = nullptr;
+		UAttributeSet* Set = nullptr;
+		FGameplayAttribute Attribute;
+		bool bAdopted = false;
+		TArray<FString> AdoptedClassNames;
+	};
+
+	/** Everything both actions do before they diverge. */
+	bool ResolveLiveAttributeRequest(
+		const TSharedPtr<FJsonObject>& Params,
+		FLiveAttributeRequest& Out,
+		TSharedPtr<FJsonValue>& OutError)
+	{
+		FString SetSpec;
+		if (auto Err = RequireString(Params, TEXT("attributeSet"), SetSpec))
+		{
+			OutError = Err;
+			return false;
+		}
+		FString AttrName;
+		if (auto Err = RequireString(Params, TEXT("attribute"), AttrName))
+		{
+			OutError = Err;
+			return false;
+		}
+
+		Out.ASC = ResolveASC(Params, Out.Actor, OutError);
+		if (!Out.ASC) return false;
+
+		UClass* SetClass = ResolveClassDeriving(SetSpec, UAttributeSet::StaticClass());
+		if (!SetClass)
+		{
+			OutError = MCPError(FString::Printf(
+				TEXT("AttributeSet class not found: %s (pass a content path or a class name)"), *SetSpec));
+			return false;
+		}
+
+		const bool bAllowAdopt = OptionalBool(Params, TEXT("registerOwnerSets"), true);
+		Out.Set = ResolveRegisteredAttributeSet(
+			Out.ASC, Out.Actor, SetClass, bAllowAdopt, Out.bAdopted, Out.AdoptedClassNames, OutError);
+		if (!Out.Set) return false;
+
+		// Match against the REGISTERED instance's class, not the requested one:
+		// the registered set may be a subclass of what the caller named, and its
+		// own properties are the ones the aggregator reads.
+		FStructProperty* AttrProp = MCPGas::FindAttributeDataProperty(Out.Set->GetClass(), AttrName);
+		if (!AttrProp)
+		{
+			OutError = MCPError(FString::Printf(
+				TEXT("Attribute '%s' not found on '%s'. Available: %s"),
+				*AttrName,
+				*Out.Set->GetClass()->GetName(),
+				*MCPGas::ListAttributeDataPropertyNames(Out.Set->GetClass())));
+			return false;
+		}
+		Out.Attribute = FGameplayAttribute(AttrProp);
+		return true;
+	}
+
+	/** Identity + both values of the attribute, read off the registered set. */
+	void WriteLiveAttributeFields(TSharedPtr<FJsonObject> Obj, const FLiveAttributeRequest& Req)
+	{
+		Obj->SetStringField(TEXT("actorLabel"), Req.Actor->GetActorLabel());
+		Obj->SetStringField(TEXT("actorPath"), Req.Actor->GetPathName());
+		Obj->SetStringField(TEXT("attributeSet"), Req.Set->GetClass()->GetName());
+		// The proof of which object was touched. A second, disconnected instance
+		// would show a different path here.
+		Obj->SetStringField(TEXT("attributeSetInstance"), Req.Set->GetPathName());
+		Obj->SetStringField(TEXT("attribute"), Req.Attribute.GetName());
+		Obj->SetBoolField(TEXT("registeredOnAsc"), true);
+		Obj->SetBoolField(TEXT("registeredByThisCall"), Req.bAdopted);
+		if (Req.AdoptedClassNames.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> Adopted;
+			for (const FString& Name : Req.AdoptedClassNames)
+			{
+				Adopted.Add(MakeShared<FJsonValueString>(Name));
+			}
+			Obj->SetArrayField(TEXT("registeredSets"), Adopted);
+		}
+
+		// Read straight off the registered instance. GetNumericValue is the
+		// engine's own accessor for the current value of the attribute data.
+		Obj->SetNumberField(TEXT("currentValue"), Req.Attribute.GetNumericValue(Req.Set));
+		if (const FGameplayAttributeData* Data = Req.Attribute.GetGameplayAttributeData(Req.Set))
+		{
+			Obj->SetNumberField(TEXT("baseValue"), Data->GetBaseValue());
+		}
+		// The aggregator's view of the same attribute. Identical to the values
+		// above until an active GameplayEffect is modifying it, and the pair is
+		// what tells you an effect really landed.
+		Obj->SetNumberField(TEXT("aggregatorBaseValue"), Req.ASC->GetNumericAttributeBase(Req.Attribute));
+		Obj->SetNumberField(TEXT("aggregatorCurrentValue"), Req.ASC->GetNumericAttribute(Req.Attribute));
+	}
+}
+
+TSharedPtr<FJsonValue> FGasHandlers::GetLiveAttributeValue(const TSharedPtr<FJsonObject>& Params)
+{
+	MCP_CHECK_GAME_THREAD();
+
+	FLiveAttributeRequest Req;
+	TSharedPtr<FJsonValue> Err;
+	if (!ResolveLiveAttributeRequest(Params, Req, Err)) return Err;
+
+	auto Result = MCPSuccess();
+	WriteLiveAttributeFields(Result, Req);
+	return MCPResult(Result);
+}
+
+TSharedPtr<FJsonValue> FGasHandlers::SetLiveAttributeValue(const TSharedPtr<FJsonObject>& Params)
+{
+	MCP_CHECK_GAME_THREAD();
+
+	double NewValue = 0.0;
+	if (!Params->TryGetNumberField(TEXT("value"), NewValue))
+	{
+		return MCPError(TEXT("Missing required parameter 'value'"));
+	}
+
+	// "current" writes the FGameplayAttributeData's current value in place,
+	// which is what verifying a mid-combat state needs. "base" goes through the
+	// ASC so the aggregator recomputes the current value from it, which is what
+	// a durable change needs. They are not interchangeable, so the caller says.
+	const FString ValueType = OptionalString(Params, TEXT("valueType"), TEXT("current")).ToLower();
+	if (ValueType != TEXT("current") && ValueType != TEXT("base"))
+	{
+		return MCPError(FString::Printf(
+			TEXT("Unknown valueType '%s'. Use \"current\" (write the attribute data in place) or \"base\" (write through the ASC aggregator)."),
+			*ValueType));
+	}
+
+	FLiveAttributeRequest Req;
+	TSharedPtr<FJsonValue> Err;
+	if (!ResolveLiveAttributeRequest(Params, Req, Err)) return Err;
+
+	const float PreviousCurrent = Req.Attribute.GetNumericValue(Req.Set);
+	const float PreviousBase = Req.ASC->GetNumericAttributeBase(Req.Attribute);
+
+	if (ValueType == TEXT("base"))
+	{
+		// Recalculates the current value through the aggregator, so active
+		// modifiers stay consistent.
+		Req.ASC->SetNumericAttributeBase(Req.Attribute, static_cast<float>(NewValue));
+	}
+	else
+	{
+		// SetNumericValueChecked takes a mutable reference because the set's
+		// PreAttributeChange is allowed to clamp the value, so the number that
+		// lands can differ from the number asked for. That is why the result
+		// reports what was actually stored rather than echoing the request.
+		float Applied = static_cast<float>(NewValue);
+		Req.Attribute.SetNumericValueChecked(Applied, Req.Set);
+	}
+
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	WriteLiveAttributeFields(Result, Req);
+	Result->SetStringField(TEXT("valueType"), ValueType);
+	Result->SetNumberField(TEXT("requestedValue"), NewValue);
+	Result->SetNumberField(TEXT("previousCurrentValue"), PreviousCurrent);
+	Result->SetNumberField(TEXT("previousBaseValue"), PreviousBase);
+	return MCPResult(Result);
+}
+
 // #587 get_asc_state - introspect a live ASC: granted ability specs (class,
 // level, input id, active state, dynamic source tags) plus the ASC's owned
 // gameplay tags. The read half of #587 (input injection lives in pie-studio).
@@ -362,12 +691,21 @@ TSharedPtr<FJsonValue> FGasHandlers::InitAsc(const TSharedPtr<FJsonObject>& Para
 	// correctly. Safe to call again; a game's own pawn may also init the ASC.
 	ASC->InitAbilityActorInfo(Actor, Actor);
 
+	// #956: register the actor's OWN attribute set subobjects first, the way
+	// InitializeComponent would have at BeginPlay. Skipping this step and going
+	// straight to "the ASC has none, so construct one" is what produced a
+	// second, disconnected instance next to the actor's own: reads and writes
+	// then landed on an object the gameplay code never consults, and nothing
+	// reported an error. Adoption is idempotent and costs one hash walk.
+	TArray<FString> AdoptedSets;
+	MCPGas::AdoptOwnerAttributeSets(ASC, Actor, AdoptedSets);
+
 	// Optionally guarantee an attribute set exists on the ASC. This is what lets
 	// a bridge-authored test actor have live attributes without shipping an init
-	// DataTable: spawn the set (with its default values) and register it if it
-	// isn't already present. GetOrCreateAttributeSubobject is protected, so use
-	// the public GetAttributeSet + AddSpawnedAttribute pair.
+	// DataTable. A set is only constructed when the actor genuinely owns none of
+	// that class, and the result says which of the two happened.
 	FString CreatedSet;
+	bool bConstructedSet = false;
 	const FString AttrSetSpec = OptionalString(Params, TEXT("attributeSet"));
 	if (!AttrSetSpec.IsEmpty())
 	{
@@ -383,6 +721,7 @@ TSharedPtr<FJsonValue> FGasHandlers::InitAsc(const TSharedPtr<FJsonObject>& Para
 			UAttributeSet* NewSet = NewObject<UAttributeSet>(Actor, AttrSetClass);
 			ASC->AddSpawnedAttribute(NewSet);
 			CreatedSet = NewSet->GetClass()->GetName();
+			bConstructedSet = true;
 		}
 		else
 		{
@@ -405,7 +744,19 @@ TSharedPtr<FJsonValue> FGasHandlers::InitAsc(const TSharedPtr<FJsonObject>& Para
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("actorLabel"), Actor->GetActorLabel());
 	Result->SetBoolField(TEXT("initialized"), true);
-	if (!CreatedSet.IsEmpty()) Result->SetStringField(TEXT("attributeSet"), CreatedSet);
+	if (!CreatedSet.IsEmpty())
+	{
+		Result->SetStringField(TEXT("attributeSet"), CreatedSet);
+		// The caller needs to know which happened. A constructed set starts at
+		// its class defaults; an adopted one carries whatever the actor has.
+		Result->SetBoolField(TEXT("attributeSetConstructed"), bConstructedSet);
+	}
+	if (AdoptedSets.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> Adopted;
+		for (const FString& Name : AdoptedSets) Adopted.Add(MakeShared<FJsonValueString>(Name));
+		Result->SetArrayField(TEXT("registeredOwnerSets"), Adopted);
+	}
 	Result->SetNumberField(TEXT("attributeCount"), AttrCount);
 	return MCPResult(Result);
 }

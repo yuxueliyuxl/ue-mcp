@@ -50,8 +50,10 @@ describe("action classification", () => {
   it("never contradicts the locking classifier", () => {
     // The two answer different questions, but they cannot disagree about
     // whether something writes. The only exceptions are the session-registry
-    // actions, which address the server rather than any editor.
-    const REGISTRY_ACTIONS = new Set(["project.add_editor"]);
+    // actions, which address the server rather than any editor, and
+    // level.bulk_line_trace, whose `bulk` prefix locking treats as a write
+    // even though the batch only observes collision.
+    const REGISTRY_ACTIONS = new Set(["project.add_editor", "level.bulk_line_trace"]);
     const contradictions = nativeActions()
       .map((a) => ({ ...a, key: `${a.tool}.${a.action}` }))
       .filter((a) => !REGISTRY_ACTIONS.has(a.key))
@@ -73,7 +75,7 @@ describe("action classification", () => {
   });
 
   it("treats an arbitrary payload as unknown, and gates it like a mutation", () => {
-    for (const key of ["epic.call_tool", "editor.invoke_object_function"]) {
+    for (const key of ["epic.call_tool", "editor.invoke_object_function", "animation.analyze_animation"]) {
       const cls = classifyTaskClass(key);
       expect(cls.class, key).toBe("unknown");
       expect(requiresExplicitEditor(cls.class)).toBe(true);
@@ -83,10 +85,17 @@ describe("action classification", () => {
   });
 
   it("lets plain reads through", () => {
-    for (const key of ["project.get_status", "asset.list", "level.get_outliner", "reflection.reflect_class"]) {
+    for (const key of [
+      "project.get_status",
+      "asset.list",
+      "level.get_outliner",
+      "reflection.reflect_class",
+      "animation.read_control_rig_edit",
+    ]) {
       expect(classifyTaskClass(key).class, key).toBe("read");
       expect(requiresExplicitEditor("read")).toBe(false);
     }
+    expect(classifyTaskClass("animation.read_control_rig_edit").source).toBe("override");
   });
 
   it("reads a mutate verb anywhere in the name, not only at the front", () => {

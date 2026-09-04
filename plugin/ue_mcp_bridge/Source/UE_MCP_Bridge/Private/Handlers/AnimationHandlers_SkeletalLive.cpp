@@ -206,14 +206,36 @@ namespace
 			return MCPError(TEXT("world must be 'auto' (default), 'pie', 'game', or 'editor'"));
 		}
 
+		// #983: actorPath wins over the label token, and a label naming more
+		// than one actor in the world that answered is refused rather than
+		// read off whichever the iterator reached first.
+		const FString ActorPath = OptionalString(Params, TEXT("actorPath"));
 		TArray<TPair<FString, UWorld*>> Candidates = BuildWorldCandidates(RequestedScope);
 		for (const TPair<FString, UWorld*>& Candidate : Candidates)
 		{
-			AActor* Actor = FindActorByLabelNameOrPath(Candidate.Value, ActorToken);
-			if (Actor)
+			if (!ActorPath.IsEmpty())
+			{
+				if (AActor* ByPath = MCPFindActorByPath(Candidate.Value, ActorPath))
+				{
+					OutWorld = Candidate.Value;
+					OutActor = ByPath;
+					OutResolvedScope = Candidate.Key;
+					return nullptr;
+				}
+				continue;
+			}
+			TArray<AActor*> Matches;
+			MCPCollectActorsByToken(Candidate.Value, ActorToken, EMCPActorMatch::LabelNameOrPath, Matches);
+			if (Matches.Num() > 1)
+			{
+				return MCPAmbiguousActorError(
+					ActorToken, TEXT("actorLabel"), TEXT("actorPath"),
+					MCPDescribeActorMatchTier(ActorToken, Matches[0]), Matches);
+			}
+			if (Matches.Num() == 1)
 			{
 				OutWorld = Candidate.Value;
-				OutActor = Actor;
+				OutActor = Matches[0];
 				OutResolvedScope = Candidate.Key;
 				return nullptr;
 			}
@@ -230,7 +252,7 @@ namespace
 TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransform(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 	FString BoneName;
 	if (auto Err = RequireString(Params, TEXT("boneName"), BoneName)) return Err;
 	const FString ComponentName = OptionalString(Params, TEXT("componentName"));
@@ -240,6 +262,9 @@ TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransform(const TSharedPtr<FJs
 	AActor* Actor = nullptr;
 	FString ResolvedWorldScope;
 	if (auto Err = ResolveSkeletalActorForQuery(Params, ActorLabel, TEXT("auto"), World, Actor, ResolvedWorldScope)) return Err;
+	// A caller who passed only actorPath left ActorLabel holding the path, and
+	// every message below reads better naming the actor that answered (#983).
+	ActorLabel = Actor->GetActorLabel();
 	USkeletalMeshComponent* SK = ResolveSkeletalMeshComp(Actor, ComponentName);
 	if (!SK) return MakeSkeletalComponentNotFoundError(Actor, ActorLabel, ComponentName);
 
@@ -292,13 +317,16 @@ TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransform(const TSharedPtr<FJs
 TSharedPtr<FJsonValue> FAnimationHandlers::ListBones(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 	const FString ComponentName = OptionalString(Params, TEXT("componentName"));
 
 	UWorld* World = nullptr;
 	AActor* Actor = nullptr;
 	FString ResolvedWorldScope;
 	if (auto Err = ResolveSkeletalActorForQuery(Params, ActorLabel, TEXT("auto"), World, Actor, ResolvedWorldScope)) return Err;
+	// A caller who passed only actorPath left ActorLabel holding the path, and
+	// every message below reads better naming the actor that answered (#983).
+	ActorLabel = Actor->GetActorLabel();
 	USkeletalMeshComponent* SK = ResolveSkeletalMeshComp(Actor, ComponentName);
 	if (!SK) return MakeSkeletalComponentNotFoundError(Actor, ActorLabel, ComponentName);
 	if (!SK->GetSkeletalMeshAsset()) return MCPError(FString::Printf(TEXT("SkeletalMeshComponent '%s' on actor '%s' has no SkeletalMesh asset"), *SK->GetName(), *ActorLabel));
@@ -335,10 +363,12 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RebindLeaderPose(const TSharedPtr<FJs
 {
 	REQUIRE_EDITOR_WORLD(World);
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
-	AActor* Actor = FindActorByLabel(World, ActorLabel);
-	if (!Actor) return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+	if (!Actor) return ActorErr;
+	ActorLabel = Actor->GetActorLabel();
 
 	TArray<USkeletalMeshComponent*> Comps;
 	Actor->GetComponents<USkeletalMeshComponent>(Comps);
@@ -374,6 +404,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RebindLeaderPose(const TSharedPtr<FJs
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetStringField(TEXT("body"), Body->GetName());
 	Result->SetNumberField(TEXT("rebound"), Rebound);
 	Result->SetArrayField(TEXT("components"), Bound);
@@ -385,12 +416,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::PreviewAnimation(const TSharedPtr<FJs
 {
 	REQUIRE_EDITOR_WORLD(World);
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 	bool bEnabled = true;
 	Params->TryGetBoolField(TEXT("enabled"), bEnabled);
 
-	AActor* Actor = FindActorByLabel(World, ActorLabel);
-	if (!Actor) return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+	if (!Actor) return ActorErr;
+	ActorLabel = Actor->GetActorLabel();
 
 	TArray<USkeletalMeshComponent*> Comps;
 	Actor->GetComponents<USkeletalMeshComponent>(Comps);
@@ -413,12 +446,185 @@ TSharedPtr<FJsonValue> FAnimationHandlers::PreviewAnimation(const TSharedPtr<FJs
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetBoolField(TEXT("enabled"), bEnabled);
 	Result->SetNumberField(TEXT("componentsUpdated"), Updated);
 
 	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Payload->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Payload->SetBoolField(TEXT("enabled"), !bEnabled);
 	MCPSetRollback(Result, TEXT("preview_animation"), Payload);
+	return MCPResult(Result);
+}
+
+
+// #922/#926: the EVALUATED pose off a live SkeletalMeshComponent, in the editor
+// world or in PIE.
+//
+// get_bone_transforms reads a skeleton's REFERENCE pose, which is the read that
+// looks correct while the running instance is wrong: in #922 a character lay
+// flat on the floor and every transform the bridge could show read clean,
+// because none of them were the pose the component was actually holding.
+// get_bone_transform answers for one bone at a time. This answers for a set, off
+// the component's own evaluated arrays, and reports what is driving the
+// evaluation next to the numbers, so a flat character and a stopped anim
+// instance are distinguishable from one call.
+TSharedPtr<FJsonValue> FAnimationHandlers::GetLiveBoneTransforms(const TSharedPtr<FJsonObject>& Params)
+{
+	// How many bones one response carries. A humanoid skeleton is a few hundred,
+	// so the whole thing fits; a crowd-scale or facial rig can be far more.
+	constexpr int32 LiveBoneTransformCap = 1000;
+
+	FString ActorLabel;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
+	const FString ComponentName = OptionalString(Params, TEXT("componentName"));
+	const FString Space = OptionalString(Params, TEXT("space"), TEXT("world")).ToLower();
+	if (!(Space == TEXT("world") || Space == TEXT("component") || Space == TEXT("local")))
+	{
+		return MCPError(TEXT("space must be 'world' (default), 'component', or 'local'"));
+	}
+
+	UWorld* World = nullptr;
+	AActor* Actor = nullptr;
+	FString ResolvedWorldScope;
+	if (auto Err = ResolveSkeletalActorForQuery(Params, ActorLabel, TEXT("auto"), World, Actor, ResolvedWorldScope)) return Err;
+	// A caller who passed only actorPath left ActorLabel holding the path, and
+	// every message below reads better naming the actor that answered (#983).
+	ActorLabel = Actor->GetActorLabel();
+	USkeletalMeshComponent* SK = ResolveSkeletalMeshComp(Actor, ComponentName);
+	if (!SK) return MakeSkeletalComponentNotFoundError(Actor, ActorLabel, ComponentName);
+	USkeletalMesh* Mesh = SK->GetSkeletalMeshAsset();
+	if (!Mesh)
+	{
+		return MCPError(FString::Printf(
+			TEXT("SkeletalMeshComponent '%s' on actor '%s' has no SkeletalMesh asset"), *SK->GetName(), *ActorLabel));
+	}
+
+	const FReferenceSkeleton& RefSkeleton = Mesh->GetRefSkeleton();
+
+	// boneNames selects a subset; omitting it returns every bone, which is what a
+	// caller diagnosing a pose wants and is a few hundred entries on a character.
+	TArray<FName> RequestedBones;
+	const TArray<TSharedPtr<FJsonValue>>* BonesArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("boneNames"), BonesArray) && BonesArray)
+	{
+		for (const TSharedPtr<FJsonValue>& Entry : *BonesArray)
+		{
+			if (!Entry.IsValid()) continue;
+			const FString Name = Entry->AsString();
+			if (!Name.IsEmpty()) RequestedBones.Add(FName(*Name));
+		}
+	}
+	if (RequestedBones.Num() == 0)
+	{
+		for (int32 BoneIndex = 0; BoneIndex < RefSkeleton.GetNum(); ++BoneIndex)
+		{
+			RequestedBones.Add(RefSkeleton.GetBoneName(BoneIndex));
+		}
+	}
+	if (RequestedBones.Num() > LiveBoneTransformCap)
+	{
+		return MCPError(FString::Printf(
+			TEXT("%d bones requested, over the %d limit. Pass 'boneNames' with the bones you need."),
+			RequestedBones.Num(), LiveBoneTransformCap));
+	}
+
+	const TArray<FTransform>& ComponentSpace = SK->GetComponentSpaceTransforms();
+	const TArray<FTransform> BoneSpace = SK->GetBoneSpaceTransforms();
+
+	TArray<TSharedPtr<FJsonValue>> Bones;
+	TArray<TSharedPtr<FJsonValue>> Missing;
+	Bones.Reserve(RequestedBones.Num());
+	for (const FName& BoneName : RequestedBones)
+	{
+		const int32 BoneIndex = SK->GetBoneIndex(BoneName);
+		if (BoneIndex == INDEX_NONE)
+		{
+			Missing.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+			continue;
+		}
+
+		FTransform Transform;
+		if (Space == TEXT("world"))
+		{
+			Transform = SK->GetBoneTransform(BoneIndex);
+		}
+		else if (Space == TEXT("component"))
+		{
+			if (!ComponentSpace.IsValidIndex(BoneIndex))
+			{
+				Missing.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+				continue;
+			}
+			Transform = ComponentSpace[BoneIndex];
+		}
+		else
+		{
+			if (!BoneSpace.IsValidIndex(BoneIndex))
+			{
+				Missing.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+				continue;
+			}
+			Transform = BoneSpace[BoneIndex];
+		}
+
+		TSharedPtr<FJsonObject> BoneObj = MakeShared<FJsonObject>();
+		BoneObj->SetStringField(TEXT("name"), BoneName.ToString());
+		BoneObj->SetNumberField(TEXT("index"), BoneIndex);
+		const int32 ParentIndex = RefSkeleton.GetParentIndex(BoneIndex);
+		BoneObj->SetNumberField(TEXT("parentIndex"), ParentIndex);
+		if (ParentIndex != INDEX_NONE)
+		{
+			BoneObj->SetStringField(TEXT("parentName"), RefSkeleton.GetBoneName(ParentIndex).ToString());
+		}
+		BoneObj->SetObjectField(TEXT("location"), MCPVec3ToJsonObject(Transform.GetLocation()));
+		BoneObj->SetObjectField(TEXT("rotation"), MCPRotatorToJsonObject(Transform.GetRotation().Rotator()));
+		BoneObj->SetObjectField(TEXT("scale"), MCPVec3ToJsonObject(Transform.GetScale3D()));
+		Bones.Add(MakeShared<FJsonValueObject>(BoneObj));
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorName"), Actor->GetName());
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
+	Result->SetStringField(TEXT("world"), ResolvedWorldScope);
+	Result->SetStringField(TEXT("worldName"), World ? World->GetName() : TEXT(""));
+	AddSkeletalComponentMetadata(Result, SK);
+	Result->SetStringField(TEXT("space"), Space);
+	Result->SetNumberField(TEXT("boneCount"), Bones.Num());
+	Result->SetArrayField(TEXT("bones"), Bones);
+	if (Missing.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("unresolvedBones"), Missing);
+	}
+
+	// The component's own placement, so a component-space read lifts to world
+	// without a second call, and a component transform that reads clean while
+	// the pose does not is visible side by side (#922).
+	const FTransform ComponentToWorld = SK->GetComponentTransform();
+	TSharedPtr<FJsonObject> ComponentTransform = MakeShared<FJsonObject>();
+	ComponentTransform->SetObjectField(TEXT("location"), MCPVec3ToJsonObject(ComponentToWorld.GetLocation()));
+	ComponentTransform->SetObjectField(TEXT("rotation"), MCPRotatorToJsonObject(ComponentToWorld.GetRotation().Rotator()));
+	ComponentTransform->SetObjectField(TEXT("scale"), MCPVec3ToJsonObject(ComponentToWorld.GetScale3D()));
+	Result->SetObjectField(TEXT("componentTransform"), ComponentTransform);
+
+	// What is driving the pose. A stopped or absent anim instance is the usual
+	// reason an evaluated read matches the reference pose exactly.
+	TSharedPtr<FJsonObject> Evaluation = MakeShared<FJsonObject>();
+	const EAnimationMode::Type AnimationMode = SK->GetAnimationMode();
+	Evaluation->SetStringField(TEXT("animationMode"),
+		AnimationMode == EAnimationMode::AnimationBlueprint ? TEXT("AnimationBlueprint")
+		: AnimationMode == EAnimationMode::AnimationSingleNode ? TEXT("AnimationSingleNode")
+		: TEXT("AnimationCustomMode"));
+	if (UAnimInstance* AnimInstance = SK->GetAnimInstance())
+	{
+		Evaluation->SetStringField(TEXT("animInstanceClass"), AnimInstance->GetClass()->GetPathName());
+	}
+	Evaluation->SetNumberField(TEXT("componentSpaceTransformCount"), ComponentSpace.Num());
+	Evaluation->SetNumberField(TEXT("refSkeletonBoneCount"), RefSkeleton.GetNum());
+	Evaluation->SetBoolField(TEXT("componentVisible"), SK->IsVisible());
+	Result->SetObjectField(TEXT("evaluation"), Evaluation);
+
 	return MCPResult(Result);
 }

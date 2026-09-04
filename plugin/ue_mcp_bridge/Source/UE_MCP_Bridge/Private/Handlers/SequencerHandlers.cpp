@@ -1,9 +1,11 @@
 #include "SequencerHandlers.h"
+#include "SequencerHandlers_Internal.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 
 #include "LevelSequenceEditorBlueprintLibrary.h"
 #include "MovieSceneSequencePlayer.h"
+#include "MovieSceneTimeUnit.h"
 
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "HandlerAssetCreate.h"
@@ -21,6 +23,7 @@
 #include "Sections/MovieScene3DAttachSection.h"
 #include "Sections/MovieScene3DTransformSection.h"
 #include "Sections/MovieSceneCameraCutSection.h"
+#include "Channels/MovieSceneChannel.h"
 #include "Channels/MovieSceneDoubleChannel.h"
 #include "Channels/MovieSceneFloatChannel.h"
 #include "Channels/MovieSceneChannelProxy.h"
@@ -43,6 +46,7 @@ void FSequencerHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("get_sequence_info"), &ReadSequenceInfo);
 	Registry.RegisterHandler(TEXT("add_sequence_track"), &AddTrack);
 	Registry.RegisterHandler(TEXT("play_sequence"), &SequenceControl);
+	Registry.RegisterHandler(TEXT("scrub_sequence"), &ScrubSequence);
 	Registry.RegisterHandler(TEXT("set_sequence_playback_range"), &SetPlaybackRange);
 	Registry.RegisterHandler(TEXT("add_sequence_section"), &AddSection);
 	Registry.RegisterHandler(TEXT("set_sequence_keyframes"), &SetKeyframes);
@@ -66,13 +70,16 @@ namespace
 		return Seq;
 	}
 
-	// Resolve (creating if needed) the actor's possessable binding GUID.
-	bool ResolveActorBinding(ULevelSequence* Sequence, UMovieScene* MovieScene, const FString& ActorLabel, FGuid& OutGuid, FString& OutError)
+	// Resolve (creating if needed) the possessable binding GUID for an actor the
+	// caller already selected. #983: the selection happens through
+	// MCPResolveActor at the call site, so a duplicated label is refused before
+	// a binding is created against the wrong actor.
+	bool ResolveActorBinding(ULevelSequence* Sequence, UMovieScene* MovieScene, AActor* TargetActor, FGuid& OutGuid, FString& OutError)
 	{
 		UWorld* World = GetEditorWorld();
 		if (!World) { OutError = TEXT("No editor world available"); return false; }
-		AActor* TargetActor = FindActorByLabel(World, ActorLabel);
-		if (!TargetActor) { OutError = FString::Printf(TEXT("Actor not found: %s"), *ActorLabel); return false; }
+		if (!TargetActor) { OutError = TEXT("Target actor is null"); return false; }
+		const FString ActorLabel = TargetActor->GetActorLabel();
 
 		for (int32 i = 0; i < MovieScene->GetPossessableCount(); ++i)
 		{
@@ -158,15 +165,30 @@ TSharedPtr<FJsonValue> FSequencerHandlers::ReadSequenceInfo(const TSharedPtr<FJs
 	Result->SetStringField(TEXT("name"), Sequence->GetName());
 	Result->SetStringField(TEXT("path"), Sequence->GetPathName());
 
-	// Display rate
-	FFrameRate DisplayRate = MovieScene->GetDisplayRate();
+	const FFrameRate DisplayRate = MovieScene->GetDisplayRate();
+	const FFrameRate TickResolution = MovieScene->GetTickResolution();
+	if (!UEMCP::SequencerInfo::IsUsableFrameRate(DisplayRate) ||
+		!UEMCP::SequencerInfo::IsUsableFrameRate(TickResolution))
+	{
+		return MCPError(FString::Printf(
+			TEXT("LevelSequence has invalid timing rates (displayRate=%d/%d, tickResolution=%d/%d)"),
+			DisplayRate.Numerator,
+			DisplayRate.Denominator,
+			TickResolution.Numerator,
+			TickResolution.Denominator));
+	}
+
 	TSharedPtr<FJsonObject> DisplayRateObj = MakeShared<FJsonObject>();
-	DisplayRateObj->SetNumberField(TEXT("numerator"), DisplayRate.Numerator);
-	DisplayRateObj->SetNumberField(TEXT("denominator"), DisplayRate.Denominator);
+	UEMCP::SequencerInfo::SetFrameRateFields(*DisplayRateObj, DisplayRate);
 	Result->SetObjectField(TEXT("displayRate"), DisplayRateObj);
 
-	// Playback range
-	TRange<FFrameNumber> PlaybackRange = MovieScene->GetPlaybackRange();
+	TSharedPtr<FJsonObject> TickResolutionObj = MakeShared<FJsonObject>();
+	UEMCP::SequencerInfo::SetFrameRateFields(*TickResolutionObj, TickResolution);
+	Result->SetObjectField(TEXT("tickResolution"), TickResolutionObj);
+
+	// Keep the legacy startFrame/endFrame values in tick-resolution units.
+	// The explicit fields below remove that ambiguity without changing callers.
+	const TRange<FFrameNumber> PlaybackRange = MovieScene->GetPlaybackRange();
 	TSharedPtr<FJsonObject> RangeObj = MakeShared<FJsonObject>();
 	if (PlaybackRange.HasLowerBound())
 	{
@@ -176,27 +198,62 @@ TSharedPtr<FJsonValue> FSequencerHandlers::ReadSequenceInfo(const TSharedPtr<FJs
 	{
 		RangeObj->SetNumberField(TEXT("endFrame"), PlaybackRange.GetUpperBoundValue().Value);
 	}
+	UEMCP::SequencerInfo::SetTimingRangeFields(*RangeObj, PlaybackRange, TickResolution, DisplayRate);
 	Result->SetObjectField(TEXT("playbackRange"), RangeObj);
 
-	// #52: optional section-level detail (attach sockets, first transform key values)
 	const bool bIncludeDetails = OptionalBool(Params, TEXT("includeSectionDetails"));
+	UEMCP::SequencerInfo::FDetailBudget DetailBudget;
 
-	auto ExtractSectionDetails = [&](UMovieSceneTrack* Track, TSharedPtr<FJsonObject>& TrackObj)
+	if (bIncludeDetails)
+	{
+		TSharedPtr<FJsonObject> LimitsObj = MakeShared<FJsonObject>();
+		LimitsObj->SetNumberField(TEXT("maxSections"), UEMCP::SequencerInfo::MaxDetailedSections);
+		LimitsObj->SetNumberField(TEXT("maxChannels"), UEMCP::SequencerInfo::MaxDetailedChannels);
+		LimitsObj->SetNumberField(TEXT("maxKeyTimes"), UEMCP::SequencerInfo::MaxDetailedKeyTimes);
+		LimitsObj->SetNumberField(TEXT("maxKeyTimesPerChannel"), UEMCP::SequencerInfo::MaxKeyTimesPerChannel);
+		Result->SetObjectField(TEXT("detailLimits"), LimitsObj);
+	}
+
+	auto ExtractSectionDetails = [&](UMovieSceneTrack* Track, const TSharedPtr<FJsonObject>& TrackObj)
 	{
 		if (!bIncludeDetails || !Track) return;
+
+		const TArray<UMovieSceneSection*>& AllSections = Track->GetAllSections();
 		TArray<TSharedPtr<FJsonValue>> SectionsArr;
-		for (UMovieSceneSection* Section : Track->GetAllSections())
+		for (int32 SectionIndex = 0; SectionIndex < AllSections.Num(); ++SectionIndex)
 		{
-			if (!Section) continue;
+			if (DetailBudget.Sections <= 0)
+			{
+				DetailBudget.bTruncated = true;
+				break;
+			}
+
+			UMovieSceneSection* Section = AllSections[SectionIndex];
+			if (!Section)
+			{
+				DetailBudget.bTruncated = true;
+				continue;
+			}
+			--DetailBudget.Sections;
+
 			TSharedPtr<FJsonObject> SObj = MakeShared<FJsonObject>();
+			SObj->SetNumberField(TEXT("index"), SectionIndex);
+			SObj->SetStringField(TEXT("class"), Section->GetClass()->GetName());
+			UEMCP::SequencerInfo::SetTimingRangeFields(
+				*SObj,
+				Section->GetTrueRange(),
+				TickResolution,
+				DisplayRate);
+
 			if (UMovieScene3DAttachSection* Attach = Cast<UMovieScene3DAttachSection>(Section))
 			{
 				SObj->SetStringField(TEXT("attachSocket"), Attach->AttachSocketName.ToString());
 				SObj->SetStringField(TEXT("attachComponent"), Attach->AttachComponentName.ToString());
 			}
-			if (UMovieScene3DTransformSection* Xf = Cast<UMovieScene3DTransformSection>(Section))
+
+			const FMovieSceneChannelProxy& Proxy = Section->GetChannelProxy();
+			if (Cast<UMovieScene3DTransformSection>(Section))
 			{
-				FMovieSceneChannelProxy& Proxy = Xf->GetChannelProxy();
 				TArray<FName> ChannelNames = {
 					TEXT("Location.X"), TEXT("Location.Y"), TEXT("Location.Z"),
 					TEXT("Rotation.X"), TEXT("Rotation.Y"), TEXT("Rotation.Z"),
@@ -229,11 +286,135 @@ TSharedPtr<FJsonValue> FSequencerHandlers::ReadSequenceInfo(const TSharedPtr<FJs
 				}
 				SObj->SetObjectField(TEXT("firstKeyValues"), FirstKeys);
 			}
-			SObj->SetStringField(TEXT("class"), Section->GetClass()->GetName());
+
+			const int32 ChannelCount = Proxy.NumChannels();
+			TArray<TSharedPtr<FJsonValue>> ChannelsArr;
+			bool bStopChannels = false;
+			for (const FMovieSceneChannelEntry& Entry : Proxy.GetAllEntries())
+			{
+				const FString ChannelType = Entry.GetChannelTypeName().ToString();
+				const TArrayView<FMovieSceneChannel* const> Channels = Entry.GetChannels();
+				const TArrayView<const FMovieSceneChannelMetaData> MetaData = Entry.GetMetaData();
+
+				for (int32 ChannelIndex = 0; ChannelIndex < Channels.Num(); ++ChannelIndex)
+				{
+					if (DetailBudget.Channels <= 0)
+					{
+						DetailBudget.bTruncated = true;
+						bStopChannels = true;
+						break;
+					}
+
+					FMovieSceneChannel* Channel = Channels[ChannelIndex];
+					if (!Channel)
+					{
+						DetailBudget.bTruncated = true;
+						continue;
+					}
+					--DetailBudget.Channels;
+
+					FString ChannelName;
+					if (MetaData.IsValidIndex(ChannelIndex) && !MetaData[ChannelIndex].Name.IsNone())
+					{
+						ChannelName = MetaData[ChannelIndex].Name.ToString();
+					}
+					else
+					{
+						ChannelName = FString::Printf(TEXT("%s[%d]"), *ChannelType, ChannelIndex);
+					}
+
+					TArray<FFrameNumber> KeyTimes;
+					if (DetailBudget.KeyTimes > 0)
+					{
+						Channel->GetKeys(TRange<FFrameNumber>::All(), &KeyTimes, nullptr);
+						KeyTimes.Sort([](const FFrameNumber A, const FFrameNumber B)
+						{
+							return A.Value < B.Value;
+						});
+					}
+
+					const int32 KeyCount = FMath::Max(Channel->GetNumKeys(), KeyTimes.Num());
+					const int32 KeyTimesToReturn = FMath::Min3(
+						KeyTimes.Num(),
+						UEMCP::SequencerInfo::MaxKeyTimesPerChannel,
+						DetailBudget.KeyTimes);
+
+					TArray<TSharedPtr<FJsonValue>> KeyTimesArr;
+					KeyTimesArr.Reserve(KeyTimesToReturn);
+					for (int32 KeyIndex = 0; KeyIndex < KeyTimesToReturn; ++KeyIndex)
+					{
+						KeyTimesArr.Add(MakeShared<FJsonValueObject>(
+							UEMCP::SequencerInfo::MakeKeyTimeObject(
+								KeyTimes[KeyIndex],
+								TickResolution,
+								DisplayRate)));
+					}
+					DetailBudget.KeyTimes -= KeyTimesToReturn;
+
+					const bool bKeyTimesTruncated = KeyTimesToReturn < KeyCount;
+					DetailBudget.bTruncated |= bKeyTimesTruncated;
+
+					TSharedPtr<FJsonObject> ChannelObj = MakeShared<FJsonObject>();
+					ChannelObj->SetNumberField(TEXT("index"), ChannelIndex);
+					ChannelObj->SetStringField(TEXT("name"), ChannelName);
+					ChannelObj->SetStringField(TEXT("type"), ChannelType);
+					ChannelObj->SetNumberField(TEXT("keyCount"), KeyCount);
+					ChannelObj->SetArrayField(TEXT("keyTimes"), KeyTimesArr);
+					ChannelObj->SetBoolField(TEXT("keyTimesTruncated"), bKeyTimesTruncated);
+					ChannelsArr.Add(MakeShared<FJsonValueObject>(ChannelObj));
+				}
+
+				if (bStopChannels) break;
+			}
+
+			const bool bChannelsTruncated = ChannelsArr.Num() < ChannelCount;
+			DetailBudget.bTruncated |= bChannelsTruncated;
+			SObj->SetNumberField(TEXT("channelCount"), ChannelCount);
+			SObj->SetArrayField(TEXT("channels"), ChannelsArr);
+			SObj->SetBoolField(TEXT("channelsTruncated"), bChannelsTruncated);
 			SectionsArr.Add(MakeShared<FJsonValueObject>(SObj));
 		}
+
+		const bool bSectionsTruncated = SectionsArr.Num() < AllSections.Num();
+		DetailBudget.bTruncated |= bSectionsTruncated;
 		TrackObj->SetArrayField(TEXT("sections"), SectionsArr);
+		TrackObj->SetBoolField(TEXT("sectionsTruncated"), bSectionsTruncated);
 	};
+
+	auto MakeTrackObject = [&](UMovieSceneTrack* Track) -> TSharedPtr<FJsonObject>
+	{
+		TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();
+		TrackObj->SetStringField(TEXT("name"), Track->GetTrackName().ToString());
+		TrackObj->SetStringField(TEXT("class"), Track->GetClass()->GetName());
+		TrackObj->SetNumberField(TEXT("sectionCount"), Track->GetAllSections().Num());
+		ExtractSectionDetails(Track, TrackObj);
+		return TrackObj;
+	};
+
+	// Camera cuts are stored separately from UMovieScene::GetTracks(). Emit the
+	// camera-cut track first so the root-track inspection is never hidden behind
+	// the bounded detail budget, then append the ordinary root tracks once each.
+	TArray<UMovieSceneTrack*> RootTracks;
+	if (UMovieSceneTrack* CameraCutTrack = MovieScene->GetCameraCutTrack())
+	{
+		RootTracks.Add(CameraCutTrack);
+	}
+	for (UMovieSceneTrack* Track : MovieScene->GetTracks())
+	{
+		if (Track && !RootTracks.Contains(Track))
+		{
+			RootTracks.Add(Track);
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> MasterTracksArray;
+	for (UMovieSceneTrack* Track : RootTracks)
+	{
+		if (!Track) continue;
+		MasterTracksArray.Add(MakeShared<FJsonValueObject>(MakeTrackObject(Track)));
+	}
+	Result->SetArrayField(TEXT("masterTracks"), MasterTracksArray);
+	Result->SetNumberField(TEXT("masterTrackCount"), MasterTracksArray.Num());
 
 	// #556: collect the Sequencer binding tags (group labels) that reference a
 	// given binding guid, from the MovieScene's tagged-binding map.
@@ -254,80 +435,47 @@ TSharedPtr<FJsonValue> FSequencerHandlers::ReadSequenceInfo(const TSharedPtr<FJs
 		return Out;
 	};
 
-	// Bindings (possessables and spawnables)
 	TArray<TSharedPtr<FJsonValue>> BindingsArray;
-	for (int32 i = 0; i < MovieScene->GetPossessableCount(); ++i)
+	auto AppendBinding = [&](const FString& Name, const FGuid& Guid, const TCHAR* Type)
 	{
-		const FMovieScenePossessable& Possessable = MovieScene->GetPossessable(i);
 		TSharedPtr<FJsonObject> BindingObj = MakeShared<FJsonObject>();
-		BindingObj->SetStringField(TEXT("name"), Possessable.GetName());
-		BindingObj->SetStringField(TEXT("guid"), Possessable.GetGuid().ToString());
-		BindingObj->SetStringField(TEXT("type"), TEXT("possessable"));
-		BindingObj->SetArrayField(TEXT("tags"), TagsForGuid(Possessable.GetGuid()));
+		BindingObj->SetStringField(TEXT("name"), Name);
+		BindingObj->SetStringField(TEXT("guid"), Guid.ToString());
+		BindingObj->SetStringField(TEXT("type"), Type);
+		BindingObj->SetArrayField(TEXT("tags"), TagsForGuid(Guid));
 
-		// List tracks for this binding (with optional section detail)
 		TArray<TSharedPtr<FJsonValue>> TrackArr;
-		const FMovieSceneBinding* Binding = MovieScene->FindBinding(Possessable.GetGuid());
+		const FMovieSceneBinding* Binding = MovieScene->FindBinding(Guid);
 		if (Binding)
 		{
 			for (UMovieSceneTrack* Track : Binding->GetTracks())
 			{
 				if (!Track) continue;
-				TSharedPtr<FJsonObject> TObj = MakeShared<FJsonObject>();
-				TObj->SetStringField(TEXT("class"), Track->GetClass()->GetName());
-				TObj->SetStringField(TEXT("name"), Track->GetTrackName().ToString());
-				ExtractSectionDetails(Track, TObj);
-				TrackArr.Add(MakeShared<FJsonValueObject>(TObj));
+				TrackArr.Add(MakeShared<FJsonValueObject>(MakeTrackObject(Track)));
 			}
 		}
 		BindingObj->SetArrayField(TEXT("tracks"), TrackArr);
-
 		BindingsArray.Add(MakeShared<FJsonValueObject>(BindingObj));
+	};
+
+	for (int32 i = 0; i < MovieScene->GetPossessableCount(); ++i)
+	{
+		const FMovieScenePossessable& Possessable = MovieScene->GetPossessable(i);
+		AppendBinding(Possessable.GetName(), Possessable.GetGuid(), TEXT("possessable"));
 	}
 
 	for (int32 i = 0; i < MovieScene->GetSpawnableCount(); ++i)
 	{
 		const FMovieSceneSpawnable& Spawnable = MovieScene->GetSpawnable(i);
-		TSharedPtr<FJsonObject> BindingObj = MakeShared<FJsonObject>();
-		BindingObj->SetStringField(TEXT("name"), Spawnable.GetName());
-		BindingObj->SetStringField(TEXT("guid"), Spawnable.GetGuid().ToString());
-		BindingObj->SetStringField(TEXT("type"), TEXT("spawnable"));
-		BindingObj->SetArrayField(TEXT("tags"), TagsForGuid(Spawnable.GetGuid()));
-
-		TArray<TSharedPtr<FJsonValue>> TrackArr;
-		const FMovieSceneBinding* Binding = MovieScene->FindBinding(Spawnable.GetGuid());
-		if (Binding)
-		{
-			for (UMovieSceneTrack* Track : Binding->GetTracks())
-			{
-				if (!Track) continue;
-				TSharedPtr<FJsonObject> TObj = MakeShared<FJsonObject>();
-				TObj->SetStringField(TEXT("class"), Track->GetClass()->GetName());
-				TObj->SetStringField(TEXT("name"), Track->GetTrackName().ToString());
-				ExtractSectionDetails(Track, TObj);
-				TrackArr.Add(MakeShared<FJsonValueObject>(TObj));
-			}
-		}
-		BindingObj->SetArrayField(TEXT("tracks"), TrackArr);
-
-		BindingsArray.Add(MakeShared<FJsonValueObject>(BindingObj));
+		AppendBinding(Spawnable.GetName(), Spawnable.GetGuid(), TEXT("spawnable"));
 	}
 	Result->SetArrayField(TEXT("bindings"), BindingsArray);
 	Result->SetNumberField(TEXT("bindingCount"), BindingsArray.Num());
 
-	// Master tracks
-	TArray<TSharedPtr<FJsonValue>> MasterTracksArray;
-	for (UMovieSceneTrack* Track : MovieScene->GetTracks())
+	if (bIncludeDetails)
 	{
-		if (!Track) continue;
-		TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();
-		TrackObj->SetStringField(TEXT("name"), Track->GetTrackName().ToString());
-		TrackObj->SetStringField(TEXT("class"), Track->GetClass()->GetName());
-		TrackObj->SetNumberField(TEXT("sectionCount"), Track->GetAllSections().Num());
-		MasterTracksArray.Add(MakeShared<FJsonValueObject>(TrackObj));
+		Result->SetBoolField(TEXT("detailsTruncated"), DetailBudget.bTruncated);
 	}
-	Result->SetArrayField(TEXT("masterTracks"), MasterTracksArray);
-	Result->SetNumberField(TEXT("masterTrackCount"), MasterTracksArray.Num());
 
 	return MCPResult(Result);
 }
@@ -390,18 +538,18 @@ TSharedPtr<FJsonValue> FSequencerHandlers::AddTrack(const TSharedPtr<FJsonObject
 
 	// Check if we should add to an actor binding or as a master track
 	FString ActorLabel = OptionalString(Params, TEXT("actorLabel"));
+	const FString ActorPath = OptionalString(Params, TEXT("actorPath"));
 	auto Result = MCPSuccess();
 
-	if (!ActorLabel.IsEmpty())
+	if (!ActorLabel.IsEmpty() || !ActorPath.IsEmpty())
 	{
 		// Find the binding for this actor
 		REQUIRE_EDITOR_WORLD(World);
 
-		AActor* TargetActor = FindActorByLabel(World, ActorLabel);
-		if (!TargetActor)
-		{
-			return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
-		}
+		TSharedPtr<FJsonValue> ActorErr;
+		AActor* TargetActor = MCPResolveActor(World, Params, ActorErr);
+		if (!TargetActor) return ActorErr;
+		ActorLabel = TargetActor->GetActorLabel();
 
 		// Find or create a binding for this actor
 		FGuid BindingGuid;
@@ -431,6 +579,7 @@ TSharedPtr<FJsonValue> FSequencerHandlers::AddTrack(const TSharedPtr<FJsonObject
 		{
 			MCPSetExisted(Result);
 			Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+			Result->SetStringField(TEXT("actorPath"), TargetActor->GetPathName());
 			Result->SetStringField(TEXT("bindingGuid"), BindingGuid.ToString());
 			Result->SetStringField(TEXT("trackType"), TrackType);
 			Result->SetStringField(TEXT("trackClass"), ExistingTrack->GetClass()->GetName());
@@ -447,6 +596,7 @@ TSharedPtr<FJsonValue> FSequencerHandlers::AddTrack(const TSharedPtr<FJsonObject
 
 		MCPSetCreated(Result);
 		Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+		Result->SetStringField(TEXT("actorPath"), TargetActor->GetPathName());
 		Result->SetStringField(TEXT("bindingGuid"), BindingGuid.ToString());
 		Result->SetStringField(TEXT("trackType"), TrackType);
 		Result->SetStringField(TEXT("trackClass"), NewTrack->GetClass()->GetName());
@@ -559,6 +709,152 @@ TSharedPtr<FJsonValue> FSequencerHandlers::SequenceControl(const TSharedPtr<FJso
 	return MCPResult(Result);
 }
 
+// scrub_sequence (#881) - park the playhead on an exact time and evaluate there.
+//
+// Building a data-driven cinematic means capturing the evaluated world at a
+// known frame, and play_sequence only offers play/pause/stop: realtime playback
+// races capture_scene_png and the frame that lands is whatever the tick gave
+// you. This puts the playhead on the frame that was asked for and forces the
+// evaluation before answering, which is what makes scrub-then-capture
+// reproducible.
+//
+// A separate action rather than a fourth verb on play_sequence: sequenceAction
+// is a closed enum of play|pause|stop and widening it is a contract change on
+// the transport, while a scrub carries a time argument the transport verbs have
+// no use for.
+TSharedPtr<FJsonValue> FSequencerHandlers::ScrubSequence(const TSharedPtr<FJsonObject>& Params)
+{
+	// The Sequencer scripting surface acts on whatever is currently open, so a
+	// named sequence has to be opened first or the scrub would move a different
+	// one. Same rule as play_sequence.
+	const FString RequestedPath = OptionalString(Params, TEXT("sequencePath"), OptionalString(Params, TEXT("assetPath")));
+	if (!RequestedPath.IsEmpty())
+	{
+		ULevelSequence* Sequence = LoadAssetByPath<ULevelSequence>(RequestedPath);
+		if (!Sequence)
+		{
+			return MCPError(FString::Printf(TEXT("Level Sequence not found: %s"), *RequestedPath));
+		}
+		if (!ULevelSequenceEditorBlueprintLibrary::OpenLevelSequence(Sequence))
+		{
+			return MCPError(FString::Printf(TEXT("Failed to open '%s' in Sequencer."), *Sequence->GetPathName()));
+		}
+	}
+
+	ULevelSequence* Current = ULevelSequenceEditorBlueprintLibrary::GetCurrentLevelSequence();
+	if (!Current)
+	{
+		return MCPError(TEXT("No Level Sequence is open in Sequencer. Pass sequencePath to open one, or open it in the editor first."));
+	}
+	UMovieScene* MovieScene = Current->GetMovieScene();
+	if (!MovieScene)
+	{
+		return MCPError(TEXT("LevelSequence has no MovieScene"));
+	}
+
+	const FFrameRate DisplayRate = MovieScene->GetDisplayRate();
+	const FFrameRate TickResolution = MovieScene->GetTickResolution();
+
+	// Two units are in play and confusing them is an 800x error, so the unit is
+	// named rather than guessed: 'display' is the frame number Sequencer shows,
+	// 'tick' is what get_sequence_info's playbackRange reports.
+	const FString TimeUnit = OptionalString(Params, TEXT("timeUnit"), TEXT("display")).ToLower();
+	if (TimeUnit != TEXT("display") && TimeUnit != TEXT("tick"))
+	{
+		return MCPError(FString::Printf(
+			TEXT("Unknown timeUnit '%s'. Use 'display' (the frame numbers Sequencer shows) or 'tick' (the units get_sequence_info's playbackRange reports)."),
+			*TimeUnit));
+	}
+
+	double RequestedSeconds = 0.0;
+	double RequestedFrame = 0.0;
+	const bool bHasSeconds = Params->TryGetNumberField(TEXT("seconds"), RequestedSeconds);
+	const bool bHasFrame = Params->TryGetNumberField(TEXT("frame"), RequestedFrame);
+	if (bHasSeconds == bHasFrame)
+	{
+		return MCPError(TEXT("Provide exactly one of 'seconds' or 'frame'"));
+	}
+
+	// Everything resolves to a display-rate frame time, which is the unit
+	// SetGlobalPosition takes and the unit the Sequencer time field shows.
+	FFrameTime TargetDisplay;
+	if (bHasSeconds)
+	{
+		TargetDisplay = DisplayRate.AsFrameTime(RequestedSeconds);
+	}
+	else if (TimeUnit == TEXT("tick"))
+	{
+		const FFrameTime AsTicks(FFrameNumber(static_cast<int32>(FMath::RoundToDouble(RequestedFrame))));
+		TargetDisplay = FFrameRate::TransformTime(AsTicks, TickResolution, DisplayRate);
+	}
+	else
+	{
+		TargetDisplay = FFrameTime(FFrameNumber(static_cast<int32>(FMath::RoundToDouble(RequestedFrame))));
+	}
+
+	// Pause before scrubbing: a playing sequence moves the playhead again on the
+	// next tick, and the capture would not be at the time that was asked for.
+	ULevelSequenceEditorBlueprintLibrary::Pause();
+	const FMovieSceneSequencePlaybackParams ScrubTo(TargetDisplay, EUpdatePositionMethod::Scrub);
+	ULevelSequenceEditorBlueprintLibrary::SetGlobalPosition(ScrubTo, EMovieSceneTimeUnit::DisplayRate);
+	// Evaluate now instead of on the next tick. The playhead move alone does not
+	// write possessed-actor transforms; the evaluation does, and a capture taken
+	// before it would read the previous frame's world.
+	ULevelSequenceEditorBlueprintLibrary::ForceUpdate();
+
+	const FFrameTime TargetTicks = FFrameRate::TransformTime(TargetDisplay, DisplayRate, TickResolution);
+	const double EvaluatedSeconds = DisplayRate.AsSeconds(TargetDisplay);
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("sequencePath"), Current->GetPathName());
+	Result->SetStringField(TEXT("timeUnit"), TimeUnit);
+	Result->SetNumberField(TEXT("seconds"), EvaluatedSeconds);
+	Result->SetNumberField(TEXT("frame"), TargetDisplay.AsDecimal());
+	Result->SetNumberField(TEXT("tick"), TargetTicks.AsDecimal());
+	Result->SetBoolField(TEXT("evaluated"), true);
+	// Read the transport back rather than reporting what was asked for.
+	Result->SetBoolField(TEXT("playing"), ULevelSequenceEditorBlueprintLibrary::IsPlaying());
+
+	TSharedPtr<FJsonObject> DisplayRateObj = MakeShared<FJsonObject>();
+	DisplayRateObj->SetNumberField(TEXT("numerator"), DisplayRate.Numerator);
+	DisplayRateObj->SetNumberField(TEXT("denominator"), DisplayRate.Denominator);
+	Result->SetObjectField(TEXT("displayRate"), DisplayRateObj);
+
+	TSharedPtr<FJsonObject> TickRateObj = MakeShared<FJsonObject>();
+	TickRateObj->SetNumberField(TEXT("numerator"), TickResolution.Numerator);
+	TickRateObj->SetNumberField(TEXT("denominator"), TickResolution.Denominator);
+	Result->SetObjectField(TEXT("tickResolution"), TickRateObj);
+
+	// A scrub outside the playback range is legal and evaluates, but a track
+	// that has no section there reads as its nearest key, which presents as
+	// "the scrub did nothing". Say so rather than leaving it to be guessed.
+	const TRange<FFrameNumber> PlaybackRange = MovieScene->GetPlaybackRange();
+	TSharedPtr<FJsonObject> RangeObj = MakeShared<FJsonObject>();
+	if (PlaybackRange.HasLowerBound())
+	{
+		RangeObj->SetNumberField(TEXT("startTick"), PlaybackRange.GetLowerBoundValue().Value);
+		RangeObj->SetNumberField(TEXT("startSeconds"), TickResolution.AsSeconds(FFrameTime(PlaybackRange.GetLowerBoundValue())));
+	}
+	if (PlaybackRange.HasUpperBound())
+	{
+		RangeObj->SetNumberField(TEXT("endTick"), PlaybackRange.GetUpperBoundValue().Value);
+		RangeObj->SetNumberField(TEXT("endSeconds"), TickResolution.AsSeconds(FFrameTime(PlaybackRange.GetUpperBoundValue())));
+	}
+	Result->SetObjectField(TEXT("playbackRange"), RangeObj);
+
+	const bool bWithinRange = PlaybackRange.Contains(TargetTicks.FrameNumber);
+	Result->SetBoolField(TEXT("withinPlaybackRange"), bWithinRange);
+	if (!bWithinRange)
+	{
+		Result->SetStringField(TEXT("warning"), TEXT(
+			"The requested time is outside the sequence's playback range. The playhead moved and the sequence "
+			"evaluated, but a track with no section there holds its nearest key, which looks like a scrub that "
+			"did nothing. playbackRange above is in ticks; seconds are given alongside."));
+	}
+
+	return MCPResult(Result);
+}
+
 // set_sequence_playback_range -- set a Level Sequence's playback range in
 // seconds. (#548) Params: sequencePath, startSeconds, endSeconds.
 TSharedPtr<FJsonValue> FSequencerHandlers::SetPlaybackRange(const TSharedPtr<FJsonObject>& Params)
@@ -609,12 +905,17 @@ TSharedPtr<FJsonValue> FSequencerHandlers::AddSection(const TSharedPtr<FJsonObje
 	if (!TrackClass) return MCPError(FString::Printf(TEXT("Unknown track type: '%s'"), *TrackType));
 
 	const FString ActorLabel = OptionalString(Params, TEXT("actorLabel"));
+	const FString ActorPath = OptionalString(Params, TEXT("actorPath"));
 
 	UMovieSceneTrack* Track = nullptr;
 	FGuid BindingGuid;
-	if (!ActorLabel.IsEmpty())
+	if (!ActorLabel.IsEmpty() || !ActorPath.IsEmpty())
 	{
-		if (!ResolveActorBinding(Sequence, MovieScene, ActorLabel, BindingGuid, Err)) return MCPError(Err);
+		REQUIRE_EDITOR_WORLD(BindingWorld);
+		TSharedPtr<FJsonValue> ActorErr;
+		AActor* BoundActor = MCPResolveActor(BindingWorld, Params, ActorErr);
+		if (!BoundActor) return ActorErr;
+		if (!ResolveActorBinding(Sequence, MovieScene, BoundActor, BindingGuid, Err)) return MCPError(Err);
 		Track = MovieScene->FindTrack(TrackClass, BindingGuid);
 		if (!Track) Track = MovieScene->AddTrack(TrackClass, BindingGuid);
 	}
@@ -631,10 +932,18 @@ TSharedPtr<FJsonValue> FSequencerHandlers::AddSection(const TSharedPtr<FJsonObje
 	// Resolve the camera binding up front so a bad cameraActorLabel fails before
 	// we create an orphan section.
 	const FString CameraActorLabel = OptionalString(Params, TEXT("cameraActorLabel"));
+	const FString CameraActorPath = OptionalString(Params, TEXT("cameraActorPath"));
 	FGuid CamGuid;
-	if (!CameraActorLabel.IsEmpty())
+	if (!CameraActorLabel.IsEmpty() || !CameraActorPath.IsEmpty())
 	{
-		if (!ResolveActorBinding(Sequence, MovieScene, CameraActorLabel, CamGuid, Err)) return MCPError(Err);
+		REQUIRE_EDITOR_WORLD(CameraWorld);
+		FMCPActorSelector CameraSel;
+		CameraSel.LabelKey = TEXT("cameraActorLabel");
+		CameraSel.PathKey = TEXT("cameraActorPath");
+		TSharedPtr<FJsonValue> CameraErr;
+		AActor* CameraActor = MCPResolveActor(CameraWorld, Params, CameraErr, CameraSel);
+		if (!CameraActor) return CameraErr;
+		if (!ResolveActorBinding(Sequence, MovieScene, CameraActor, CamGuid, Err)) return MCPError(Err);
 	}
 
 	UMovieSceneSection* Section = Track->CreateNewSection();
@@ -715,11 +1024,16 @@ TSharedPtr<FJsonValue> FSequencerHandlers::SetKeyframes(const TSharedPtr<FJsonOb
 	}
 
 	const FString ActorLabel = OptionalString(Params, TEXT("actorLabel"));
+	const FString ActorPath = OptionalString(Params, TEXT("actorPath"));
 	UMovieSceneTrack* Track = nullptr;
-	if (!ActorLabel.IsEmpty())
+	if (!ActorLabel.IsEmpty() || !ActorPath.IsEmpty())
 	{
+		REQUIRE_EDITOR_WORLD(BindingWorld);
+		TSharedPtr<FJsonValue> ActorErr;
+		AActor* BoundActor = MCPResolveActor(BindingWorld, Params, ActorErr);
+		if (!BoundActor) return ActorErr;
 		FGuid BindingGuid;
-		if (!ResolveActorBinding(Sequence, MovieScene, ActorLabel, BindingGuid, Err)) return MCPError(Err);
+		if (!ResolveActorBinding(Sequence, MovieScene, BoundActor, BindingGuid, Err)) return MCPError(Err);
 		Track = MovieScene->FindTrack(TrackClass, BindingGuid);
 	}
 	else

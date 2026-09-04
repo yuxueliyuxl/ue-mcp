@@ -36,3 +36,5 @@ public class UE_MCP_BridgeStatus : ModuleRules
 		);
 	}
 }
+
+// Rescan trigger: Private/Tests/MCPEngineStatusTests.cpp (#990).

@@ -5,9 +5,12 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 #include "UObject/UnrealType.h"
 #include "UObject/PropertyPortFlags.h"
 #include "UObject/SoftObjectPtr.h"
+#include "StructUtils/InstancedStruct.h"
 #include "GameplayTagContainer.h"
 #include "GameplayTagsManager.h"
 #include "Engine/Blueprint.h"
@@ -22,6 +25,87 @@
 namespace MCPJsonProperty
 {
 	inline bool SetJsonOnProperty(FProperty* Prop, void* ValueAddr, const TSharedPtr<FJsonValue>& InValue, FString& OutError);
+
+	// The reference-property kinds, as one closed answer per property.
+	//
+	// The reflection types nest: FClassProperty derives from FObjectProperty,
+	// and FSoftClassProperty from FSoftObjectProperty; FWeakObjectProperty and
+	// FLazyObjectProperty are siblings of both under FObjectPropertyBase.
+	// CastField<Base>() succeeds on a derived instance, so a chain that tests
+	// the base first swallows the derived kind and leaves the derived branch
+	// unreachable. That is exactly how a TSubclassOf<> field came to be
+	// resolved by the generic asset loader instead of the class loader: the
+	// class branch sat below the object branch and never ran (#935).
+	//
+	// Classifying once and switching on the answer is used here in preference
+	// to simply reordering the branches. Ordering is invisible at the point of
+	// use, is not checkable by a test, and one tidy-up edit that moves a block
+	// silently reinstates the bug. A wrong answer here is a single function to
+	// read and a single function to test, and no later edit to the call sites
+	// can bring the dead branch back.
+	enum class ERefKind : uint8
+	{
+		NotAReference,
+		SoftClass,
+		SoftObject,
+		Class,
+		Object,
+		WeakObject,
+		LazyObject,
+		Interface,
+	};
+
+	inline ERefKind ClassifyReference(const FProperty* Prop)
+	{
+		if (!Prop) return ERefKind::NotAReference;
+		// Most derived first: each test is reached only once every
+		// more-derived test above it has failed.
+		if (Prop->IsA<FSoftClassProperty>())  return ERefKind::SoftClass;
+		if (Prop->IsA<FSoftObjectProperty>()) return ERefKind::SoftObject;
+		if (Prop->IsA<FClassProperty>())      return ERefKind::Class;
+		if (Prop->IsA<FObjectProperty>())     return ERefKind::Object;
+		if (Prop->IsA<FWeakObjectProperty>()) return ERefKind::WeakObject;
+		if (Prop->IsA<FLazyObjectProperty>()) return ERefKind::LazyObject;
+		if (Prop->IsA<FInterfaceProperty>())  return ERefKind::Interface;
+		return ERefKind::NotAReference;
+	}
+
+	// Resolve a class path the way a caller means it, without inventing a
+	// suffix the path did not ask for.
+	//
+	// #489: a caller naming a Blueprint commonly passes the asset path
+	// (/Game/Foo/BP_GameMode.BP_GameMode) for a class-typed field, and the
+	// generated class is that path plus "_C".
+	// #928: the suffix used to be appended unconditionally on the soft-class
+	// path, so a native /Script/Module.ClassName reference was stored as
+	// /Script/Module.ClassName_C, which names no class at all, and the write
+	// still reported success. The suffix is now only ever used when the path
+	// as written does not name a class and the suffixed form does.
+	inline UClass* ResolveClassPath(const FString& Path)
+	{
+		if (Path.IsEmpty()) return nullptr;
+
+		if (UClass* Direct = LoadClass<UObject>(nullptr, *Path))
+		{
+			return Direct;
+		}
+		// A native class lives at its /Script/ path and never carries "_C".
+		if (!Path.StartsWith(TEXT("/Script/")) && !Path.EndsWith(TEXT("_C")))
+		{
+			const FString WithSuffix = Path + TEXT("_C");
+			if (UClass* Generated = LoadClass<UObject>(nullptr, *WithSuffix))
+			{
+				return Generated;
+			}
+		}
+		// Last ditch: load the asset as a UBlueprint and take its generated
+		// class. Covers paths written without the .Name object suffix.
+		if (UBlueprint* BP = Cast<UBlueprint>(StaticLoadObject(UBlueprint::StaticClass(), nullptr, *Path)))
+		{
+			return BP->GeneratedClass;
+		}
+		return nullptr;
+	}
 
 	// One (key, value) write for a TMap, in whichever JSON shape the caller
 	// used. `KeyJson` is null for the object shape, where the field name is the
@@ -117,31 +201,32 @@ namespace MCPJsonProperty
 		// to ImportText and surfaced "asset not found: None".
 		if (Value->Type == EJson::Null)
 		{
-			if (FObjectProperty* OP = CastField<FObjectProperty>(Prop))
+			// One dispatch on the classified kind: FClassProperty used to sit
+			// below FObjectProperty here and never be reached (#935). Clearing
+			// happens to mean the same thing for both, so this branch was not
+			// the one that corrupted data, but leaving the same inverted chain
+			// in place invites the next reader to copy it.
+			switch (ClassifyReference(Prop))
 			{
-				OP->SetObjectPropertyValue(ValueAddr, nullptr);
+			case ERefKind::SoftClass:
+			case ERefKind::SoftObject:
+				CastFieldChecked<FSoftObjectProperty>(Prop)->SetPropertyValue(ValueAddr, FSoftObjectPtr());
 				return true;
-			}
-			if (FSoftObjectProperty* SOP = CastField<FSoftObjectProperty>(Prop))
-			{
-				SOP->SetPropertyValue(ValueAddr, FSoftObjectPtr());
+			case ERefKind::Class:
+			case ERefKind::Object:
+				CastFieldChecked<FObjectProperty>(Prop)->SetObjectPropertyValue(ValueAddr, nullptr);
 				return true;
-			}
-			if (FWeakObjectProperty* WOP = CastField<FWeakObjectProperty>(Prop))
-			{
-				WOP->SetObjectPropertyValue(ValueAddr, nullptr);
+			case ERefKind::WeakObject:
+				CastFieldChecked<FWeakObjectProperty>(Prop)->SetObjectPropertyValue(ValueAddr, nullptr);
 				return true;
-			}
-			if (FClassProperty* CP = CastField<FClassProperty>(Prop))
-			{
-				CP->SetObjectPropertyValue(ValueAddr, nullptr);
-				return true;
-			}
-			if (FInterfaceProperty* IP = CastField<FInterfaceProperty>(Prop))
+			case ERefKind::Interface:
 			{
 				FScriptInterface Empty;
-				IP->SetPropertyValue(ValueAddr, Empty);
+				CastFieldChecked<FInterfaceProperty>(Prop)->SetPropertyValue(ValueAddr, Empty);
 				return true;
+			}
+			default:
+				break;
 			}
 			OutError = FString::Printf(TEXT("property '%s' is not an object/class/interface reference; null value not allowed"), *Prop->GetName());
 			return false;
@@ -351,84 +436,81 @@ namespace MCPJsonProperty
 			}
 		}
 
-		// Hard UObject ref - accept asset path
-		if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
+		// Object, class and soft references, all addressed by path. One
+		// dispatch on the classified kind (see ClassifyReference), so the
+		// class kinds are handled by the class-aware code rather than being
+		// swallowed by their base's branch (#935). A value that is not a
+		// string falls out of the switch to the ImportText fallback below,
+		// exactly as it did when these were separate `if` blocks.
+		switch (ClassifyReference(Prop))
+		{
+		case ERefKind::Class:
 		{
 			FString Path;
 			if (Value->TryGetString(Path) && !Path.IsEmpty())
 			{
+				UClass* Loaded = ResolveClassPath(Path);
+				if (!Loaded) { OutError = FString::Printf(TEXT("class not found: %s"), *Path); return false; }
+				CastFieldChecked<FClassProperty>(Prop)->SetObjectPropertyValue(ValueAddr, Loaded);
+				return true;
+			}
+			break;
+		}
+		case ERefKind::Object:
+		{
+			FString Path;
+			if (Value->TryGetString(Path) && !Path.IsEmpty())
+			{
+				FObjectProperty* ObjProp = CastFieldChecked<FObjectProperty>(Prop);
 				UObject* Loaded = StaticLoadObject(ObjProp->PropertyClass, nullptr, *Path);
 				if (!Loaded) { OutError = FString::Printf(TEXT("asset not found: %s"), *Path); return false; }
 				ObjProp->SetObjectPropertyValue(ValueAddr, Loaded);
 				return true;
 			}
+			break;
 		}
-
-		// Hard UClass ref - accept class path
-		if (FClassProperty* ClassProp = CastField<FClassProperty>(Prop))
-		{
-			FString Path;
-			if (Value->TryGetString(Path) && !Path.IsEmpty())
-			{
-				UClass* Loaded = LoadClass<UObject>(nullptr, *Path);
-				if (!Loaded)
-				{
-					// #489: callers commonly pass a Blueprint asset path
-					// (/Game/Foo/BP_GameMode.BP_GameMode) for a TSubclassOf
-					// field. Retry with the generated-class suffix.
-					if (!Path.EndsWith(TEXT("_C")))
-					{
-						const FString WithSuffix = Path + TEXT("_C");
-						Loaded = LoadClass<UObject>(nullptr, *WithSuffix);
-					}
-				}
-				if (!Loaded)
-				{
-					// Last-ditch: load the asset as UBlueprint and grab its
-					// GeneratedClass. Covers paths that omit the .Name suffix.
-					if (UBlueprint* BP = Cast<UBlueprint>(StaticLoadObject(UBlueprint::StaticClass(), nullptr, *Path)))
-					{
-						Loaded = BP->GeneratedClass;
-					}
-				}
-				if (!Loaded) { OutError = FString::Printf(TEXT("class not found: %s"), *Path); return false; }
-				ClassProp->SetObjectPropertyValue(ValueAddr, Loaded);
-				return true;
-			}
-		}
-
-		// Soft class ref - accept class path string, same Blueprint suffix tolerance.
-		if (FSoftClassProperty* SoftClassProp = CastField<FSoftClassProperty>(Prop))
+		case ERefKind::SoftClass:
 		{
 			FString Path;
 			if (Value->TryGetString(Path))
 			{
+				FSoftClassProperty* SoftClassProp = CastFieldChecked<FSoftClassProperty>(Prop);
 				if (Path.IsEmpty())
 				{
 					SoftClassProp->SetPropertyValue(ValueAddr, FSoftObjectPtr());
 					return true;
 				}
-				if (!Path.EndsWith(TEXT("_C")))
+				// #928: store the path that actually names a class. Only a
+				// Blueprint-generated class carries the "_C" suffix, and it is
+				// added only when the path as written names nothing and the
+				// suffixed form does. A path that resolves to neither is
+				// stored verbatim: a soft reference to an asset that does not
+				// exist yet is legitimate, and silently rewriting it was how a
+				// native /Script/ reference got corrupted.
+				if (UClass* Resolved = ResolveClassPath(Path))
 				{
-					Path += TEXT("_C");
+					SoftClassProp->SetPropertyValue(ValueAddr, FSoftObjectPtr(FSoftObjectPath(Resolved)));
+					return true;
 				}
-				FSoftObjectPath PathObj(Path);
-				SoftClassProp->SetPropertyValue(ValueAddr, FSoftObjectPtr(PathObj));
+				SoftClassProp->SetPropertyValue(ValueAddr, FSoftObjectPtr(FSoftObjectPath(Path)));
 				return true;
 			}
+			break;
 		}
-
-		// Soft object ref - accept path string
-		if (FSoftObjectProperty* SoftObjProp = CastField<FSoftObjectProperty>(Prop))
+		case ERefKind::SoftObject:
 		{
 			FString Path;
 			if (Value->TryGetString(Path))
 			{
 				FSoftObjectPath PathObj(Path);
 				FSoftObjectPtr Ptr(PathObj);
-				SoftObjProp->SetPropertyValue(ValueAddr, Ptr);
+				CastFieldChecked<FSoftObjectProperty>(Prop)->SetPropertyValue(ValueAddr, Ptr);
 				return true;
 			}
+			break;
+		}
+		default:
+			break;
 		}
 
 		// Enum / Byte-with-enum: accept friendly aliases ("center", "Center"),
@@ -552,6 +634,208 @@ namespace MCPJsonProperty
 		return bOk;
 	}
 
+	// ── Readback verification ────────────────────────────────────────────────
+	//
+	// #935: a write that did not take must not come back as a success. The
+	// setter returns true the moment an assignment executes, and nothing used
+	// to look at what was actually stored afterwards, so a reference that
+	// resolved to the wrong thing, a container that quietly emptied, or a
+	// value that never reached the row the caller named all reported
+	// success: true with the broken asset saved to disk.
+
+	/** A compact, readable rendering of a JSON value for an error message. */
+	inline FString DescribeJsonValue(const TSharedPtr<FJsonValue>& Value)
+	{
+		if (!Value.IsValid()) return TEXT("(none)");
+		switch (Value->Type)
+		{
+		case EJson::Null:    return TEXT("null");
+		case EJson::Boolean: return Value->AsBool() ? TEXT("true") : TEXT("false");
+		case EJson::Number:  return FString::SanitizeFloat(Value->AsNumber());
+		case EJson::String:  return Value->AsString();
+		default:
+			break;
+		}
+		FString Out;
+		using FCondensedWriter = TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>;
+		const TSharedRef<FCondensedWriter> Writer =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
+		if (Value->Type == EJson::Object)
+		{
+			FJsonSerializer::Serialize(Value->AsObject().ToSharedRef(), Writer);
+		}
+		else
+		{
+			FJsonSerializer::Serialize(Value->AsArray(), Writer);
+		}
+		return Out;
+	}
+
+	/** True when two independent applications of one request must produce
+	 *  values that compare Identical.
+	 *
+	 *  Two kinds of value are not in that class, and both would report a
+	 *  mismatch that is not one:
+	 *
+	 *  FText identity is per instance. Two imports of the same source string
+	 *  carry different keys and are never Identical.
+	 *
+	 *  An instanced reference is a fresh subobject on every import, so the two
+	 *  applications point at two different objects by design.
+	 *
+	 *  Anything unrecognised, and anything past the depth bound, answers
+	 *  "no", so the conservative path is the one that skips the comparison
+	 *  rather than the one that fails a write that was fine. */
+	inline bool PropertyIsComparableByIdentity(const FProperty* Prop, int32 Depth = 0)
+	{
+		if (!Prop || Depth > 12) return false;
+		if (Prop->HasAnyPropertyFlags(CPF_InstancedReference | CPF_ContainsInstancedReference)) return false;
+		if (Prop->IsA<FTextProperty>()) return false;
+
+		if (const FArrayProperty* ArrProp = CastField<FArrayProperty>(Prop))
+		{
+			return PropertyIsComparableByIdentity(ArrProp->Inner, Depth + 1);
+		}
+		if (const FSetProperty* SetProp = CastField<FSetProperty>(Prop))
+		{
+			return PropertyIsComparableByIdentity(SetProp->ElementProp, Depth + 1);
+		}
+		if (const FMapProperty* MapProp = CastField<FMapProperty>(Prop))
+		{
+			return PropertyIsComparableByIdentity(MapProp->KeyProp, Depth + 1)
+				&& PropertyIsComparableByIdentity(MapProp->ValueProp, Depth + 1);
+		}
+		if (const FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+		{
+			for (TFieldIterator<FProperty> It(StructProp->Struct); It; ++It)
+			{
+				if (!PropertyIsComparableByIdentity(*It, Depth + 1)) return false;
+			}
+		}
+		return true;
+	}
+
+	/** The comparable form of an asset path.
+	 *
+	 *  Two normalisations, and only the two the resolver is allowed to apply:
+	 *  the "Pkg.Obj" long form of "Pkg" that the content browser writes as
+	 *  "Pkg", and the Blueprint generated class "Pkg.Obj_C" of that same
+	 *  asset. Both are recognised by the object name repeating the package
+	 *  leaf, which is what makes them the same asset; a "_C" that does not
+	 *  produce that repetition is part of the name and is left alone, so
+	 *  /Script/Engine.Character and /Script/Engine.Character_C stay different
+	 *  paths, and an asset genuinely called Foo_C still compares equal to
+	 *  itself. A subobject path is compared whole. */
+	inline FString NormalizeAssetPathForCompare(const FString& InPath)
+	{
+		FString Path = InPath.TrimStartAndEnd();
+		if (Path.IsEmpty() || Path.Contains(TEXT(":"))) return Path;
+
+		int32 DotPos = INDEX_NONE;
+		if (!Path.FindLastChar(TEXT('.'), DotPos)) return Path;
+
+		const FString Package = Path.Left(DotPos);
+		const FString ObjectName = Path.Mid(DotPos + 1);
+
+		int32 SlashPos = INDEX_NONE;
+		const FString LeafName = Package.FindLastChar(TEXT('/'), SlashPos)
+			? Package.Mid(SlashPos + 1)
+			: Package;
+
+		if (LeafName.Equals(ObjectName, ESearchCase::IgnoreCase)) return Package;
+		if (ObjectName.EndsWith(TEXT("_C")) &&
+			LeafName.Equals(ObjectName.LeftChop(2), ESearchCase::IgnoreCase))
+		{
+			return Package;
+		}
+		return Path;
+	}
+
+	/** Read the stored value back and answer whether it is what was asked for.
+	 *
+	 *  Three checks, because they fail on different things.
+	 *
+	 *  A soft reference is never resolved at write time, so its stored text is
+	 *  whatever the setter chose to write. Comparing that text against the
+	 *  requested path is the only thing that catches a path the setter
+	 *  rewrote, which is exactly how a native /Script/ class reference used to
+	 *  end up with a "_C" suffix appended (#928).
+	 *
+	 *  A hard reference that was asked for by path must not have come out
+	 *  null. Comparing its path is not useful, because a redirector legally
+	 *  answers a different path than the one requested.
+	 *
+	 *  Everything else is compared by identity against an independent buffer
+	 *  the same request was applied to. That is what catches a value that
+	 *  never reached the destination: a container that stored fewer entries
+	 *  than it was handed, a row copy that dropped the field, a reference
+	 *  cleared by a later step. Values whose two applications are not
+	 *  required to be identical, text and instanced references, are exempt
+	 *  rather than failed.
+	 *
+	 *  On a mismatch OutDetail carries the requested and the stored value. */
+	inline bool VerifyJsonOnProperty(
+		FProperty* Prop,
+		const void* ValueAddr,
+		const TSharedPtr<FJsonValue>& Requested,
+		FString& OutDetail)
+	{
+		if (!Prop || !ValueAddr || !Requested.IsValid()) return true;
+
+		FString StoredText;
+		Prop->ExportTextItem_Direct(StoredText, ValueAddr, nullptr, nullptr, PPF_None);
+
+		FString RequestedPath;
+		const bool bRequestedPath = Requested->TryGetString(RequestedPath) && !RequestedPath.IsEmpty();
+		const ERefKind Kind = ClassifyReference(Prop);
+
+		if (bRequestedPath && (Kind == ERefKind::SoftClass || Kind == ERefKind::SoftObject))
+		{
+			const FString Stored = CastFieldChecked<FSoftObjectProperty>(Prop)->GetPropertyValue(ValueAddr).ToString();
+			if (!NormalizeAssetPathForCompare(Stored).Equals(
+					NormalizeAssetPathForCompare(RequestedPath), ESearchCase::IgnoreCase))
+			{
+				OutDetail = FString::Printf(TEXT("requested '%s', stored '%s'"), *RequestedPath, *Stored);
+				return false;
+			}
+			return true;
+		}
+
+		if (bRequestedPath && (Kind == ERefKind::Class || Kind == ERefKind::Object))
+		{
+			if (CastFieldChecked<FObjectProperty>(Prop)->GetObjectPropertyValue(ValueAddr) == nullptr)
+			{
+				OutDetail = FString::Printf(TEXT("requested '%s', stored nothing"), *RequestedPath);
+				return false;
+			}
+			return true;
+		}
+
+		if (!PropertyIsComparableByIdentity(Prop)) return true;
+
+		FDefaultConstructedPropertyElement Reference(Prop);
+		FString Ignored;
+		if (!SetJsonOnProperty(Prop, Reference.GetObjAddress(), Requested, Ignored))
+		{
+			// The same request applied cleanly a moment ago; if it does not
+			// apply now the stored value cannot be trusted either.
+			OutDetail = FString::Printf(
+				TEXT("requested %s, stored '%s' (the request no longer applies: %s)"),
+				*DescribeJsonValue(Requested), *StoredText, *Ignored);
+			return false;
+		}
+		if (!Prop->Identical(ValueAddr, Reference.GetObjAddress(), PPF_None))
+		{
+			FString ReferenceText;
+			Prop->ExportTextItem_Direct(ReferenceText, Reference.GetObjAddress(), nullptr, nullptr, PPF_None);
+			OutDetail = FString::Printf(
+				TEXT("requested %s (which resolves to '%s'), stored '%s'"),
+				*DescribeJsonValue(Requested), *ReferenceText, *StoredText);
+			return false;
+		}
+		return true;
+	}
+
 	// Resolve a dotted property path that may index arrays ("Traits[2]") and
 	// follow object references (instanced subobjects), e.g.
 	// "Config.Traits[1].Params.RepresentationActorManagementClass" on a
@@ -571,12 +855,13 @@ namespace MCPJsonProperty
 		if (Parts.Num() == 0) { OutError = TEXT("empty property name"); return false; }
 
 		void* Container = Root;
-		UStruct* ContainerStruct = Root->GetClass();
+		const UStruct* ContainerStruct = Root->GetClass();
 		UObject* Owner = Root;
 
 		for (int32 i = 0; i < Parts.Num(); ++i)
 		{
 			FString Token = Parts[i];
+			const FString PathToken = Token;
 			int32 Index = INDEX_NONE;
 			int32 BracketPos;
 			if (Token.FindChar(TEXT('['), BracketPos))
@@ -595,12 +880,36 @@ namespace MCPJsonProperty
 
 			if (Index != INDEX_NONE)
 			{
-				FArrayProperty* ArrProp = CastField<FArrayProperty>(Prop);
-				if (!ArrProp) { OutError = FString::Printf(TEXT("'%s' is not an array but was indexed [%d]"), *Token, Index); return false; }
-				FScriptArrayHelper H(ArrProp, ValueAddr);
-				if (Index < 0 || Index >= H.Num()) { OutError = FString::Printf(TEXT("index %d out of range on '%s' (num=%d)"), Index, *Token, H.Num()); return false; }
-				Prop = ArrProp->Inner;
-				ValueAddr = H.GetRawPtr(Index);
+				if (FArrayProperty* ArrProp = CastField<FArrayProperty>(Prop))
+				{
+					FScriptArrayHelper H(ArrProp, ValueAddr);
+					if (Index < 0 || Index >= H.Num()) { OutError = FString::Printf(TEXT("index %d out of range on '%s' (num=%d)"), Index, *Token, H.Num()); return false; }
+					Prop = ArrProp->Inner;
+					ValueAddr = H.GetRawPtr(Index);
+				}
+				// #927: a UPROPERTY declared as a C-style fixed array, e.g.
+				// `int32 Foo[3]`, is ONE FProperty with ArrayDim == 3 rather than
+				// an FArrayProperty. Without this branch every indexed write to
+				// one landed on element 0, or was refused as "not an array",
+				// which is how RecastNavMesh's three navmesh generation tiers
+				// became unreachable: only the Low tier could be read or written
+				// while the engine generated from Default and High.
+				else if (Prop->ArrayDim > 1)
+				{
+					if (Index < 0 || Index >= Prop->ArrayDim)
+					{
+						OutError = FString::Printf(TEXT("index %d out of range on fixed array '%s' (ArrayDim=%d)"), Index, *Token, Prop->ArrayDim);
+						return false;
+					}
+					// Re-address from the container so the element offset is the
+					// engine's own, rather than adding a hand-computed stride.
+					ValueAddr = Prop->ContainerPtrToValuePtr<void>(Container, Index);
+				}
+				else
+				{
+					OutError = FString::Printf(TEXT("'%s' is not an array but was indexed [%d]"), *Token, Index);
+					return false;
+				}
 			}
 
 			if (i == Parts.Num() - 1)
@@ -614,8 +923,25 @@ namespace MCPJsonProperty
 			// Descend for the next token.
 			if (FStructProperty* SP = CastField<FStructProperty>(Prop))
 			{
-				Container = ValueAddr;
-				ContainerStruct = SP->Struct;
+				if (SP->Struct == FInstancedStruct::StaticStruct())
+				{
+					FInstancedStruct* InstancedStruct = static_cast<FInstancedStruct*>(ValueAddr);
+					const UScriptStruct* PayloadStruct = InstancedStruct->GetScriptStruct();
+					void* PayloadMemory = InstancedStruct->GetMutableMemory();
+					if (!PayloadStruct || !PayloadMemory)
+					{
+						OutError = FString::Printf(TEXT("'%s' FInstancedStruct payload is empty - cannot descend"), *PathToken);
+						return false;
+					}
+
+					Container = PayloadMemory;
+					ContainerStruct = PayloadStruct;
+				}
+				else
+				{
+					Container = ValueAddr;
+					ContainerStruct = SP->Struct;
+				}
 			}
 			else if (FObjectProperty* OP = CastField<FObjectProperty>(Prop))
 			{

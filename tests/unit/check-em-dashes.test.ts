@@ -140,3 +140,37 @@ describe("the command line", () => {
     expect(status).toBe(2);
   });
 });
+
+describe("absolute paths (git worktree commit hook)", () => {
+  // .husky/commit-msg runs `check-em-dashes.mjs --files "$1"`. Git hands that
+  // hook an ABSOLUTE COMMIT_EDITMSG path when the commit is made inside a
+  // worktree. Gluing the cwd onto the front of an absolute path produced a
+  // path that does not exist, so the hook rejected every worktree commit and
+  // the only way through was --no-verify, which skips the check entirely.
+  const EM_DASH = String.fromCharCode(0x2014);
+
+  it("scans a file given by absolute path", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "emdash-abs-"));
+    try {
+      const file = path.join(dir, "COMMIT_EDITMSG");
+      writeFileSync(file, "fix: a clean message", "utf8");
+      expect(path.isAbsolute(file)).toBe(true);
+      expect(scanFiles([file], REPO_ROOT)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still finds an em dash in an absolute-path file", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "emdash-abs-"));
+    try {
+      const file = path.join(dir, "COMMIT_EDITMSG");
+      writeFileSync(file, "fix: a message with " + EM_DASH + " in it", "utf8");
+      const findings = scanFiles([file], REPO_ROOT);
+      expect(findings).toHaveLength(1);
+      expect(findings[0].file).toBe(file);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

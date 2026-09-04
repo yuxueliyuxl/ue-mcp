@@ -28,6 +28,75 @@ export function bridgeLockfilePath(projectDir: string): string {
   return path.join(projectDir, "Saved", "UE_MCP_Bridge", "port.json");
 }
 
+/** Where every live bridge publishes its own address, one file per process. */
+export function bridgeInstancesDir(projectDir: string): string {
+  return path.join(projectDir, "Saved", "UE_MCP_Bridge", "instances");
+}
+
+/**
+ * One editor's own published address, from `instances/<pid>.json`.
+ *
+ * Unlike port.json this file cannot be taken away by anybody else: the process
+ * that wrote it is the only one that ever deletes it, and its name is that
+ * process's pid. That is what makes it the recovery path when port.json is
+ * gone (#934).
+ */
+export interface BridgeInstanceRecord {
+  port: number;
+  pid: number;
+  instanceId: string | null;
+  /** "listening" or "bind-failed". A bind-failed record names no reachable port. */
+  state: string | null;
+  startedAt: string | null;
+  recordPath: string;
+  writtenAtMs: number;
+}
+
+/**
+ * Every readable instance record for this project, newest first.
+ *
+ * Records are read, not trusted: the caller decides which pids are still alive.
+ * A record whose process is gone is exactly the artefact that outlives a crash,
+ * and treating it as an address would resurrect the bug the lockfile pid check
+ * exists to prevent (#819).
+ */
+export function readBridgeInstanceRecords(projectDir: string): BridgeInstanceRecord[] {
+  const dir = bridgeInstancesDir(projectDir);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+
+  const records: BridgeInstanceRecord[] = [];
+  for (const name of names) {
+    if (!name.toLowerCase().endsWith(".json")) continue;
+    const recordPath = path.join(dir, name);
+    try {
+      const stat = fs.statSync(recordPath);
+      const parsed = JSON.parse(fs.readFileSync(recordPath, "utf-8")) as Record<string, unknown>;
+      const pid = parsed.pid;
+      const port = parsed.port;
+      if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) continue;
+      if (typeof port !== "number" || !Number.isInteger(port) || port <= 0 || port > 65535) continue;
+      records.push({
+        port,
+        pid,
+        instanceId: typeof parsed.instanceId === "string" ? parsed.instanceId : null,
+        state: typeof parsed.state === "string" ? parsed.state : null,
+        startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : null,
+        recordPath,
+        writtenAtMs: stat.mtimeMs,
+      });
+    } catch {
+      // A record being written right now, or one from a build that wrote a
+      // different shape. Neither is a reason to discard the others.
+    }
+  }
+  return records.sort((a, b) => b.writtenAtMs - a.writtenAtMs);
+}
+
 export interface BridgeLockfile {
   port: number;
   /** The editor process that bound the port, or null on older plugin builds. */
@@ -68,6 +137,10 @@ export type BridgeTarget =
       pid: number | null;
       writtenAtMs: number;
       lockfilePath: string;
+      /** Which published file this address came from. */
+      source: "port.json" | "instance-record";
+      /** The instance record used, when the shared lockfile could not answer. */
+      recordPath?: string;
     }
   | {
       ok: false;
@@ -78,11 +151,47 @@ export type BridgeTarget =
     };
 
 /**
+ * A live editor's own published address for this project, newest first.
+ *
+ * #934: two editors of one project share a single `Saved/UE_MCP_Bridge/`, and
+ * the one that quits removes port.json on its way out. Only the instance that
+ * wrote it ever deletes it, so the survivor is left with no shared lockfile at
+ * all even though it is listening perfectly well, and recovery used to mean
+ * hand-writing port.json back. Its own `instances/<pid>.json` was on disk the
+ * whole time and names its port, so recovery is a directory read.
+ *
+ * `alive` is injected so the fallback is testable without real pids.
+ */
+export function findLiveInstanceRecord(
+  projectDir: string,
+  alive: (pid: number) => boolean = isPidAlive,
+): BridgeInstanceRecord | null {
+  for (const record of readBridgeInstanceRecords(projectDir)) {
+    // A bind-failed record exists to explain a failure, not to be dialled.
+    if (record.state === "bind-failed") continue;
+    if (!alive(record.pid)) continue;
+    return record;
+  }
+  return null;
+}
+
+/**
  * The bridge endpoint belonging to `projectDir`, or a reason naming the exact
  * file that was checked. Never returns a port that this project did not
  * publish for itself.
+ *
+ * The shared lockfile is still the first answer, and callers still check the
+ * pid it names for themselves. When there is no lockfile at all, a live
+ * instance record for this project is a strictly better answer than a refusal:
+ * the editor published it, for this project, and it names a port nobody else
+ * can overwrite (#934).
+ *
+ * `isAlive` is injected so the fallback is testable without real pids.
  */
-export function resolveBridgeTarget(projectDir?: string | null): BridgeTarget {
+export function resolveBridgeTarget(
+  projectDir?: string | null,
+  isAlive: (pid: number) => boolean = isPidAlive,
+): BridgeTarget {
   if (!projectDir) {
     return {
       ok: false,
@@ -95,23 +204,38 @@ export function resolveBridgeTarget(projectDir?: string | null): BridgeTarget {
 
   const lockfilePath = bridgeLockfilePath(projectDir);
   const lockfile = readBridgeLockfileIn(projectDir);
-  if (!lockfile) {
+  if (lockfile) {
     return {
-      ok: false,
+      ok: true,
+      port: lockfile.port,
+      pid: lockfile.pid,
+      writtenAtMs: lockfile.writtenAtMs,
       lockfilePath,
-      reason:
-        `No bridge port published at ${lockfilePath}. The editor writes that file while its bridge is listening ` +
-        "and removes it when it exits, so either no editor is running for this project or its bridge never started. " +
-        "Lifecycle actions do not guess a port, because a guessed port reaches whichever editor happens to hold it.",
+      source: "port.json",
+    };
+  }
+
+  const record = findLiveInstanceRecord(projectDir, isAlive);
+  if (record) {
+    return {
+      ok: true,
+      port: record.port,
+      pid: record.pid,
+      writtenAtMs: record.writtenAtMs,
+      lockfilePath,
+      source: "instance-record",
+      recordPath: record.recordPath,
     };
   }
 
   return {
-    ok: true,
-    port: lockfile.port,
-    pid: lockfile.pid,
-    writtenAtMs: lockfile.writtenAtMs,
+    ok: false,
     lockfilePath,
+    reason:
+      `No bridge port published at ${lockfilePath}, and no live instance record under ${bridgeInstancesDir(projectDir)}. ` +
+      "The editor writes those files while its bridge is listening and removes them when it exits, so either no " +
+      "editor is running for this project or its bridge never started. " +
+      "Lifecycle actions do not guess a port, because a guessed port reaches whichever editor happens to hold it.",
   };
 }
 

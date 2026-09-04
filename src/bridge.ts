@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { McpError, ErrorCode } from "./errors.js";
+import { resolveBridgeTimeout, TIMEOUT_ENV_VAR } from "./bridge-timeouts.js";
 import { debug, warn } from "./log.js";
 import { DEFAULT_BRIDGE_PORT, deriveProjectPort } from "./port.js";
 import { isPidAlive } from "./editor-target.js";
@@ -532,7 +533,11 @@ export class EditorBridge implements IBridge {
 
     const id = String(++this.idCounter);
     const request = { id, method, params: params ?? {} };
-    const timeout = timeoutMs ?? 30_000;
+    // #989: not a flat 30s any more. An explicit per-call budget is honoured,
+    // and a method the C++ side registered a longer timeout for is waited out
+    // to that limit, so the client stops declaring a failure on a call the
+    // editor is still allowed to be running. See src/bridge-timeouts.ts.
+    const timeout = resolveBridgeTimeout(method, timeoutMs);
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       throw new McpError(
@@ -554,7 +559,10 @@ export class EditorBridge implements IBridge {
           `Bridge call '${method}' timed out after ${Math.round(timeout / 1000)}s. `
           + `Outcome is unknown: the editor may have already applied and saved this call `
           + `(operation ${id}). Read the current state back before retrying, and prefer `
-          + `an idempotent retry (pass the same names) so a call that did land is not repeated.`,
+          + `an idempotent retry (pass the same names) so a call that did land is not repeated. `
+          + `If the editor was simply busy (a large batch, shader compilation), raise the `
+          + `budget with timeoutMs on the call, or ${TIMEOUT_ENV_VAR} for every call, `
+          + `rather than retrying at the same budget.`,
           { outcome: "unknown", operationId: id, method },
         ));
       }, timeout);

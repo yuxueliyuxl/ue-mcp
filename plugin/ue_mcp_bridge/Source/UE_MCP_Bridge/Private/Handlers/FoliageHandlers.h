@@ -15,4 +15,7 @@ private:
 	static TSharedPtr<FJsonValue> GetFoliageSettings(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetFoliageTypeSettings(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateFoliageType(const TSharedPtr<FJsonObject>& Params);
+	// #988: write settings to every FoliageType matching a predicate on an
+	// EXISTING property value. Lives in FoliageHandlers_Batch.cpp.
+	static TSharedPtr<FJsonValue> BatchSetFoliageSettingsWhere(const TSharedPtr<FJsonObject>& Params);
 };

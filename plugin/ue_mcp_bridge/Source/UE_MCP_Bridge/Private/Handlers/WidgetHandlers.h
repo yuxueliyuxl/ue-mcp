@@ -4,6 +4,90 @@
 #include "Dom/JsonValue.h"
 #include "Dom/JsonObject.h"
 
+class UWidgetBlueprint;
+
+/**
+ * Shared WidgetBlueprint resolution for every widget action (#972).
+ *
+ * Symptom: building a WidgetBlueprint incrementally failed every second or
+ * third add_widget with "Failed to load WidgetBlueprint", on an asset that was
+ * on disk, was in the AssetRegistry, and that asset(search) could see. Then it
+ * wedged permanently, and asset(force_reload) made it worse while
+ * editor(reload_bridge) cleared it instantly.
+ *
+ * Mechanism, confirmed by reading every widget translation unit: the handlers
+ * hold NO pointer between calls. Each one re-resolved from the path through
+ * UEditorAssetLibrary::LoadAsset, which is not a plain load. It converts the
+ * path, looks the asset up in the AssetRegistry, and loads the FAssetData it
+ * got back. That round trip is what intermittently answers null: the registry
+ * entry a call resolved through can be mid-rescan, and after a package reload
+ * it names an object that has been consigned to oblivion (RF_NewerVersionExists)
+ * while a new one holds the name. So the stale handle is real, it just lives in
+ * the engine's asset plumbing rather than in a static in this plugin, and
+ * "resolve fresh per call" was already true and not enough on its own.
+ *
+ * The resolver below therefore does three things the old one-liner did not:
+ *
+ *   1. Asks the object hash FIRST (FindObject on the object path). An asset
+ *      already in memory answers without touching the registry round trip at
+ *      all, which is the step that removes the intermittency.
+ *   2. Revalidates whatever it gets. IsValid plus an RF_NewerVersionExists
+ *      check, so a reload's corpse is never handed to a caller who would then
+ *      mutate an object the editor no longer consults.
+ *   3. Falls through progressively (EditorAssetLibrary, direct LoadObject,
+ *      explicit LoadPackage then look inside it) instead of giving up on the
+ *      first null.
+ *
+ * It also separates "there is no such asset" from "the asset is there and the
+ * handle went stale", because the caller's next move differs: fix the path, or
+ * retry / reload the bridge.
+ */
+namespace MCPWidget
+{
+
+enum class EWidgetBlueprintResolveFailure : uint8
+{
+	/** Resolved. */
+	None,
+	/** Nothing in the AssetRegistry and no package of that name on disk. */
+	NotFound,
+	/** The path names something real that is not a WidgetBlueprint. */
+	WrongType,
+	/** The asset exists but no live object could be reached this call. */
+	Unresolvable,
+};
+
+struct FWidgetBlueprintResolve
+{
+	UWidgetBlueprint* Blueprint = nullptr;
+	EWidgetBlueprintResolveFailure Failure = EWidgetBlueprintResolveFailure::None;
+	/** The normalised object path that was searched for. */
+	FString ObjectPath;
+	/** Class of the object that was found, when Failure is WrongType. */
+	FString FoundClass;
+	/** True when the registry or the filesystem says the asset is really there. */
+	bool bAssetExists = false;
+};
+
+/** Resolve fresh, revalidate, and say why when it fails. Never caches. */
+FWidgetBlueprintResolve ResolveWidgetBlueprint(const FString& AssetPath);
+
+/** Error JSON for a failed resolve, worded per failure kind. */
+TSharedPtr<FJsonValue> WidgetBlueprintResolveError(
+	const FString& AssetPath,
+	const FWidgetBlueprintResolve& Resolved);
+
+/** The `if (!WidgetBP) return Err;` shape every handler wants. */
+UWidgetBlueprint* ResolveWidgetBlueprintOrError(
+	const FString& AssetPath,
+	TSharedPtr<FJsonValue>& OutError);
+
+/** A resolved blueprint whose WidgetTree is missing is a broken asset, not a
+ *  failed load. Separate message so the two stop looking identical. */
+TSharedPtr<FJsonValue> MissingWidgetTreeError(const FString& AssetPath);
+
+}
+
 class FWidgetHandlers
 {
 public:

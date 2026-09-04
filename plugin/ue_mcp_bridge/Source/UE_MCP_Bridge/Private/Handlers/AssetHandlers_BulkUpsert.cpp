@@ -351,7 +351,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRestoreDataAssets(const TSharedPtr<FJ
 				continue;
 			}
 
-			UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+			UObject* Asset = MCPLoadAssetObject(AssetPath);
 			if (!Asset)
 			{
 				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Unable to load '%s' for rollback"), *AssetPath)));
@@ -510,7 +510,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkUpsertDataAssets(const TSharedPtr<FJs
 				*Prepared.DataClass->GetPathName()));
 		}
 
-		Prepared.ExistingAsset = LoadObject<UObject>(nullptr, *Prepared.AssetPath);
+		Prepared.ExistingAsset = MCPLoadAssetObject(Prepared.AssetPath);
 		if (Prepared.ExistingAsset)
 		{
 			if (OnConflict == TEXT("error"))

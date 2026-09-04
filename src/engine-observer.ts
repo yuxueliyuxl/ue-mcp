@@ -73,10 +73,72 @@ export interface EditorProcess {
 
 const HEADLESS_FLAGS = ["-server", "-game", "-nullrhi", "-unattended", "-run=", "-buildmachine"];
 
-function extractProjectPath(commandLine: string): string | null {
-  const match = commandLine.match(/"?([A-Za-z]:[\\/][^"]*?\.uproject|\/[^"\s]*?\.uproject)"?/);
-  if (!match) return null;
-  return path.resolve(match[1]);
+/**
+ * Where a path argument can begin on a command line: the start of the string,
+ * or straight after a separator that cannot itself be part of a path (a space,
+ * a quote, or the `=` of `-Project=`). Matching the root marker rather than the
+ * whole token is what lets an unquoted path containing spaces still be found.
+ */
+const PATH_ROOT_RE = /(?:^|[\s"'=])((?:[A-Za-z]:[\\/])|\/)/g;
+
+/**
+ * The .uproject argument on a process command line, absolute and resolved.
+ *
+ * #967/#970/#965: this used to be one lazy regex over the whole command line,
+ * `[A-Za-z]:[\\/][^"]*?\.uproject`. `[^"]` matches spaces, so on the unquoted
+ * command line Windows reports for a spawned editor
+ *
+ *     C:\...\UnrealEditor.exe C:\work\Demo\Demo.uproject
+ *
+ * the match started at the drive letter of the EXECUTABLE and ran all the way
+ * to the end, and every process came back with a "project path" that was the
+ * exe and the project concatenated. Nothing ever equalled that, so
+ * editorOwnsProject was false for the very editor that had the project open:
+ * stop_editor refused to stop a healthy editor while printing that same
+ * concatenation back as its evidence, and get_engine_state reported no process
+ * for a project whose editor was answering on the bridge.
+ *
+ * So: find where the .uproject argument ENDS (a token boundary, not just any
+ * occurrence of the extension), then walk back to the last place a path could
+ * have begun. That handles the quoted form, the unquoted form, `-Project=` with
+ * and without quotes, and POSIX roots, without assuming a path has no spaces.
+ */
+export function extractProjectPath(commandLine: string): string | null {
+  const lower = commandLine.toLowerCase();
+  const EXT = ".uproject";
+
+  let end = -1;
+  for (let at = lower.indexOf(EXT); at >= 0; at = lower.indexOf(EXT, at + EXT.length)) {
+    const after = commandLine[at + EXT.length];
+    if (after === undefined || /[\s"']/.test(after)) {
+      end = at + EXT.length;
+      break;
+    }
+  }
+  if (end < 0) return null;
+
+  const head = commandLine.slice(0, end);
+  let start = -1;
+  PATH_ROOT_RE.lastIndex = 0;
+  for (let m = PATH_ROOT_RE.exec(head); m !== null; m = PATH_ROOT_RE.exec(head)) {
+    // m[0] may include the delimiter that proved this is a token boundary;
+    // the path itself starts where the captured root does.
+    start = m.index + m[0].length - m[1].length;
+  }
+  if (start < 0) return null;
+
+  const raw = commandLine.slice(start, end).replace(/^["']|["']$/g, "").trim();
+  if (raw.length === 0) return null;
+
+  // A candidate that still swallowed the executable is the exact failure this
+  // function exists to prevent, so never return one. It can only happen when
+  // the project argument itself is relative, and there the last whitespace
+  // delimited token is the honest answer.
+  if (/\.exe(\s|$)/i.test(raw)) {
+    const token = raw.split(/\s+/).pop();
+    return token && token.toLowerCase().endsWith(EXT) ? path.resolve(token) : null;
+  }
+  return path.resolve(raw);
 }
 
 function classify(pid: number, commandLine: string, responding: boolean, windowTitle: string | null): EditorProcess {
@@ -114,48 +176,69 @@ $out = foreach ($p in $procs) {
 // keeps a burst of callers from paying for the same query repeatedly, while
 // staying far below the timescale on which an editor starts or dies.
 const PROCESS_CACHE_MS = 3000;
-let processCache: { at: number; value: EditorProcess[] } | null = null;
+let processCache: { at: number; value: EditorProcess[]; failed: boolean } | null = null;
+
+interface ProcessProbe {
+  processes: EditorProcess[];
+  /**
+   * #965: the probe itself did not run. PowerShell timing out, a policy that
+   * blocks CIM, or `ps` being unavailable all produce an empty list that means
+   * "I could not look", not "there is no editor". The two must never be
+   * reported as the same thing.
+   */
+  failed: boolean;
+}
 
 /**
  * Every UnrealEditor process on this machine, with enough detail to tell an
  * interactive editor for one project apart from a headless shard for another.
  */
 export async function listEditorProcesses(): Promise<EditorProcess[]> {
-  if (processCache && Date.now() - processCache.at < PROCESS_CACHE_MS) {
-    return processCache.value;
-  }
-  const value = await queryEditorProcesses();
-  processCache = { at: Date.now(), value };
-  return value;
+  return (await probeEditorProcesses()).processes;
 }
 
-async function queryEditorProcesses(): Promise<EditorProcess[]> {
+async function probeEditorProcesses(): Promise<ProcessProbe> {
+  if (processCache && Date.now() - processCache.at < PROCESS_CACHE_MS) {
+    return { processes: processCache.value, failed: processCache.failed };
+  }
+  const probe = await queryEditorProcesses();
+  processCache = { at: Date.now(), value: probe.processes, failed: probe.failed };
+  return probe;
+}
+
+async function queryEditorProcesses(): Promise<ProcessProbe> {
   try {
     if (IS_WINDOWS) {
       const raw = await powershell(WINDOWS_PROCESS_SCRIPT, 20000);
       const rows = parseJsonLoose<{ pid: number; cmd: string; responding: boolean; title: string }>(raw);
-      return rows
-        .filter((r) => typeof r?.pid === "number")
-        .map((r) => classify(r.pid, r.cmd ?? "", r.responding !== false, r.title ?? null));
+      return {
+        processes: rows
+          .filter((r) => typeof r?.pid === "number")
+          .map((r) => classify(r.pid, r.cmd ?? "", r.responding !== false, r.title ?? null)),
+        failed: false,
+      };
     }
 
     // POSIX: `ps` gives the full argv, which carries the .uproject and the
     // headless flags. There is no cheap "responding" equivalent, so report
     // true and let the log-staleness signal stand in for a wedge.
     const { stdout } = await execFileAsync("ps", ["-eo", "pid=,args="], { timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
-    return stdout
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => /UnrealEditor/.test(line) && !/\bgrep\b/.test(line))
-      .map((line) => {
-        const space = line.indexOf(" ");
-        const pid = Number(line.slice(0, space));
-        return classify(pid, line.slice(space + 1), true, null);
-      })
-      .filter((p) => Number.isFinite(p.pid));
+    return {
+      processes: stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => /UnrealEditor/.test(line) && !/\bgrep\b/.test(line))
+        .map((line) => {
+          const space = line.indexOf(" ");
+          const pid = Number(line.slice(0, space));
+          return classify(pid, line.slice(space + 1), true, null);
+        })
+        .filter((p) => Number.isFinite(p.pid)),
+      failed: false,
+    };
   } catch (err) {
     log.debug("engine-observer", "process probe failed", err);
-    return [];
+    return { processes: [], failed: true };
   }
 }
 
@@ -302,6 +385,52 @@ function readTailBytes(file: string, bytes: number): { text: string; partial: bo
  * before the plugin module exists, which is where the "editor launched but the
  * bridge never came up" reports have always come from.
  */
+/**
+ * The engine root the project was last actually opened with, from its own log.
+ *
+ * Unreal writes `LogInit: Base Directory: <engine>/Engine/Binaries/<Platform>/`
+ * in the first few lines of every run, which is the only durable record of
+ * which engine tree launched an editor. It survives the editor exiting, so it
+ * answers "which engine is this project on" while the editor is stopped, which
+ * is exactly when a full rebuild has to be resolved (#959, #974).
+ *
+ * Returns null when the log is absent, unreadable, or has no such line.
+ */
+export function readEngineRootFromLog(projectPath: string | null | undefined): string | null {
+  if (!projectPath) return null;
+  const file = projectLogPath(projectPath);
+  let head: string;
+  try {
+    const size = fs.statSync(file).size;
+    const length = Math.min(size, 64 * 1024);
+    if (length <= 0) return null;
+    const buf = Buffer.alloc(length);
+    const fd = fs.openSync(file, "r");
+    try {
+      fs.readSync(fd, buf, 0, length, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
+    head = buf.toString("utf-8");
+  } catch {
+    return null;
+  }
+
+  const match = head.match(/Log\w*:\s*(?:Base|Engine) Directory:\s*(.+)/i);
+  if (!match) return null;
+  const directory = match[1].trim().replace(/[\\/]+$/, "");
+  if (!directory) return null;
+
+  // Base Directory points inside Engine/Binaries/<Platform>; Engine Directory
+  // points at the Engine folder itself. Both sit under the root we want.
+  let current = path.resolve(directory);
+  while (current && current !== path.dirname(current)) {
+    if (path.basename(current).toLowerCase() === "engine") return path.dirname(current);
+    current = path.dirname(current);
+  }
+  return null;
+}
+
 export function readLogState(projectPath: string | null | undefined, tailLines = 25): LogState {
   const empty: LogState = {
     logPath: null,
@@ -483,6 +612,8 @@ export function dialogLikeWindows(windows: NativeWindow[]): NativeWindow[] {
 export interface EngineSnapshot {
   writtenAt?: string;
   ageSeconds?: number;
+  /** Which process this snapshot describes. Absent on plugin builds before #990. */
+  pid?: number;
   phase?: string;
   /**
    * Null until the engine loop starts ticking. Startup has no tick loop to
@@ -503,10 +634,7 @@ export interface EngineSnapshot {
  * keeps updating while the game thread is inside a modal loop or a slow task,
  * which is precisely when a bridge request cannot be answered.
  */
-export function readEngineSnapshot(projectPath: string | null | undefined): EngineSnapshot | null {
-  if (!projectPath) return null;
-  const file = path.join(path.dirname(projectPath), "Saved", "UE_MCP_Bridge", "status.json");
-
+function readSnapshotFile(file: string): EngineSnapshot | null {
   // The writer publishes atomically (temp file + move) four times a second, so
   // a read can land in the instant between unlink and rename. One retry turns
   // that transient miss back into a hit; without it, callers see a null and
@@ -523,6 +651,51 @@ export function readEngineSnapshot(projectPath: string | null | undefined): Engi
   return null;
 }
 
+/**
+ * `status.<pid>.json` names, newest last-written first.
+ *
+ * #990: one project directory can hold the status of several processes, and a
+ * single shared `status.json` describes only whichever of them wrote last. The
+ * per-process files are the ones that describe each editor honestly. A file
+ * whose process has died stops being updated, so newest-wins picks a live
+ * editor over a crashed one without a process-table query.
+ */
+function instanceStatusFiles(dir: string): string[] {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((name) => /^status\.\d+\.json$/i.test(name))
+      .map((name) => {
+        const file = path.join(dir, name);
+        let mtimeMs = 0;
+        try {
+          mtimeMs = fs.statSync(file).mtimeMs;
+        } catch {
+          // Removed between readdir and stat; sorts last and reads as null.
+        }
+        return { file, mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .map((entry) => entry.file);
+  } catch {
+    return [];
+  }
+}
+
+export function readEngineSnapshot(projectPath: string | null | undefined): EngineSnapshot | null {
+  if (!projectPath) return null;
+  const dir = path.join(path.dirname(projectPath), "Saved", "UE_MCP_Bridge");
+
+  // Per-process first, shared second. The shared path is still written by
+  // current plugin builds and is the only thing an older one writes, so it
+  // stays the fallback rather than being dropped.
+  for (const file of instanceStatusFiles(dir)) {
+    const snapshot = readSnapshotFile(file);
+    if (snapshot) return snapshot;
+  }
+  return readSnapshotFile(path.join(dir, "status.json"));
+}
+
 // ---------------------------------------------------------------------------
 // Merged view
 // ---------------------------------------------------------------------------
@@ -533,6 +706,17 @@ export interface EngineState {
   log: LogState;
   snapshot: EngineSnapshot | null;
   dialogs: NativeWindow[];
+  /**
+   * #965: the out-of-process probe could not run. Reported on its own rather
+   * than folded into an empty `processes`, because "I could not look" and
+   * "there is no editor" are different answers and only one of them is a
+   * reason to conclude the editor is down.
+   */
+  processProbeFailed: boolean;
+  /** What `running` is asserted on. A bridge reply outranks the process table. */
+  runningEvidence: "bridge-snapshot" | "process-table" | "none";
+  /** Where `snapshot` came from. */
+  snapshotSource: "bridge" | "status.json" | "none";
   /** One line an agent can act on without reading any of the above. */
   summary: string;
   /** True when something is waiting on a human answer. */
@@ -541,8 +725,33 @@ export interface EngineState {
 
 function summarise(state: Omit<EngineState, "summary" | "blocked">): { summary: string; blocked: boolean } {
   const ours = state.processes;
+  if (ours.length === 0 && !state.running) {
+    return {
+      summary: state.processProbeFailed
+        ? `The process probe failed, so whether an editor is running for this project is unknown. Log phase: ${state.log.phase}.`
+        : `No editor process for this project. Log phase: ${state.log.phase}.`,
+      blocked: false,
+    };
+  }
+
+  // #965: an editor answered this request over the bridge while the process
+  // table came back empty, and the report said "No editor process for this
+  // project" in the same breath as it returned that editor's own snapshot.
+  // Whatever the process table managed to see, an editor that replied exists.
   if (ours.length === 0) {
-    return { summary: `No editor process for this project. Log phase: ${state.log.phase}.`, blocked: false };
+    const modal = state.snapshot?.modal;
+    if (modal) {
+      return {
+        summary: `Editor answered over the bridge and is blocked on modal "${modal.title}": ${modal.message} [${(modal.buttons ?? []).join(", ")}]`,
+        blocked: true,
+      };
+    }
+    return {
+      summary:
+        `Editor answered over the bridge (phase: ${state.snapshot?.phase ?? state.log.phase}), but the process probe ` +
+        `${state.processProbeFailed ? "failed" : "did not find it"}, so no pid or command line is available.`,
+      blocked: false,
+    };
   }
 
   if (state.dialogs.length > 0) {
@@ -594,7 +803,11 @@ export async function readEngineState(
   projectPath: string | null | undefined,
   opts: { probeWindows?: boolean } = {},
 ): Promise<EngineState> {
-  const processes = await findInteractiveEditors(projectPath);
+  const probe = await probeEditorProcesses();
+  // Every interactive editor holding this .uproject open, not just one: two
+  // editors on one project is a legitimate state and hiding the second is how
+  // a stop lands on the wrong one (#965).
+  const processes = selectEditorsForProject(probe.processes, projectPath);
   const logState = readLogState(projectPath);
   const snapshot = readEngineSnapshot(projectPath);
 
@@ -603,6 +816,39 @@ export async function readEngineState(
     dialogs = dialogLikeWindows(await readNativeWindows(processes.map((p) => p.pid)));
   }
 
-  const base = { running: processes.length > 0, processes, log: logState, snapshot, dialogs };
+  const base: Omit<EngineState, "summary" | "blocked"> = {
+    running: processes.length > 0,
+    processes,
+    log: logState,
+    snapshot,
+    dialogs,
+    processProbeFailed: probe.failed,
+    runningEvidence: processes.length > 0 ? "process-table" : "none",
+    snapshotSource: snapshot ? "status.json" : "none",
+  };
+  return { ...base, ...summarise(base) };
+}
+
+/**
+ * Fold in a snapshot the editor served over its own bridge.
+ *
+ * #965: one report contained `"running": false, "processes": []` and, in the
+ * same object, a live snapshot with an uptime and a ticking game thread, served
+ * BY the editor over the bridge. An editor that answers a request is running;
+ * a process table that came back empty is a failed measurement, not a fact
+ * about the world. So a bridge reply sets `running` and the process probe's
+ * silence is reported as its own field.
+ */
+export function withBridgeSnapshot(state: EngineState, snapshot: EngineSnapshot): EngineState {
+  const base: Omit<EngineState, "summary" | "blocked"> = {
+    ...state,
+    // It was served in answer to this call, so its age is zero. Leaving it
+    // unset made the summary's freshness gate treat it as 999 seconds old and
+    // skip the modal and slow-task lines it was fetched to provide.
+    snapshot: { ...snapshot, ageSeconds: 0 },
+    snapshotSource: "bridge",
+    running: true,
+    runningEvidence: "bridge-snapshot",
+  };
   return { ...base, ...summarise(base) };
 }

@@ -87,16 +87,17 @@ namespace
 			ActorPackage = Instance.GetActorPackage();
 			ActorPath = *Instance.GetActorSoftPath().ToString();
 
-			// GetDataLayers() returns instance names unless the actor is on data
-			// layer assets, and only the asset form is a usable object path.
-			if (Instance.IsUsingDataLayerAsset())
+			// #937: IsUsingDataLayerAsset() and GetDataLayers() are deprecated in
+			// UE 5.8 (C4996, and the message warns the project stops compiling in
+			// the release after). Actors no longer carry data layers without
+			// assets, so the old guard is now always true and the branch it
+			// protected is unconditional. GetDataLayerInstanceNames() is the
+			// supported read and its names are the asset paths this wants.
+			const TArray<FName>& DataLayers = Instance.GetDataLayerInstanceNames().ToArray();
+			DataLayerAssets.Reserve(DataLayers.Num());
+			for (const FName& DataLayerAssetPath : DataLayers)
 			{
-				const TArray<FName> DataLayers = Instance.GetDataLayers();
-				DataLayerAssets.Reserve(DataLayers.Num());
-				for (const FName& DataLayerAssetPath : DataLayers)
-				{
-					DataLayerAssets.Add(FSoftObjectPath(DataLayerAssetPath.ToString()));
-				}
+				DataLayerAssets.Add(FSoftObjectPath(DataLayerAssetPath.ToString()));
 			}
 		}
 	};

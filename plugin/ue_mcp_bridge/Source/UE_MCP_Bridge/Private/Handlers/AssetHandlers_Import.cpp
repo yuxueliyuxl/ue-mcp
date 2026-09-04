@@ -8,6 +8,7 @@
 #include "HandlerUtils.h"
 #include "HandlerAssetCreate.h"
 #include "HandlerJsonProperty.h"
+#include "JsonSerializer.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #include "AssetImportTask.h"
@@ -143,11 +144,13 @@ namespace
 	TSharedPtr<FJsonValue> LoadCurveTable(const TSharedPtr<FJsonObject>& Params, UCurveTable*& OutTable, FString& OutAssetPath)
 	{
 		if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), OutAssetPath)) return Err;
-		UObject* Asset = UEditorAssetLibrary::LoadAsset(OutAssetPath);
+		TSharedPtr<FJsonValue> LoadError;
+		UObject* Asset = MCPRequireAssetObject(OutAssetPath, LoadError);
+		if (!Asset) return LoadError;
 		OutTable = Cast<UCurveTable>(Asset);
 		if (!OutTable)
 		{
-			return MCPError(FString::Printf(TEXT("Asset is not a CurveTable: %s"), *OutAssetPath));
+			return MCPAssetWrongTypeError(OutAssetPath, Asset, TEXT("CurveTable"));
 		}
 		return nullptr;
 	}
@@ -333,7 +336,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportSkeletalMesh(const TSharedPtr<FJson
 	FString SkeletonPath;
 	if (Params->TryGetStringField(TEXT("skeletonPath"), SkeletonPath) && !SkeletonPath.IsEmpty())
 	{
-		USkeleton* Skeleton = LoadObject<USkeleton>(nullptr, *SkeletonPath);
+		USkeleton* Skeleton = LoadAssetByPath<USkeleton>(SkeletonPath);
 		if (Skeleton)
 		{
 			ImportUI->Skeleton = Skeleton;
@@ -470,10 +473,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportAnimation(const TSharedPtr<FJsonObj
 		return MCPError(FString::Printf(TEXT("File not found: %s"), *FileName));
 	}
 
-	USkeleton* Skeleton = LoadObject<USkeleton>(nullptr, *SkeletonPath);
+	USkeleton* Skeleton = LoadAssetByPath<USkeleton>(SkeletonPath);
 	if (!Skeleton)
 	{
-		return MCPError(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+		return MCPAssetLoadError(SkeletonPath, TEXT("Skeleton"));
 	}
 
 	UFbxFactory* FbxFactory = NewObject<UFbxFactory>();
@@ -577,16 +580,14 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListTextureProperties(const TSharedPtr<FJ
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> LoadError;
+	UObject* Asset = MCPRequireAssetObject(AssetPath, LoadError);
+	if (!Asset) return LoadError;
 
 	UTexture2D* Texture = Cast<UTexture2D>(Asset);
 	if (!Texture)
 	{
-		return MCPError(FString::Printf(TEXT("Asset is not a Texture2D: %s"), *AssetPath));
+		return MCPAssetWrongTypeError(AssetPath, Asset, TEXT("Texture2D"));
 	}
 
 	auto Result = MCPSuccess();
@@ -662,16 +663,14 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetTextureProperties(const TSharedPtr<FJs
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> LoadError;
+	UObject* Asset = MCPRequireAssetObject(AssetPath, LoadError);
+	if (!Asset) return LoadError;
 
 	UTexture2D* Texture = Cast<UTexture2D>(Asset);
 	if (!Texture)
 	{
-		return MCPError(FString::Printf(TEXT("Asset is not a Texture2D: %s"), *AssetPath));
+		return MCPAssetWrongTypeError(AssetPath, Asset, TEXT("Texture2D"));
 	}
 
 	// Capture previous values for self-inverse rollback. Use reflection paths
@@ -1062,7 +1061,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateCurveTable(const TSharedPtr<FJsonOb
 			{
 				FString ExistingAssetPath;
 				ExistingObj->TryGetStringField(TEXT("path"), ExistingAssetPath);
-				if (UCurveTable* Existing = LoadObject<UCurveTable>(nullptr, *ExistingAssetPath))
+				if (UCurveTable* Existing = LoadAssetByPath<UCurveTable>(ExistingAssetPath))
 				{
 					ExistingObj->SetStringField(TEXT("assetPath"), Existing->GetPathName());
 					ExistingObj->SetStringField(TEXT("curveType"), CurveTableModeName(Existing->GetCurveTableMode()));
@@ -1552,7 +1551,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObj
 
 	// Find the row struct type
 	UScriptStruct* ScriptStruct = nullptr;
-	ScriptStruct = LoadObject<UScriptStruct>(nullptr, *RowStruct);
+	ScriptStruct = LoadAssetByPath<UScriptStruct>(RowStruct);
 	if (!ScriptStruct)
 	{
 		for (TObjectIterator<UScriptStruct> It; It; ++It)
@@ -1583,7 +1582,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObj
 			{
 				FString ExistingAssetPath;
 				ExistingObj->TryGetStringField(TEXT("path"), ExistingAssetPath);
-				if (UDataTable* Existing = LoadObject<UDataTable>(nullptr, *ExistingAssetPath))
+				if (UDataTable* Existing = LoadAssetByPath<UDataTable>(ExistingAssetPath))
 				{
 					ExistingObj->SetStringField(TEXT("assetPath"), Existing->GetPathName());
 					ExistingObj->SetStringField(TEXT("rowStruct"), Existing->RowStruct ? Existing->RowStruct->GetName() : TEXT(""));
@@ -1612,22 +1611,40 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObj
 }
 
 
+namespace
+{
+	// #930: resolve the DataTable parameter the way asset(read) resolves any
+	// asset, so the type-specific actions succeed on every path form the
+	// generic reader already opens. Returns a ready-to-return error, or an
+	// unset pointer on success with OutAssetPath and OutTable filled in.
+	//
+	// The "not a DataTable" message names the class that was found, because
+	// the old wording was also what a caller saw when the path resolved to
+	// nothing at all.
+	TSharedPtr<FJsonValue> LoadDataTableParam(
+		const TSharedPtr<FJsonObject>& Params,
+		FString& OutAssetPath,
+		UDataTable*& OutTable)
+	{
+		if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), OutAssetPath)) return Err;
+
+		TSharedPtr<FJsonValue> LoadError;
+		UObject* Asset = MCPRequireAssetObject(OutAssetPath, LoadError);
+		if (!Asset) return LoadError;
+		OutTable = Cast<UDataTable>(Asset);
+		if (!OutTable)
+		{
+			return MCPAssetWrongTypeError(OutAssetPath, Asset, TEXT("DataTable"));
+		}
+		return nullptr;
+	}
+}
+
 TSharedPtr<FJsonValue> FAssetHandlers::ReadDataTable(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
-
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
-	}
-
-	UDataTable* DataTable = Cast<UDataTable>(Asset);
-	if (!DataTable)
-	{
-		return MCPError(FString::Printf(TEXT("Asset is not a DataTable: %s"), *AssetPath));
-	}
+	UDataTable* DataTable = nullptr;
+	if (auto Err = LoadDataTableParam(Params, AssetPath, DataTable)) return Err;
 
 	FString RowFilter = OptionalString(Params, TEXT("rowFilter"));
 
@@ -1697,19 +1714,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReadDataTable(const TSharedPtr<FJsonObjec
 TSharedPtr<FJsonValue> FAssetHandlers::ReimportDataTable(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
-
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
-	}
-
-	UDataTable* DataTable = Cast<UDataTable>(Asset);
-	if (!DataTable)
-	{
-		return MCPError(FString::Printf(TEXT("Asset is not a DataTable: %s"), *AssetPath));
-	}
+	UDataTable* DataTable = nullptr;
+	if (auto Err = LoadDataTableParam(Params, AssetPath, DataTable)) return Err;
 
 	// Get JSON string from either inline jsonString or from a file path
 	FString JsonString;
@@ -1767,7 +1773,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReimportDataTable(const TSharedPtr<FJsonO
 TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableRow(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
+	UDataTable* DataTable = nullptr;
+	if (auto Err = LoadDataTableParam(Params, AssetPath, DataTable)) return Err;
 	FString RowName;
 	if (auto Err = RequireString(Params, TEXT("rowName"), RowName)) return Err;
 
@@ -1785,12 +1792,6 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableRow(const TSharedPtr<FJsonObj
 		return MCPError(TEXT("Missing 'row' (or 'fields'/'data') JSON object with the row struct fields"));
 	}
 
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UDataTable* DataTable = Cast<UDataTable>(Asset);
-	if (!DataTable)
-	{
-		return MCPError(FString::Printf(TEXT("Asset is not a DataTable: %s"), *AssetPath));
-	}
 	const UScriptStruct* RowStruct = DataTable->GetRowStruct();
 	if (!RowStruct)
 	{
@@ -1798,35 +1799,19 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableRow(const TSharedPtr<FJsonObj
 	}
 
 	const FName RowKey(*RowName);
-	const TMap<FName, uint8*>& RowMap = DataTable->GetRowMap();
-	const bool bExisted = RowMap.Contains(RowKey);
+	uint8* const* ExistingRow = DataTable->GetRowMap().Find(RowKey);
+	const bool bExisted = ExistingRow != nullptr && *ExistingRow != nullptr;
 
-	// Snapshot the prior row (if any) for rollback / idempotency.
-	FString PrevExport;
-	if (bExisted)
-	{
-		uint8* PrevPtr = *RowMap.Find(RowKey);
-		RowStruct->ExportText(PrevExport, PrevPtr, PrevPtr, nullptr, PPF_None, nullptr);
-	}
-
-	// Allocate a row buffer and apply fields via MCPJsonProperty so dicts/
-	// arrays/asset paths/gameplay tags all work.
-	const int32 StructSize = RowStruct->GetStructureSize();
-	const int32 MinAlign = RowStruct->GetMinAlignment();
-	uint8* NewRow = (uint8*)FMemory::Malloc(StructSize, MinAlign);
-	RowStruct->InitializeStruct(NewRow);
-
-	// Seed from the prior row so partial JSON only updates the named fields.
-	if (bExisted)
-	{
-		uint8* PrevPtr = *RowMap.Find(RowKey);
-		RowStruct->CopyScriptStruct(NewRow, PrevPtr);
-	}
-
-	FString SetErr;
-	bool bOk = true;
+	// Resolve every named field before a single byte is written. An unknown
+	// field name used to be discovered half way through the loop, after
+	// earlier fields had already been applied.
+	TArray<TPair<FProperty*, TSharedPtr<FJsonValue>>> Writes;
+	Writes.Reserve((*RowObj)->Values.Num());
 	for (const auto& Pair : (*RowObj)->Values)
 	{
+		// FJsonObject::Values is not keyed by FString on UE 5.8, so the key has
+		// to be materialised before it can be compared with a property name.
+		// FString(*Pair.Key) is the idiom the rest of this module already uses.
 		const FString FieldName(*Pair.Key);
 		FProperty* FieldProp = nullptr;
 		for (TFieldIterator<FProperty> It(RowStruct); It; ++It)
@@ -1839,31 +1824,151 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableRow(const TSharedPtr<FJsonObj
 		}
 		if (!FieldProp)
 		{
-			SetErr = FString::Printf(TEXT("row struct '%s' has no field '%s'"), *RowStruct->GetName(), *FieldName);
-			bOk = false;
-			break;
+			return MCPError(FString::Printf(
+				TEXT("row struct '%s' has no field '%s'"), *RowStruct->GetName(), *Pair.Key));
 		}
-		void* FieldAddr = FieldProp->ContainerPtrToValuePtr<void>(NewRow);
-		FString E;
-		if (!MCPJsonProperty::SetJsonOnProperty(FieldProp, FieldAddr, Pair.Value, E))
+		Writes.Emplace(FieldProp, Pair.Value);
+	}
+
+	const int32 StructSize = RowStruct->GetStructureSize();
+	const int32 MinAlign = RowStruct->GetMinAlignment();
+
+	// Snapshot the prior row: it is both the rollback record handed back to
+	// the caller and the copy this handler restores if a field write fails
+	// part way through.
+	//
+	// The rollback record carries the prior values of exactly the fields
+	// about to change, as a row payload for set_datatable_row, which is a
+	// method that exists and now merges in place. It used to name
+	// set_datatable_row_raw, which is registered nowhere, so a flow running
+	// with rollback_on_failure could not restore a row at all; and it carried
+	// whole-struct export text produced with the value as its own defaults,
+	// which exports every field as unchanged and yields "()".
+	TSharedPtr<FJsonObject> PrevFields = MakeShared<FJsonObject>();
+	uint8* Backup = nullptr;
+	if (bExisted)
+	{
+		Backup = (uint8*)FMemory::Malloc(StructSize, MinAlign);
+		RowStruct->InitializeStruct(Backup);
+		RowStruct->CopyScriptStruct(Backup, *ExistingRow);
+		for (const TPair<FProperty*, TSharedPtr<FJsonValue>>& Write : Writes)
 		{
-			SetErr = FString::Printf(TEXT("%s: %s"), *FieldName, *E);
+			const void* FieldAddr = Write.Key->ContainerPtrToValuePtr<void>(Backup);
+			PrevFields->SetField(
+				Write.Key->GetAuthoredName(),
+				FMCPJsonSerializer::SerializeValue(FieldAddr, Write.Key));
+		}
+	}
+
+	// #929: an existing row is edited in the memory the table already owns.
+	// Only the named fields are touched, so every other field keeps the exact
+	// bytes it had, whether or not its UPROPERTY declares a default.
+	//
+	// The previous shape reallocated the row (RemoveRow followed by AddRow)
+	// and relied on a CopyScriptStruct seed to carry the untouched fields
+	// across. That seed is one line away from being lost, it moved the row to
+	// the end of the row map on every edit, and UDataTable::RemoveRow closes
+	// an FScopedDataTableChange whose destructor calls
+	// HandleDataTableChanged(NAME_None), which runs
+	// FTableRowBase::OnDataTableChanged against *every* row in the table
+	// rather than the one being edited. A single-cell write should not reach
+	// the other rows at all.
+	uint8* RowData = bExisted ? *ExistingRow : (uint8*)FMemory::Malloc(StructSize, MinAlign);
+	if (!bExisted)
+	{
+		RowStruct->InitializeStruct(RowData);
+	}
+
+	FString SetErr;
+	bool bOk = true;
+	for (const TPair<FProperty*, TSharedPtr<FJsonValue>>& Write : Writes)
+	{
+		void* FieldAddr = Write.Key->ContainerPtrToValuePtr<void>(RowData);
+		FString E;
+		if (!MCPJsonProperty::SetJsonOnProperty(Write.Key, FieldAddr, Write.Value, E))
+		{
+			SetErr = FString::Printf(TEXT("%s: %s"), *Write.Key->GetAuthoredName(), *E);
 			bOk = false;
 			break;
 		}
 	}
 	if (!bOk)
 	{
-		RowStruct->DestroyStruct(NewRow);
-		FMemory::Free(NewRow);
+		if (bExisted)
+		{
+			// Put the row back exactly as it was found.
+			RowStruct->CopyScriptStruct(RowData, Backup);
+			RowStruct->DestroyStruct(Backup);
+			FMemory::Free(Backup);
+		}
+		else
+		{
+			RowStruct->DestroyStruct(RowData);
+			FMemory::Free(RowData);
+		}
 		return MCPError(SetErr);
 	}
 
-	// AddRow takes the struct buffer ownership (copies, manages lifetime).
-	DataTable->RemoveRow(RowKey);
-	DataTable->AddRow(RowKey, *reinterpret_cast<FTableRowBase*>(NewRow));
-	RowStruct->DestroyStruct(NewRow);
-	FMemory::Free(NewRow);
+	if (!bExisted)
+	{
+		// AddRow copies the buffer and owns the copy from here on.
+		DataTable->AddRow(RowKey, *reinterpret_cast<FTableRowBase*>(RowData));
+		RowStruct->DestroyStruct(RowData);
+		FMemory::Free(RowData);
+		RowData = nullptr;
+	}
+
+	// #935: read the row back out of the table and check that every field the
+	// caller named holds what was asked for, before anything is saved. This
+	// reads the table's own memory, not the buffer that was written, so a
+	// value lost in the copy into the table is caught here too.
+	uint8* const* StoredRow = DataTable->GetRowMap().Find(RowKey);
+	if (!StoredRow || !*StoredRow)
+	{
+		if (bExisted)
+		{
+			RowStruct->DestroyStruct(Backup);
+			FMemory::Free(Backup);
+		}
+		return MCPError(FString::Printf(
+			TEXT("Row '%s' is missing from '%s' after the write. Nothing was saved."),
+			*RowName, *AssetPath));
+	}
+	for (const TPair<FProperty*, TSharedPtr<FJsonValue>>& Write : Writes)
+	{
+		const void* FieldAddr = Write.Key->ContainerPtrToValuePtr<void>(*StoredRow);
+		FString Detail;
+		if (MCPJsonProperty::VerifyJsonOnProperty(Write.Key, FieldAddr, Write.Value, Detail))
+		{
+			continue;
+		}
+
+		// Undo the whole call. A verified-bad write is not a partial success.
+		if (bExisted)
+		{
+			RowStruct->CopyScriptStruct(*StoredRow, Backup);
+			RowStruct->DestroyStruct(Backup);
+			FMemory::Free(Backup);
+			DataTable->HandleDataTableChanged(RowKey);
+		}
+		else
+		{
+			DataTable->RemoveRow(RowKey);
+		}
+		return MCPError(FString::Printf(
+			TEXT("Field '%s' on row '%s' did not store the requested value: %s. The row was left unchanged."),
+			*Write.Key->GetAuthoredName(), *RowName, *Detail));
+	}
+
+	if (bExisted)
+	{
+		RowStruct->DestroyStruct(Backup);
+		FMemory::Free(Backup);
+		Backup = nullptr;
+		// The table's own row memory was edited, so name the row that changed
+		// and only its hook runs.
+		DataTable->HandleDataTableChanged(RowKey);
+	}
 
 	DataTable->MarkPackageDirty();
 	UEditorAssetLibrary::SaveLoadedAsset(DataTable, /*bOnlyIfIsDirty*/ true);
@@ -1880,8 +1985,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableRow(const TSharedPtr<FJsonObj
 		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 		Payload->SetStringField(TEXT("assetPath"), AssetPath);
 		Payload->SetStringField(TEXT("rowName"), RowName);
-		Payload->SetStringField(TEXT("rowExport"), PrevExport);
-		MCPSetRollback(Result, TEXT("set_datatable_row_raw"), Payload);
+		Payload->SetObjectField(TEXT("row"), PrevFields);
+		MCPSetRollback(Result, TEXT("set_datatable_row"), Payload);
 	}
 	else
 	{
@@ -1899,16 +2004,11 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableRow(const TSharedPtr<FJsonObj
 TSharedPtr<FJsonValue> FAssetHandlers::RemoveDataTableRow(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
+	UDataTable* DataTable = nullptr;
+	if (auto Err = LoadDataTableParam(Params, AssetPath, DataTable)) return Err;
 	FString RowName;
 	if (auto Err = RequireString(Params, TEXT("rowName"), RowName)) return Err;
 
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UDataTable* DataTable = Cast<UDataTable>(Asset);
-	if (!DataTable)
-	{
-		return MCPError(FString::Printf(TEXT("Asset is not a DataTable: %s"), *AssetPath));
-	}
 	const FName RowKey(*RowName);
 	if (!DataTable->GetRowMap().Contains(RowKey))
 	{
@@ -1936,12 +2036,11 @@ TSharedPtr<FJsonValue> FAssetHandlers::RemoveDataTableRow(const TSharedPtr<FJson
 TSharedPtr<FJsonValue> FAssetHandlers::GetDataTableRow(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
+	UDataTable* DataTable = nullptr;
+	if (auto Err = LoadDataTableParam(Params, AssetPath, DataTable)) return Err;
 	FString RowName;
 	if (auto Err = RequireString(Params, TEXT("rowName"), RowName)) return Err;
 
-	UDataTable* DataTable = Cast<UDataTable>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!DataTable) return MCPError(FString::Printf(TEXT("Asset is not a DataTable: %s"), *AssetPath));
 	const UScriptStruct* RowStruct = DataTable->GetRowStruct();
 	if (!RowStruct) return MCPError(TEXT("DataTable has no row struct"));
 
@@ -1968,8 +2067,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::GetDataTableRow(const TSharedPtr<FJsonObj
 }
 
 // #535: write a single field on a single row. Thin wrapper over the row-merge
-// upsert (SetDataTableRow), which seeds from the existing row so only the named
-// cell changes. Params: assetPath, rowName, fieldName, value.
+// upsert (SetDataTableRow), which edits the existing row in place so only the
+// named cell changes. Params: assetPath, rowName, fieldName, value.
 TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableCell(const TSharedPtr<FJsonObject>& Params)
 {
 	FString FieldName;
@@ -1983,11 +2082,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableCell(const TSharedPtr<FJsonOb
 	// Build a one-field row object and delegate to the row upsert, which
 	// requires the row to exist for a cell edit (no accidental row creation).
 	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
+	UDataTable* DataTable = nullptr;
+	if (auto Err = LoadDataTableParam(Params, AssetPath, DataTable)) return Err;
 	FString RowName;
 	if (auto Err = RequireString(Params, TEXT("rowName"), RowName)) return Err;
-	UDataTable* DataTable = Cast<UDataTable>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!DataTable) return MCPError(FString::Printf(TEXT("Asset is not a DataTable: %s"), *AssetPath));
 	if (!DataTable->GetRowMap().Contains(FName(*RowName)))
 	{
 		return MCPError(FString::Printf(TEXT("Row not found: %s (use set_datatable_row to create it)"), *RowName));
@@ -2007,14 +2105,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableCell(const TSharedPtr<FJsonOb
 TSharedPtr<FJsonValue> FAssetHandlers::RenameDataTableRow(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
+	UDataTable* DataTable = nullptr;
+	if (auto Err = LoadDataTableParam(Params, AssetPath, DataTable)) return Err;
 	FString OldName;
 	if (auto Err = RequireStringAlt(Params, TEXT("oldName"), TEXT("rowName"), OldName)) return Err;
 	FString NewName;
 	if (auto Err = RequireString(Params, TEXT("newName"), NewName)) return Err;
 
-	UDataTable* DataTable = Cast<UDataTable>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!DataTable) return MCPError(FString::Printf(TEXT("Asset is not a DataTable: %s"), *AssetPath));
 	const UScriptStruct* RowStruct = DataTable->GetRowStruct();
 	if (!RowStruct) return MCPError(TEXT("DataTable has no row struct"));
 
@@ -2063,7 +2160,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::RenameDataTableRow(const TSharedPtr<FJson
 TSharedPtr<FJsonValue> FAssetHandlers::FillDataTableFromJson(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
+	UDataTable* DataTable = nullptr;
+	if (auto Err = LoadDataTableParam(Params, AssetPath, DataTable)) return Err;
 
 	const TSharedPtr<FJsonObject>* RowsObj = nullptr;
 	TSharedPtr<FJsonObject> ParsedRows;
@@ -2085,8 +2183,6 @@ TSharedPtr<FJsonValue> FAssetHandlers::FillDataTableFromJson(const TSharedPtr<FJ
 		return MCPError(TEXT("Missing 'rows' object (or 'jsonString') mapping rowName -> {field: value}"));
 	}
 
-	UDataTable* DataTable = Cast<UDataTable>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!DataTable) return MCPError(FString::Printf(TEXT("Asset is not a DataTable: %s"), *AssetPath));
 	const UScriptStruct* RowStruct = DataTable->GetRowStruct();
 	if (!RowStruct) return MCPError(TEXT("DataTable has no row struct"));
 
@@ -2132,16 +2228,14 @@ namespace
 	{
 		if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), OutAssetPath)) return Err;
 
-		UObject* Asset = UEditorAssetLibrary::LoadAsset(OutAssetPath);
-		if (!Asset)
-		{
-			return MCPError(FString::Printf(TEXT("Asset not found: %s"), *OutAssetPath));
-		}
+		TSharedPtr<FJsonValue> LoadError;
+		UObject* Asset = MCPRequireAssetObject(OutAssetPath, LoadError);
+		if (!Asset) return LoadError;
 
 		OutStringTable = Cast<UStringTable>(Asset);
 		if (!OutStringTable)
 		{
-			return MCPError(FString::Printf(TEXT("Asset is not a StringTable: %s"), *OutAssetPath));
+			return MCPAssetWrongTypeError(OutAssetPath, Asset, TEXT("StringTable"));
 		}
 		return nullptr;
 	}
@@ -2222,7 +2316,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateStringTable(const TSharedPtr<FJsonO
 			{
 				FString ExistingAssetPath;
 				ExistingObj->TryGetStringField(TEXT("path"), ExistingAssetPath);
-				if (UStringTable* Existing = LoadObject<UStringTable>(nullptr, *ExistingAssetPath))
+				if (UStringTable* Existing = LoadAssetByPath<UStringTable>(ExistingAssetPath))
 				{
 					SetStringTableInfoFields(ExistingObj, Existing);
 				}
@@ -2481,6 +2575,256 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportStringTable(const TSharedPtr<FJsonO
 	return MCPResult(Result);
 }
 
+// ---------------------------------------------------------------------------
+// import_stringtable_csv (#978)
+//
+// String Tables could be created and inspected but not refreshed from a CSV
+// source with any confidence, so a user kept the CSV as the canonical copy and
+// ran a custom editor script instead. This is the same engine importer
+// FStringTable exposes, wrapped so the caller gets the three things the script
+// was written to provide: the CSV is proved to parse and to carry the expected
+// keys BEFORE the asset is touched, the result names exactly which keys were
+// added, updated and removed, and the save is reported rather than assumed.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	/** Every key and source string in a table, as a plain map. */
+	void MCPSnapshotStringTable(const UStringTable* Table, TMap<FString, FString>& Out)
+	{
+		Out.Reset();
+		if (!Table) return;
+		Table->GetStringTable()->EnumerateKeysAndSourceStrings(
+			[&Out](const FTextKey& Key, const FString& SourceString) -> bool
+			{
+				Out.Add(Key.ToString(), SourceString);
+				return true;
+			});
+	}
+
+	/** Run the engine's CSV importer over Table, on whichever engine this is. */
+	bool MCPImportStringTableCsvFile(UStringTable* Table, const FString& FilePath)
+	{
+		if (!Table) return false;
+#if UE_MCP_HAS_5_8_API
+		return Table->GetMutableStringTable()->ImportStringsFromCSVFile(FilePath);
+#else
+		return Table->GetMutableStringTable()->ImportStrings(FilePath);
+#endif
+	}
+
+	TArray<TSharedPtr<FJsonValue>> MCPSortedKeysToJson(const TArray<FString>& Keys)
+	{
+		TArray<FString> Sorted = Keys;
+		Sorted.Sort();
+		TArray<TSharedPtr<FJsonValue>> Out;
+		Out.Reserve(Sorted.Num());
+		for (const FString& Key : Sorted) Out.Add(MakeShared<FJsonValueString>(Key));
+		return Out;
+	}
+}
+
+TSharedPtr<FJsonValue> FAssetHandlers::ImportStringTableCsv(const TSharedPtr<FJsonObject>& Params)
+{
+	MCP_CHECK_GAME_THREAD();
+
+	FString AssetPath;
+	UStringTable* StringTable = nullptr;
+	if (auto Err = LoadStringTableAsset(Params, AssetPath, StringTable)) return Err;
+
+	if (MCPIsProtectedAssetPath(AssetPath))
+	{
+		return MCPError(FString::Printf(
+			TEXT("'%s' is on a protected mount (/Engine/, /Script/, /Memory/, /Temp/), which the bridge never writes to."),
+			*AssetPath));
+	}
+
+	FString CsvPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("csvPath"), TEXT("filePath"), CsvPath)) return Err;
+	// A relative path is read against the project directory, not the editor's
+	// working directory, which is not something a caller can predict.
+	if (FPaths::IsRelative(CsvPath))
+	{
+		CsvPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir(), CsvPath);
+	}
+	if (!FPaths::FileExists(CsvPath))
+	{
+		return MCPError(FString::Printf(TEXT("CSV file not found: %s"), *CsvPath));
+	}
+
+	const bool bReplaceExisting = OptionalBool(Params, TEXT("replaceExisting"), false);
+	const bool bRequireExactKeys = OptionalBool(Params, TEXT("requireExactKeys"), false);
+	const bool bSave = OptionalBool(Params, TEXT("save"), true);
+
+	TArray<FString> ExpectedKeys;
+	const TArray<TSharedPtr<FJsonValue>>* ExpectedField = nullptr;
+	if (Params->TryGetArrayField(TEXT("expectedKeys"), ExpectedField) && ExpectedField)
+	{
+		ExpectedKeys = JsonArrayToStringList(ExpectedField);
+	}
+
+	// Parse and validate against a throwaway table first, so a malformed CSV or
+	// a key set that does not match expectations never reaches the asset.
+	UStringTable* Staged = NewObject<UStringTable>(GetTransientPackage(), NAME_None, RF_Transient);
+	if (!Staged)
+	{
+		return MCPError(TEXT("Could not create the staging StringTable used to validate the CSV."));
+	}
+	const FGCRootScope KeepStagedAlive(Staged);
+	if (!MCPImportStringTableCsvFile(Staged, CsvPath))
+	{
+		return MCPError(FString::Printf(
+			TEXT("The engine's String Table importer rejected '%s'. Nothing was changed. ")
+			TEXT("The file must be a CSV whose first column is the entry key; the editor log carries the parse error."),
+			*CsvPath));
+	}
+
+	TMap<FString, FString> Incoming;
+	MCPSnapshotStringTable(Staged, Incoming);
+	if (Incoming.Num() == 0)
+	{
+		return MCPError(FString::Printf(
+			TEXT("'%s' parsed but carried no entries, so nothing was changed."), *CsvPath));
+	}
+
+	if (ExpectedKeys.Num() > 0)
+	{
+		TArray<FString> MissingKeys;
+		for (const FString& Expected : ExpectedKeys)
+		{
+			if (!Incoming.Contains(Expected)) MissingKeys.Add(Expected);
+		}
+		TArray<FString> UnexpectedKeys;
+		if (bRequireExactKeys)
+		{
+			for (const TPair<FString, FString>& Entry : Incoming)
+			{
+				if (!ExpectedKeys.Contains(Entry.Key)) UnexpectedKeys.Add(Entry.Key);
+			}
+		}
+		if (MissingKeys.Num() > 0 || UnexpectedKeys.Num() > 0)
+		{
+			TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+			Obj->SetBoolField(TEXT("success"), false);
+			Obj->SetStringField(TEXT("error"), FString::Printf(
+				TEXT("'%s' does not match the expected key set, so the String Table was not touched: %d expected key(s) missing%s."),
+				*CsvPath, MissingKeys.Num(),
+				bRequireExactKeys
+					? *FString::Printf(TEXT(", %d unexpected"), UnexpectedKeys.Num())
+					: TEXT("")));
+			Obj->SetStringField(TEXT("reason"), TEXT("key_set_mismatch"));
+			Obj->SetStringField(TEXT("assetPath"), AssetPath);
+			Obj->SetStringField(TEXT("csvPath"), CsvPath);
+			Obj->SetNumberField(TEXT("csvKeyCount"), Incoming.Num());
+			Obj->SetArrayField(TEXT("missingKeys"), MCPSortedKeysToJson(MissingKeys));
+			Obj->SetArrayField(TEXT("unexpectedKeys"), MCPSortedKeysToJson(UnexpectedKeys));
+			return MakeShared<FJsonValueObject>(Obj);
+		}
+	}
+
+	TMap<FString, FString> Before;
+	MCPSnapshotStringTable(StringTable, Before);
+
+	// The merge runs first and the pruning second, so a parse that somehow
+	// fails on the second pass cannot leave the table emptied.
+	StringTable->Modify(true);
+	if (!MCPImportStringTableCsvFile(StringTable, CsvPath))
+	{
+		return MCPError(FString::Printf(
+			TEXT("'%s' parsed into the staging table but not into '%s'. The table is unchanged apart from any partial merge the importer applied; re-read it before retrying."),
+			*CsvPath, *AssetPath));
+	}
+
+	TArray<FString> RemovedKeys;
+	if (bReplaceExisting)
+	{
+		for (const TPair<FString, FString>& Entry : Before)
+		{
+			if (!Incoming.Contains(Entry.Key))
+			{
+				StringTable->GetMutableStringTable()->RemoveSourceString(FTextKey(Entry.Key));
+				RemovedKeys.Add(Entry.Key);
+			}
+		}
+	}
+
+	TMap<FString, FString> After;
+	MCPSnapshotStringTable(StringTable, After);
+
+	TArray<FString> AddedKeys;
+	TArray<FString> UpdatedKeys;
+	for (const TPair<FString, FString>& Entry : After)
+	{
+		if (const FString* Previous = Before.Find(Entry.Key))
+		{
+			if (!Previous->Equals(Entry.Value, ESearchCase::CaseSensitive))
+			{
+				UpdatedKeys.Add(Entry.Key);
+			}
+		}
+		else
+		{
+			AddedKeys.Add(Entry.Key);
+		}
+	}
+
+	UPackage* Package = StringTable->GetOutermost();
+	bool bPersisted = false;
+	FString PersistReason;
+	if (bSave)
+	{
+		bPersisted = SaveAssetPackage(StringTable);
+		if (!bPersisted)
+		{
+			PersistReason = FString::Printf(
+				TEXT("The editor refused to write '%s'. The entries are in memory only."),
+				Package ? *Package->GetName() : *AssetPath);
+		}
+	}
+	else
+	{
+		PersistReason = TEXT("save=false was requested, so the imported entries are in memory only until the package is saved.");
+	}
+
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	SetStringTableInfoFields(Result, StringTable);
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetStringField(TEXT("csvPath"), CsvPath);
+	Result->SetBoolField(TEXT("replaceExisting"), bReplaceExisting);
+	Result->SetNumberField(TEXT("csvKeyCount"), Incoming.Num());
+	Result->SetNumberField(TEXT("entryCountBefore"), Before.Num());
+	Result->SetNumberField(TEXT("entryCountAfter"), After.Num());
+	Result->SetArrayField(TEXT("addedKeys"), MCPSortedKeysToJson(AddedKeys));
+	Result->SetArrayField(TEXT("updatedKeys"), MCPSortedKeysToJson(UpdatedKeys));
+	Result->SetArrayField(TEXT("removedKeys"), MCPSortedKeysToJson(RemovedKeys));
+	TArray<FString> AllKeys;
+	After.GetKeys(AllKeys);
+	Result->SetArrayField(TEXT("keys"), MCPSortedKeysToJson(AllKeys));
+	if (ExpectedKeys.Num() > 0)
+	{
+		Result->SetNumberField(TEXT("expectedKeyCount"), ExpectedKeys.Num());
+		Result->SetBoolField(TEXT("expectedKeysPresent"), true);
+	}
+	Result->SetBoolField(TEXT("persisted"), bPersisted);
+	Result->SetBoolField(TEXT("saved"), bPersisted);
+	if (Package)
+	{
+		Result->SetStringField(TEXT("packageName"), Package->GetName());
+		Result->SetBoolField(TEXT("packageDirty"), Package->IsDirty());
+	}
+	if (!bPersisted)
+	{
+		Result->SetStringField(TEXT("persistError"), PersistReason);
+		if (bSave)
+		{
+			Result->SetBoolField(TEXT("success"), false);
+			Result->SetStringField(TEXT("error"), PersistReason);
+		}
+	}
+	return MCPResult(Result);
+}
+
 // --- Reimport ---------------------------------------------------------
 
 
@@ -2491,11 +2835,9 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReimportAsset(const TSharedPtr<FJsonObjec
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> LoadError;
+	UObject* Asset = MCPRequireAssetObject(AssetPath, LoadError);
+	if (!Asset) return LoadError;
 
 	// Optionally override the source file path
 	FString NewSourcePath;
@@ -2563,7 +2905,9 @@ TSharedPtr<FJsonValue> FAssetHandlers::ExportAsset(const TSharedPtr<FJsonObject>
 	FString OutputPath;
 	if (auto Err = RequireString(Params, TEXT("outputPath"), OutputPath)) return Err;
 
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	// #930: same resolution as asset(read), which opened assets this action
+	// reported as missing.
+	UObject* Asset = MCPLoadAssetObject(AssetPath);
 	if (!Asset)
 	{
 		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
@@ -2613,8 +2957,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::ExportTexture(const TSharedPtr<FJsonObjec
 	FString OutputPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("outputPath"), TEXT("filePath"), OutputPath)) return Err;
 
-	UTexture2D* Texture = Cast<UTexture2D>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!Texture) return MCPError(FString::Printf(TEXT("Texture2D not found: %s"), *AssetPath));
+	UTexture2D* Texture = LoadAssetByPath<UTexture2D>(AssetPath);
+	if (!Texture) return MCPAssetLoadError(AssetPath, TEXT("Texture2D"));
 
 	FString AbsPath = OutputPath;
 	if (FPaths::IsRelative(AbsPath)) AbsPath = FPaths::Combine(FPaths::ProjectDir(), AbsPath);
@@ -2651,10 +2995,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::CompareTextures(const TSharedPtr<FJsonObj
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPathA"), TEXT("a"), PathA)) return Err;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPathB"), TEXT("b"), PathB)) return Err;
 
-	UTexture2D* A = Cast<UTexture2D>(UEditorAssetLibrary::LoadAsset(PathA));
-	UTexture2D* B = Cast<UTexture2D>(UEditorAssetLibrary::LoadAsset(PathB));
-	if (!A) return MCPError(FString::Printf(TEXT("Texture2D not found: %s"), *PathA));
-	if (!B) return MCPError(FString::Printf(TEXT("Texture2D not found: %s"), *PathB));
+	UTexture2D* A = LoadAssetByPath<UTexture2D>(PathA);
+	UTexture2D* B = LoadAssetByPath<UTexture2D>(PathB);
+	if (!A) return MCPAssetLoadError(PathA, TEXT("Texture2D"));
+	if (!B) return MCPAssetLoadError(PathB, TEXT("Texture2D"));
 
 	const bool bSameDims = A->GetSizeX() == B->GetSizeX() && A->GetSizeY() == B->GetSizeY();
 	const bool bSameFormat = A->GetPixelFormat() == B->GetPixelFormat();

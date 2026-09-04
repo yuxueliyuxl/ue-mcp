@@ -10,6 +10,12 @@ public:
 	// Register all level handlers
 	static void RegisterHandlers(class FMCPHandlerRegistry& Registry);
 
+	// Shared by the handler and its focused native automation test.
+	static int32 ClearBlueprintGraphNodes(
+		class UBlueprint* Blueprint,
+		bool bDryRun,
+		TArray<TSharedPtr<FJsonValue>>& OutGraphs);
+
 private:
 	// Handler implementations
 	static TSharedPtr<FJsonValue> GetOutliner(const TSharedPtr<FJsonObject>& Params);
@@ -25,6 +31,19 @@ private:
 	// expressed in reference's local space).
 	static TSharedPtr<FJsonValue> GetRelativeTransform(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetCurrentLevel(const TSharedPtr<FJsonObject>& Params);
+	// #964: save the level currently being edited, through the same package
+	// path editor(save_dirty) uses, and report what happened to each package
+	// rather than one bare boolean. LevelHandlers_Save.cpp.
+	static TSharedPtr<FJsonValue> SaveLevel(const TSharedPtr<FJsonObject>& Params);
+	// #985: World Partition streaming settings (CellSize / LoadingRange) and the
+	// runtime cell transformer stack, whose instanced transformer object had no
+	// writable path at all. LevelHandlers_WorldPartitionSettings.cpp.
+	static TSharedPtr<FJsonValue> GetWorldPartitionSettings(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetWorldPartitionSettings(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AddRuntimeCellTransformer(const TSharedPtr<FJsonObject>& Params);
+	// #985: bulk HLOD layer assignment, with the other selector-driven batch
+	// writes in LevelHandlers_BatchWrite.cpp.
+	static TSharedPtr<FJsonValue> SetActorHLODLayer(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ListLevels(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetSelectedActors(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ListVolumes(const TSharedPtr<FJsonObject>& Params);
@@ -41,7 +60,9 @@ private:
 	// #426: symmetric inverse of add_component_to_actor.
 	static TSharedPtr<FJsonValue> RemoveComponentFromActor(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> LoadLevel(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ClearLevelScript(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetComponentProperty(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> NudgeComponent(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetComponentDetails(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetVolumeProperties(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetWorldSettings(const TSharedPtr<FJsonObject>& Params);
@@ -52,6 +73,8 @@ private:
 	static TSharedPtr<FJsonValue> GetActorsByClass(const TSharedPtr<FJsonObject>& Params);
 	// #582 find actors that own a component of a given class
 	static TSharedPtr<FJsonValue> GetActorsByComponentClass(const TSharedPtr<FJsonObject>& Params);
+	// Aggregate loaded static-mesh usage in one bounded, read-only world scan.
+	static TSharedPtr<FJsonValue> SummarizeStaticMeshUsage(const TSharedPtr<FJsonObject>& Params);
 	// v0.7.19 issue #146 - actor class histogram (counts by class name)
 	static TSharedPtr<FJsonValue> CountActorsByClass(const TSharedPtr<FJsonObject>& Params);
 	// v0.7.19 issue #150 - RuntimeVirtualTextureVolume / component summary
@@ -104,6 +127,7 @@ private:
 	static TSharedPtr<FJsonValue> PlaceActorsBatch(const TSharedPtr<FJsonObject>& Params);
 	// #420: raycast + #419 snap-to-floor (spatial level operations)
 	static TSharedPtr<FJsonValue> LineTrace(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> BulkLineTrace(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SnapActorToFloor(const TSharedPtr<FJsonObject>& Params);
 	// #453: per-actor motion snapshot for telemetry / driving probes.
 	static TSharedPtr<FJsonValue> ReadActorMotion(const TSharedPtr<FJsonObject>& Params);
@@ -116,6 +140,10 @@ private:
 	// #697: update or remove a single instance on an ISMC/HISMC by index.
 	static TSharedPtr<FJsonValue> UpdateInstanceTransform(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveInstance(const TSharedPtr<FJsonObject>& Params);
+	// Preview or commit a bounded batch of ISMC/HISMC instances snapped to a
+	// filtered collision surface. Defaults to dryRun=true and preflights every
+	// trace before one transactional mutation.
+	static TSharedPtr<FJsonValue> SnapInstancesToSurface(const TSharedPtr<FJsonObject>& Params);
 	// #696: enable + force-build Nanite on a UStaticMesh asset, or read its
 	// current Nanite state.
 	static TSharedPtr<FJsonValue> SetNaniteSettings(const TSharedPtr<FJsonObject>& Params);
@@ -125,6 +153,44 @@ private:
 	static TSharedPtr<FJsonValue> SpawnSkeletalMeshActor(const TSharedPtr<FJsonObject>& Params);
 	// #666: add a material blendable to a PostProcessVolume's WeightedBlendables.
 	static TSharedPtr<FJsonValue> AddPostProcessBlendable(const TSharedPtr<FJsonObject>& Params);
+	// #950: FPostProcessSettings values only apply when their bOverride_<Name>
+	// bit is on, so the setter writes both halves and the reader reports which
+	// settings a volume is actually overriding.
+	// LevelHandlers_PostProcess.cpp.
+	static TSharedPtr<FJsonValue> SetPostProcessSettings(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GetPostProcessSettings(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetFixedExposure(const TSharedPtr<FJsonObject>& Params);
 	// #637: export a selected actor's mesh to FBX plus a metadata sidecar JSON.
 	static TSharedPtr<FJsonValue> ExportActorFbx(const TSharedPtr<FJsonObject>& Params);
+	// #910/#943/#912: one editor-side component query. Filters, projection,
+	// predicates, grouping and counts all evaluate here, because shipping the
+	// candidates out to be filtered by the client is what made these questions
+	// megabyte payloads and Python loops.
+	static TSharedPtr<FJsonValue> QueryComponents(const TSharedPtr<FJsonObject>& Params);
+	// #984/#941/#907/#987: the write side of the same complaint. A selector
+	// that runs in the editor, so a level-wide edit is one call rather than a
+	// generated label list and a loop.
+	static TSharedPtr<FJsonValue> BatchSetActorProperties(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> BulkSetComponentProperty(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RemoveComponentsByClass(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SpawnActorsBatch(const TSharedPtr<FJsonObject>& Params);
+	// #944: rerun construction on PLACED instances. blueprint(run_construction_script)
+	// only touches a temporary actor, and the Python wrapper has no equivalent.
+	static TSharedPtr<FJsonValue> RerunConstruction(const TSharedPtr<FJsonObject>& Params);
+	// #915: rebuild collision after mesh data changed under it. Stale collision
+	// makes line_trace report a miss through solid geometry.
+	static TSharedPtr<FJsonValue> RecreatePhysicsState(const TSharedPtr<FJsonObject>& Params);
+	// #914: geometric overlap between two components, with the unscaled local
+	// bounds a caller needs to reason about the answer.
+	static TSharedPtr<FJsonValue> TestComponentOverlap(const TSharedPtr<FJsonObject>& Params);
+	// #911: wrap UEditorActorSubsystem::ConvertActors for Brush to StaticMesh,
+	// with the safety checks that operation needs because it destroys its input.
+	static TSharedPtr<FJsonValue> ConvertBrushesToStaticMesh(const TSharedPtr<FJsonObject>& Params);
+	// #946: per-slot COMPONENT material overrides on placed actors, which is a
+	// different thing from the mesh asset's own slots.
+	static TSharedPtr<FJsonValue> SetComponentMaterials(const TSharedPtr<FJsonObject>& Params);
+	// #956: a verification subject that cannot be saved into the map.
+	static TSharedPtr<FJsonValue> SpawnTransientActor(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> DestroyTransientActor(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListTransientActors(const TSharedPtr<FJsonObject>& Params);
 };

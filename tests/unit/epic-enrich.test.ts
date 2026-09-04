@@ -220,3 +220,105 @@ describe("enrichToolsWithEpicCatalog", () => {
     expect(desc).toContain("Returns emitter properties - fields use PascalCase.");
   });
 });
+
+describe("deterministic collision suffixes (#875)", () => {
+  /**
+   * Two toolsets routed to the same category, both shipping a tool whose bare
+   * name is ImportFile. Whichever is injected first keeps `epic_import_file`
+   * and the other is qualified with its toolset, so the pair swap names if the
+   * enumeration order swaps. Unreal does not promise that order.
+   */
+  const COLLIDING: EpicCatalog = {
+    toolsets: [
+      {
+        name: "AssetToolsets.TextureToolset",
+        tools: [{ name: "AssetToolsets.TextureToolset.ImportFile", description: "Import a texture." }],
+      },
+      {
+        name: "AssetToolsets.AudioToolset",
+        tools: [{ name: "AssetToolsets.AudioToolset.ImportFile", description: "Import a sound." }],
+      },
+      {
+        name: "AssetToolsets.MeshToolset",
+        tools: [{ name: "AssetToolsets.MeshToolset.ImportFile", description: "Import a mesh." }],
+      },
+    ],
+  };
+
+  const assetTools = (): ToolDef[] => [
+    categoryTool("asset", "Assets", { list: bp("list", "list_assets") }, undefined, {}),
+    categoryTool("epic", "Epic gateway", { status: bp("status", "epic_status") }, undefined, {}),
+  ];
+
+  /** Every permutation of the three toolsets, as injected action names. */
+  function namesFor(order: number[]): string[] {
+    const tools = assetTools();
+    enrichToolsWithEpicCatalog(tools, { toolsets: order.map((i) => COLLIDING.toolsets[i]) });
+    const asset = tools.find((t) => t.name === "asset")!;
+    return Object.keys(asset.actions).filter((a) => a.startsWith("epic_")).sort();
+  }
+
+  const PERMUTATIONS = [
+    [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+  ];
+
+  it("resolves the collision the same way whatever order the catalog arrives in", () => {
+    const first = namesFor(PERMUTATIONS[0]);
+    // Sanity: the fixture really does collide, or this proves nothing.
+    expect(first).toHaveLength(3);
+    expect(first).toContain("epic_import_file");
+    expect(first.filter((n) => n !== "epic_import_file")).toHaveLength(2);
+
+    for (const order of PERMUTATIONS.slice(1)) {
+      expect(namesFor(order), `catalog order ${order.join(",")}`).toEqual(first);
+    }
+  });
+
+  it("gives the bare name to the first toolset in name order", () => {
+    // AudioToolset sorts before MeshToolset before TextureToolset, so the bare
+    // name is the audio one no matter how the editor enumerated them.
+    for (const order of PERMUTATIONS) {
+      const tools = assetTools();
+      enrichToolsWithEpicCatalog(tools, { toolsets: order.map((i) => COLLIDING.toolsets[i]) });
+      const asset = tools.find((t) => t.name === "asset")!;
+      expect(asset.actions.epic_import_file.description).toContain("Import a sound.");
+    }
+  });
+
+  it("keeps the same description on each qualified action across orders", () => {
+    const described = (order: number[]): Record<string, string> => {
+      const tools = assetTools();
+      enrichToolsWithEpicCatalog(tools, { toolsets: order.map((i) => COLLIDING.toolsets[i]) });
+      const asset = tools.find((t) => t.name === "asset")!;
+      const out: Record<string, string> = {};
+      for (const [key, spec] of Object.entries(asset.actions)) {
+        if (key.startsWith("epic_")) out[key] = spec.description ?? "";
+      }
+      return out;
+    };
+    const first = described(PERMUTATIONS[0]);
+    for (const order of PERMUTATIONS.slice(1)) {
+      expect(described(order), `catalog order ${order.join(",")}`).toEqual(first);
+    }
+  });
+
+  it("does not reorder a single toolset's own tools", () => {
+    // Only the toolset sequence is imposed. Within one toolset the registry's
+    // own order is authored and is left alone.
+    const tools = assetTools();
+    enrichToolsWithEpicCatalog(tools, {
+      toolsets: [
+        {
+          name: "AssetToolsets.TextureToolset",
+          tools: [
+            { name: "AssetToolsets.TextureToolset.ZResize" },
+            { name: "AssetToolsets.TextureToolset.ACompress" },
+          ],
+        },
+      ],
+    });
+    const asset = tools.find((t) => t.name === "asset")!;
+    expect(Object.keys(asset.actions).filter((a) => a.startsWith("epic_")))
+      .toEqual(["epic_zresize", "epic_acompress"]);
+  });
+});

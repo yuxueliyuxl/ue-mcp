@@ -321,7 +321,23 @@ export function enrichToolsWithEpicCatalog(
     return created;
   };
 
-  for (const ts of catalog.toolsets) {
+  // #875: injection order decides collision suffixes, so it has to be ours.
+  // When two toolsets in one category ship a tool with the same bare name, the
+  // first one seen keeps the bare action name and the second is qualified with
+  // its toolset. Unreal promises the set of toolsets, not the sequence, and the
+  // sequence has been observed to change between editor sessions, so the pair
+  // could trade names across a restart. That renames an advertised action: a
+  // saved flow naming the bare one would then silently reach the other tool.
+  // Sorting by toolset name makes the resolution reproducible, at the cost of a
+  // one-time swap at the version that lands this. Byte order rather than
+  // localeCompare, so the result does not depend on the machine's locale.
+  const orderedToolsets = [...catalog.toolsets].sort((a, b) => {
+    const an = a?.name ?? "";
+    const bn = b?.name ?? "";
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  });
+
+  for (const ts of orderedToolsets) {
     if (!ts?.name || !ts.tools?.length) continue;
     const targetCat = routeToolset(ts.name) ?? epicName;
     // Excluded categories are not enriched (tools stay reachable via the epic

@@ -33,6 +33,7 @@
 #include "Materials/MaterialExpressionFresnel.h"
 #include "Factories/MaterialInstanceConstantFactoryNew.h"
 #include "Factories/MaterialFactoryNew.h"
+#include "MaterialEditingLibrary.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #include "EditorScriptingUtilities/Public/EditorAssetLibrary.h"
@@ -86,6 +87,9 @@ void FMaterialHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("render_material_preview"), &RenderMaterialPreview);
 	Registry.RegisterHandler(TEXT("begin_material_transaction"), &BeginMaterialTransaction);
 	Registry.RegisterHandler(TEXT("end_material_transaction"), &EndMaterialTransaction);
+
+	// #946: texture-set build with automatic virtual/UDIM sampler selection.
+	Registry.RegisterHandler(TEXT("build_material"), &BuildMaterial);
 
 	Registry.RegisterHandler(TEXT("create_material_simple"), &CreateMaterialSimple);
 	Registry.RegisterHandler(TEXT("set_material_usage"), &SetMaterialUsage);
@@ -160,6 +164,108 @@ namespace
 		Obj->SetNumberField(TEXT("b"), Color.B);
 		Obj->SetNumberField(TEXT("a"), Color.A);
 		return Obj;
+	}
+
+	// A colour object, in any of the spellings a client might use: {r,g,b,a},
+	// {R,G,B,A} or {x,y,z,w}. Missing components fall back to 0, with alpha 1.
+	bool TryReadMaterialColorObject(const TSharedPtr<FJsonObject>& Obj, FLinearColor& OutColor)
+	{
+		if (!Obj.IsValid()) return false;
+		double R = 0.0, G = 0.0, B = 0.0, A = 1.0;
+		bool bAny = false;
+		auto Pick = [&Obj, &bAny](const TCHAR* Lower, const TCHAR* Upper, const TCHAR* Alt, double& Slot)
+		{
+			double V = 0.0;
+			if (Obj->TryGetNumberField(Lower, V) || Obj->TryGetNumberField(Upper, V) || Obj->TryGetNumberField(Alt, V))
+			{
+				Slot = V;
+				bAny = true;
+			}
+		};
+		Pick(TEXT("r"), TEXT("R"), TEXT("x"), R);
+		Pick(TEXT("g"), TEXT("G"), TEXT("y"), G);
+		Pick(TEXT("b"), TEXT("B"), TEXT("z"), B);
+		Pick(TEXT("a"), TEXT("A"), TEXT("w"), A);
+		if (!bAny) return false;
+		OutColor = FLinearColor((float)R, (float)G, (float)B, (float)A);
+		return true;
+	}
+
+	// #952: a colour arrives in whatever shape the calling client serialised it
+	// in - an object {r,g,b,a}, an array [r,g,b,a], a re-encoded JSON string, or
+	// UE struct text "(R=..,G=..,B=..,A=..)". Accept every one of them under a
+	// single named field so no caller has to guess the wire format.
+	bool TryParseMaterialColorField(
+		const TSharedPtr<FJsonObject>& Params,
+		const TCHAR* FieldName,
+		FLinearColor& OutColor)
+	{
+		if (!Params.IsValid()) return false;
+
+		const TSharedPtr<FJsonObject>* AsObject = nullptr;
+		if (Params->TryGetObjectField(FieldName, AsObject) && AsObject)
+		{
+			return TryReadMaterialColorObject(*AsObject, OutColor);
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* AsArray = nullptr;
+		if (Params->TryGetArrayField(FieldName, AsArray) && AsArray && AsArray->Num() > 0)
+		{
+			double Components[4] = { 0.0, 0.0, 0.0, 1.0 };
+			for (int32 Index = 0; Index < AsArray->Num() && Index < 4; ++Index)
+			{
+				(*AsArray)[Index]->TryGetNumber(Components[Index]);
+			}
+			OutColor = FLinearColor((float)Components[0], (float)Components[1], (float)Components[2], (float)Components[3]);
+			return true;
+		}
+
+		FString AsString;
+		if (Params->TryGetStringField(FieldName, AsString) && !AsString.IsEmpty())
+		{
+			TSharedPtr<FJsonObject> Reparsed;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(AsString);
+			if (FJsonSerializer::Deserialize(Reader, Reparsed) && TryReadMaterialColorObject(Reparsed, OutColor))
+			{
+				return true;
+			}
+			FLinearColor Parsed;
+			if (Parsed.InitFromString(AsString))
+			{
+				OutColor = Parsed;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// #952: agents reach for `color` as readily as `value` when the parameter is
+	// a colour, and rejecting the synonym is indistinguishable from the whole
+	// action being unsupported. Try both, and report which one was honoured.
+	bool TryParseMaterialColorParam(
+		const TSharedPtr<FJsonObject>& Params,
+		FLinearColor& OutColor,
+		FString& OutSourceField,
+		bool bAllowTopLevelComponents = false)
+	{
+		static const TCHAR* Candidates[] = { TEXT("value"), TEXT("color"), TEXT("colour") };
+		for (const TCHAR* Candidate : Candidates)
+		{
+			if (TryParseMaterialColorField(Params, Candidate, OutColor))
+			{
+				OutSourceField = Candidate;
+				return true;
+			}
+		}
+		// Raw bridge callers reach the handler without the tool schema in front
+		// of them and have historically passed the components at the top level.
+		if (bAllowTopLevelComponents && TryReadMaterialColorObject(Params, OutColor))
+		{
+			OutSourceField = TEXT("(top-level components)");
+			return true;
+		}
+		return false;
 	}
 
 	TSharedPtr<FJsonObject> MaterialInstanceOverrideCounts(UMaterialInstanceConstant* Instance)
@@ -247,6 +353,170 @@ namespace
 		Result->SetStringField(TEXT("parentPath"), Instance->Parent ? Instance->Parent->GetPathName() : FString());
 		Result->SetObjectField(TEXT("overrideCounts"), MaterialInstanceOverrideCounts(Instance));
 		Result->SetNumberField(TEXT("overrideCount"), CountTotalMaterialInstanceOverrides(Instance));
+	}
+
+	// #952: `read` and `list_parameters` used to insist on a base UMaterial, so
+	// the asset an agent actually edits - the instance - could be written to and
+	// never read back, and verifying a write meant dropping to python. Report
+	// what the instance resolves to now, what its parent would give it, and
+	// which of the two the instance is actually overriding.
+	void AddMaterialInterfaceParameters(TSharedPtr<FJsonObject> Result, UMaterialInterface* Material)
+	{
+		if (!Result.IsValid() || !Material)
+		{
+			return;
+		}
+
+		UMaterialInstance* Instance = Cast<UMaterialInstance>(Material);
+		UMaterialInterface* Parent = nullptr;
+		if (Instance)
+		{
+			Parent = Instance->Parent;
+		}
+
+		{
+			TArray<FMaterialParameterInfo> Infos;
+			TArray<FGuid> Guids;
+			Material->GetAllScalarParameterInfo(Infos, Guids);
+			TArray<TSharedPtr<FJsonValue>> Entries;
+			for (int32 Index = 0; Index < Infos.Num(); ++Index)
+			{
+				const FMaterialParameterInfo& Info = Infos[Index];
+				TSharedPtr<FJsonObject> Obj = MaterialParameterInfoToJson(Info);
+
+				float Value = 0.0f;
+				if (Material->GetScalarParameterValue(Info, Value))
+				{
+					Obj->SetNumberField(TEXT("value"), Value);
+				}
+				float Default = 0.0f;
+				if (Parent && Parent->GetScalarParameterValue(Info, Default))
+				{
+					Obj->SetNumberField(TEXT("defaultValue"), Default);
+				}
+
+				bool bOverridden = false;
+				if (Instance)
+				{
+					for (const FScalarParameterValue& Override : Instance->ScalarParameterValues)
+					{
+						if (Override.ParameterInfo == Info) { bOverridden = true; break; }
+					}
+				}
+				Obj->SetBoolField(TEXT("overridden"), bOverridden);
+				if (Guids.IsValidIndex(Index))
+				{
+					Obj->SetStringField(TEXT("expressionGuid"), Guids[Index].ToString(EGuidFormats::DigitsWithHyphens));
+				}
+				Entries.Add(MakeShared<FJsonValueObject>(Obj));
+			}
+			Result->SetArrayField(TEXT("scalarParameters"), Entries);
+		}
+
+		{
+			TArray<FMaterialParameterInfo> Infos;
+			TArray<FGuid> Guids;
+			Material->GetAllVectorParameterInfo(Infos, Guids);
+			TArray<TSharedPtr<FJsonValue>> Entries;
+			for (int32 Index = 0; Index < Infos.Num(); ++Index)
+			{
+				const FMaterialParameterInfo& Info = Infos[Index];
+				TSharedPtr<FJsonObject> Obj = MaterialParameterInfoToJson(Info);
+
+				FLinearColor Value;
+				if (Material->GetVectorParameterValue(Info, Value))
+				{
+					Obj->SetObjectField(TEXT("value"), LinearColorToJson(Value));
+				}
+				FLinearColor Default;
+				if (Parent && Parent->GetVectorParameterValue(Info, Default))
+				{
+					Obj->SetObjectField(TEXT("defaultValue"), LinearColorToJson(Default));
+				}
+
+				bool bOverridden = false;
+				if (Instance)
+				{
+					for (const FVectorParameterValue& Override : Instance->VectorParameterValues)
+					{
+						if (Override.ParameterInfo == Info) { bOverridden = true; break; }
+					}
+				}
+				Obj->SetBoolField(TEXT("overridden"), bOverridden);
+				if (Guids.IsValidIndex(Index))
+				{
+					Obj->SetStringField(TEXT("expressionGuid"), Guids[Index].ToString(EGuidFormats::DigitsWithHyphens));
+				}
+				Entries.Add(MakeShared<FJsonValueObject>(Obj));
+			}
+			Result->SetArrayField(TEXT("vectorParameters"), Entries);
+		}
+
+		{
+			TArray<FMaterialParameterInfo> Infos;
+			TArray<FGuid> Guids;
+			Material->GetAllTextureParameterInfo(Infos, Guids);
+			TArray<TSharedPtr<FJsonValue>> Entries;
+			for (int32 Index = 0; Index < Infos.Num(); ++Index)
+			{
+				const FMaterialParameterInfo& Info = Infos[Index];
+				TSharedPtr<FJsonObject> Obj = MaterialParameterInfoToJson(Info);
+
+				UTexture* Value = nullptr;
+				if (Material->GetTextureParameterValue(Info, Value) && Value)
+				{
+					Obj->SetStringField(TEXT("value"), Value->GetPathName());
+				}
+				UTexture* Default = nullptr;
+				if (Parent && Parent->GetTextureParameterValue(Info, Default) && Default)
+				{
+					Obj->SetStringField(TEXT("defaultValue"), Default->GetPathName());
+				}
+
+				bool bOverridden = false;
+				if (Instance)
+				{
+					for (const FTextureParameterValue& Override : Instance->TextureParameterValues)
+					{
+						if (Override.ParameterInfo == Info) { bOverridden = true; break; }
+					}
+				}
+				Obj->SetBoolField(TEXT("overridden"), bOverridden);
+				if (Guids.IsValidIndex(Index))
+				{
+					Obj->SetStringField(TEXT("expressionGuid"), Guids[Index].ToString(EGuidFormats::DigitsWithHyphens));
+				}
+				Entries.Add(MakeShared<FJsonValueObject>(Obj));
+			}
+			Result->SetArrayField(TEXT("textureParameters"), Entries);
+		}
+	}
+
+	// Identity + shading summary shared by `read` and `list_parameters` when the
+	// asset is not a base UMaterial.
+	void SetMaterialInterfaceIdentityFields(TSharedPtr<FJsonObject> Result, UMaterialInterface* Material)
+	{
+		if (!Result.IsValid() || !Material)
+		{
+			return;
+		}
+
+		Result->SetStringField(TEXT("name"), Material->GetName());
+		Result->SetStringField(TEXT("path"), Material->GetPathName());
+		Result->SetStringField(TEXT("assetType"), Material->GetClass()->GetName());
+		if (UMaterialInstance* Instance = Cast<UMaterialInstance>(Material))
+		{
+			Result->SetStringField(TEXT("parentPath"), Instance->Parent ? Instance->Parent->GetPathName() : FString());
+		}
+		if (UMaterial* Base = Material->GetMaterial())
+		{
+			Result->SetStringField(TEXT("baseMaterialPath"), Base->GetPathName());
+		}
+		if (UMaterialInstanceConstant* Constant = Cast<UMaterialInstanceConstant>(Material))
+		{
+			Result->SetObjectField(TEXT("overrideCounts"), MaterialInstanceOverrideCounts(Constant));
+			Result->SetNumberField(TEXT("overrideCount"), CountTotalMaterialInstanceOverrides(Constant));
+		}
 	}
 }
 
@@ -433,12 +703,34 @@ TSharedPtr<FJsonValue> FMaterialHandlers::ReadMaterial(const TSharedPtr<FJsonObj
 	UMaterial* Material = LoadMaterialFromPath(AssetPath);
 	if (!Material)
 	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *AssetPath));
+		// #952: a MaterialInstance is a material as far as a caller is concerned.
+		// It has no expression graph of its own, so answer with what it does
+		// have: its lineage, its shading setup, and every parameter it resolves,
+		// with the ones it overrides marked.
+		UMaterialInterface* Interface = LoadAssetByPath<UMaterialInterface>(AssetPath);
+		if (!Interface)
+		{
+			return MCPError(FString::Printf(TEXT("Failed to load material or material instance at '%s'"), *AssetPath));
+		}
+
+		auto InstanceResult = MCPSuccess();
+		SetMaterialInterfaceIdentityFields(InstanceResult, Interface);
+		InstanceResult->SetStringField(TEXT("shadingModel"), ShadingModelToString(Interface->GetShadingModels().GetFirstShadingModel()));
+		InstanceResult->SetStringField(TEXT("blendMode"), StaticEnum<EBlendMode>()->GetNameStringByValue((int64)Interface->GetBlendMode()));
+		InstanceResult->SetBoolField(TEXT("twoSided"), Interface->IsTwoSided());
+		AddMaterialInterfaceParameters(InstanceResult, Interface);
+		InstanceResult->SetArrayField(TEXT("staticSwitches"), MaterialStaticSwitchesToJson(Interface));
+		// The graph lives on the base material; say so rather than returning an
+		// empty expression list that reads like a material with no nodes.
+		InstanceResult->SetStringField(TEXT("expressionsNote"),
+			TEXT("A MaterialInstance has no expression graph. Read baseMaterialPath for the graph."));
+		return MCPResult(InstanceResult);
 	}
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("name"), Material->GetName());
 	Result->SetStringField(TEXT("path"), Material->GetPathName());
+	Result->SetStringField(TEXT("assetType"), Material->GetClass()->GetName());
 	Result->SetStringField(TEXT("shadingModel"), ShadingModelToString(Material->GetShadingModels().GetFirstShadingModel()));
 	Result->SetStringField(TEXT("blendMode"), StaticEnum<EBlendMode>()->GetNameStringByValue((int64)Material->BlendMode));
 	Result->SetBoolField(TEXT("twoSided"), Material->IsTwoSided());
@@ -1161,7 +1453,20 @@ TSharedPtr<FJsonValue> FMaterialHandlers::ListMaterialParameters(const TSharedPt
 	UMaterial* Material = LoadMaterialFromPath(AssetPath);
 	if (!Material)
 	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *AssetPath));
+		// #952: on a MaterialInstance report the resolved value of every
+		// parameter, the parent's value, and which ones this instance overrides,
+		// so a write can be verified without an execute_python round trip.
+		UMaterialInterface* Interface = LoadAssetByPath<UMaterialInterface>(AssetPath);
+		if (!Interface)
+		{
+			return MCPError(FString::Printf(TEXT("Failed to load material or material instance at '%s'"), *AssetPath));
+		}
+
+		auto InstanceResult = MCPSuccess();
+		SetMaterialInterfaceIdentityFields(InstanceResult, Interface);
+		AddMaterialInterfaceParameters(InstanceResult, Interface);
+		InstanceResult->SetArrayField(TEXT("staticSwitches"), MaterialStaticSwitchesToJson(Interface));
+		return MCPResult(InstanceResult);
 	}
 
 	TArray<TSharedPtr<FJsonValue>> ScalarParams;
@@ -1210,6 +1515,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::ListMaterialParameters(const TSharedPt
 	Result->SetArrayField(TEXT("vectorParameters"), VectorParams);
 	Result->SetArrayField(TEXT("textureParameters"), TextureParams);
 	Result->SetStringField(TEXT("path"), Material->GetPathName());
+	Result->SetStringField(TEXT("assetType"), Material->GetClass()->GetName());
 
 	return MCPResult(Result);
 }
@@ -1368,22 +1674,39 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 		}
 	}
 
+	// The association decides which parameter a name refers to once material
+	// layers are in play, and it has to be identical on the write and on the
+	// read-back or the verify step reads a different parameter than it wrote.
+	const EMaterialParameterAssociation Association = ParseMaterialParameterAssociation(
+		OptionalString(Params, TEXT("association"), TEXT("Global")));
+	const FMaterialParameterInfo ParameterInfo(FName(*ParameterName), Association);
+	const FString AssociationName = MaterialParameterAssociationToString(Association);
+
 	// Auto-detect parameter type if not provided
 	if (ParameterType.IsEmpty())
 	{
 		// Check which parameter collections contain this name
-		FName ParamFName(*ParameterName);
 		float ScalarVal;
 		FLinearColor VectorVal;
 		UTexture* TextureVal;
-		if (MaterialInstance->GetScalarParameterValue(ParamFName, ScalarVal))
+		if (MaterialInstance->GetScalarParameterValue(ParameterInfo, ScalarVal))
 			ParameterType = TEXT("scalar");
-		else if (MaterialInstance->GetVectorParameterValue(ParamFName, VectorVal))
+		else if (MaterialInstance->GetVectorParameterValue(ParameterInfo, VectorVal))
 			ParameterType = TEXT("vector");
-		else if (MaterialInstance->GetTextureParameterValue(ParamFName, TextureVal))
+		else if (MaterialInstance->GetTextureParameterValue(ParameterInfo, TextureVal))
 			ParameterType = TEXT("texture");
 		else
-			ParameterType = TEXT("scalar"); // default fallback
+		{
+			// The parent does not declare the name, so nothing can be looked
+			// up. Fall back on the shape of the payload: a colour is only ever
+			// meant for a vector parameter, and guessing scalar there produced
+			// the "missing value" rejection reported in #952.
+			FLinearColor Probe;
+			FString ProbeField;
+			ParameterType = TryParseMaterialColorParam(Params, Probe, ProbeField)
+				? TEXT("vector")
+				: TEXT("scalar");
+		}
 	}
 
 	FString TypeLower = ParameterType.ToLower();
@@ -1397,11 +1720,12 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 		}
 
 		float PrevScalar = 0.0f;
-		const bool bHadPrev = MaterialInstance->GetScalarParameterValue(FName(*ParameterName), PrevScalar);
+		const bool bHadPrev = MaterialInstance->GetScalarParameterValue(ParameterInfo, PrevScalar);
 
 		auto Result = MCPSuccess();
 		Result->SetStringField(TEXT("parameterName"), ParameterName);
 		Result->SetStringField(TEXT("parameterType"), TEXT("scalar"));
+		Result->SetStringField(TEXT("association"), AssociationName);
 		Result->SetNumberField(TEXT("value"), ScalarValue);
 		Result->SetStringField(TEXT("path"), MaterialInstance->GetPathName());
 
@@ -1409,11 +1733,31 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 		{
 			MCPSetExisted(Result);
 			Result->SetBoolField(TEXT("updated"), false);
+			Result->SetNumberField(TEXT("readBack"), PrevScalar);
 			return MCPResult(Result);
 		}
 
-		MaterialInstance->SetScalarParameterValueEditorOnly(FName(*ParameterName), static_cast<float>(ScalarValue));
-		MaterialInstance->MarkPackageDirty();
+		MaterialInstance->Modify(true);
+		const bool bApplied = UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(
+			MaterialInstance, FName(*ParameterName), static_cast<float>(ScalarValue), Association);
+		if (!bApplied)
+		{
+			// The library declines a name the parent does not declare. Writing
+			// the override anyway is what this handler has always done, and a
+			// parameter added to the parent later then picks it up.
+			MaterialInstance->SetScalarParameterValueEditorOnly(ParameterInfo, static_cast<float>(ScalarValue));
+			UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
+		}
+		Result->SetBoolField(TEXT("declaredByParent"), bApplied);
+
+		// Persist, then read the value straight back off the instance so the
+		// caller never has to take "success" on trust (#952).
+		Result->SetBoolField(TEXT("saved"), SaveAssetPackage(MaterialInstance));
+		float ReadBack = 0.0f;
+		if (MaterialInstance->GetScalarParameterValue(ParameterInfo, ReadBack))
+		{
+			Result->SetNumberField(TEXT("readBack"), ReadBack);
+		}
 
 		MCPSetUpdated(Result);
 		if (bHadPrev)
@@ -1428,97 +1772,59 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 
 		return MCPResult(Result);
 	}
-	else if (TypeLower == TEXT("vector"))
+	else if (TypeLower == TEXT("vector") || TypeLower == TEXT("color") || TypeLower == TEXT("colour"))
 	{
-		// #670: accept the vector payload as an object {r,g,b,a}, an array
-		// [r,g,b,a], or a double-encoded string ("{\"r\":..}" or "(R=..,G=..)").
-		double R = 0.0, G = 0.0, B = 0.0, A = 1.0;
-		bool bParsed = false;
-		const TSharedPtr<FJsonObject>* ValueObj = nullptr;
-		const TArray<TSharedPtr<FJsonValue>>* ValueArr = nullptr;
-		if (Params->TryGetObjectField(TEXT("value"), ValueObj) && ValueObj && (*ValueObj).IsValid())
+		// #670/#952: the payload may be an object {r,g,b,a}, an array [r,g,b,a],
+		// a re-encoded JSON string or UE struct text, and it may arrive under
+		// `value` or under `color`. Every one of those is a colour a caller
+		// meant to set, so accept them all rather than making the caller guess.
+		FLinearColor ColorValue = FLinearColor::White;
+		FString SourceField;
+		if (!TryParseMaterialColorParam(Params, ColorValue, SourceField))
 		{
-			(*ValueObj)->TryGetNumberField(TEXT("r"), R);
-			(*ValueObj)->TryGetNumberField(TEXT("g"), G);
-			(*ValueObj)->TryGetNumberField(TEXT("b"), B);
-			(*ValueObj)->TryGetNumberField(TEXT("a"), A);
-			bParsed = true;
-		}
-		else if (Params->TryGetArrayField(TEXT("value"), ValueArr) && ValueArr)
-		{
-			if (ValueArr->Num() > 0) (*ValueArr)[0]->TryGetNumber(R);
-			if (ValueArr->Num() > 1) (*ValueArr)[1]->TryGetNumber(G);
-			if (ValueArr->Num() > 2) (*ValueArr)[2]->TryGetNumber(B);
-			if (ValueArr->Num() > 3) (*ValueArr)[3]->TryGetNumber(A);
-			bParsed = true;
-		}
-		else
-		{
-			FString ValueStr;
-			if (Params->TryGetStringField(TEXT("value"), ValueStr) && !ValueStr.IsEmpty())
-			{
-				// Try JSON object first.
-				TSharedPtr<FJsonObject> Reparsed;
-				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ValueStr);
-				if (FJsonSerializer::Deserialize(Reader, Reparsed) && Reparsed.IsValid())
-				{
-					Reparsed->TryGetNumberField(TEXT("r"), R);
-					Reparsed->TryGetNumberField(TEXT("g"), G);
-					Reparsed->TryGetNumberField(TEXT("b"), B);
-					Reparsed->TryGetNumberField(TEXT("a"), A);
-					bParsed = true;
-				}
-				else
-				{
-					// Fall back to UE struct text "(R=..,G=..,B=..,A=..)".
-					FLinearColor Parsed;
-					if (Parsed.InitFromString(ValueStr))
-					{
-						R = Parsed.R; G = Parsed.G; B = Parsed.B; A = Parsed.A;
-						bParsed = true;
-					}
-				}
-			}
-		}
-		if (!bParsed)
-		{
-			return MCPError(TEXT("Missing/unparseable 'value' for vector parameter - pass {r,g,b,a}, [r,g,b,a], or '(R=..,G=..,B=..,A=..)'"));
+			return MCPError(TEXT("Missing/unparseable colour for vector parameter - pass it as 'value' or 'color', shaped {r,g,b,a}, [r,g,b,a], or '(R=..,G=..,B=..,A=..)'"));
 		}
 
-		FLinearColor ColorValue(R, G, B, A);
 		FLinearColor PrevColor;
-		const bool bHadPrev = MaterialInstance->GetVectorParameterValue(FName(*ParameterName), PrevColor);
-
-		TSharedPtr<FJsonObject> ValueResult = MakeShared<FJsonObject>();
-		ValueResult->SetNumberField(TEXT("r"), R);
-		ValueResult->SetNumberField(TEXT("g"), G);
-		ValueResult->SetNumberField(TEXT("b"), B);
-		ValueResult->SetNumberField(TEXT("a"), A);
+		const bool bHadPrev = MaterialInstance->GetVectorParameterValue(ParameterInfo, PrevColor);
 
 		auto Result = MCPSuccess();
 		Result->SetStringField(TEXT("parameterName"), ParameterName);
 		Result->SetStringField(TEXT("parameterType"), TEXT("vector"));
-		Result->SetObjectField(TEXT("value"), ValueResult);
+		Result->SetStringField(TEXT("association"), AssociationName);
+		Result->SetStringField(TEXT("valueField"), SourceField);
+		Result->SetObjectField(TEXT("value"), LinearColorToJson(ColorValue));
 		Result->SetStringField(TEXT("path"), MaterialInstance->GetPathName());
 
 		if (bHadPrev && PrevColor.Equals(ColorValue))
 		{
 			MCPSetExisted(Result);
 			Result->SetBoolField(TEXT("updated"), false);
+			Result->SetObjectField(TEXT("readBack"), LinearColorToJson(PrevColor));
 			return MCPResult(Result);
 		}
 
-		MaterialInstance->SetVectorParameterValueEditorOnly(FName(*ParameterName), ColorValue);
-		MaterialInstance->MarkPackageDirty();
+		MaterialInstance->Modify(true);
+		const bool bApplied = UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(
+			MaterialInstance, FName(*ParameterName), ColorValue, Association);
+		if (!bApplied)
+		{
+			MaterialInstance->SetVectorParameterValueEditorOnly(ParameterInfo, ColorValue);
+			UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
+		}
+		Result->SetBoolField(TEXT("declaredByParent"), bApplied);
+
+		Result->SetBoolField(TEXT("saved"), SaveAssetPackage(MaterialInstance));
+		FLinearColor ReadBack;
+		if (MaterialInstance->GetVectorParameterValue(ParameterInfo, ReadBack))
+		{
+			Result->SetObjectField(TEXT("readBack"), LinearColorToJson(ReadBack));
+		}
 
 		MCPSetUpdated(Result);
 		if (bHadPrev)
 		{
-			TSharedPtr<FJsonObject> PrevValueObj = MakeShared<FJsonObject>();
-			PrevValueObj->SetNumberField(TEXT("r"), PrevColor.R);
-			PrevValueObj->SetNumberField(TEXT("g"), PrevColor.G);
-			PrevValueObj->SetNumberField(TEXT("b"), PrevColor.B);
-			PrevValueObj->SetNumberField(TEXT("a"), PrevColor.A);
+			TSharedPtr<FJsonObject> PrevValueObj = LinearColorToJson(PrevColor);
 			TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 			Payload->SetStringField(TEXT("path"), MaterialInstance->GetPathName());
 			Payload->SetStringField(TEXT("parameterName"), ParameterName);
@@ -1533,6 +1839,10 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 	{
 		FString TexturePath;
 		if (!Params->TryGetStringField(TEXT("value"), TexturePath) || TexturePath.IsEmpty())
+		{
+			Params->TryGetStringField(TEXT("texturePath"), TexturePath);
+		}
+		if (TexturePath.IsEmpty())
 		{
 			return MCPError(TEXT("Missing 'value' string field (texture asset path) for texture parameter"));
 		}
@@ -1549,11 +1859,12 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 		}
 
 		UTexture* PrevTexture = nullptr;
-		const bool bHadPrev = MaterialInstance->GetTextureParameterValue(FName(*ParameterName), PrevTexture);
+		const bool bHadPrev = MaterialInstance->GetTextureParameterValue(ParameterInfo, PrevTexture);
 
 		auto Result = MCPSuccess();
 		Result->SetStringField(TEXT("parameterName"), ParameterName);
 		Result->SetStringField(TEXT("parameterType"), TEXT("texture"));
+		Result->SetStringField(TEXT("association"), AssociationName);
 		Result->SetStringField(TEXT("value"), Texture->GetPathName());
 		Result->SetStringField(TEXT("path"), MaterialInstance->GetPathName());
 
@@ -1561,11 +1872,26 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 		{
 			MCPSetExisted(Result);
 			Result->SetBoolField(TEXT("updated"), false);
+			Result->SetStringField(TEXT("readBack"), PrevTexture->GetPathName());
 			return MCPResult(Result);
 		}
 
-		MaterialInstance->SetTextureParameterValueEditorOnly(FName(*ParameterName), Texture);
-		MaterialInstance->MarkPackageDirty();
+		MaterialInstance->Modify(true);
+		const bool bApplied = UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
+			MaterialInstance, FName(*ParameterName), Texture, Association);
+		if (!bApplied)
+		{
+			MaterialInstance->SetTextureParameterValueEditorOnly(ParameterInfo, Texture);
+			UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
+		}
+		Result->SetBoolField(TEXT("declaredByParent"), bApplied);
+
+		Result->SetBoolField(TEXT("saved"), SaveAssetPackage(MaterialInstance));
+		UTexture* ReadBack = nullptr;
+		if (MaterialInstance->GetTextureParameterValue(ParameterInfo, ReadBack) && ReadBack)
+		{
+			Result->SetStringField(TEXT("readBack"), ReadBack->GetPathName());
+		}
 
 		MCPSetUpdated(Result);
 		if (bHadPrev && PrevTexture)
@@ -1582,7 +1908,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 	}
 	else
 	{
-		return MCPError(FString::Printf(TEXT("Unknown parameterType '%s'. Use 'scalar', 'vector', or 'texture'."), *ParameterType));
+		return MCPError(FString::Printf(TEXT("Unknown parameterType '%s'. Use 'scalar', 'vector' (alias 'color'), or 'texture'."), *ParameterType));
 	}
 }
 
@@ -1745,15 +2071,15 @@ TSharedPtr<FJsonValue> FMaterialHandlers::BatchSetInstances(const TSharedPtr<FJs
 					double V = 0; (*PObj)->TryGetNumberField(TEXT("value"), V);
 					MIC->SetScalarParameterValueEditorOnly(FName(*PName), (float)V); ++ParamsSet;
 				}
-				else if (PType == TEXT("vector") || PType == TEXT("color"))
+				else if (PType == TEXT("vector") || PType == TEXT("color") || PType == TEXT("colour"))
 				{
-					const TSharedPtr<FJsonObject>* CObj = nullptr;
-					if ((*PObj)->TryGetObjectField(TEXT("value"), CObj) && *CObj)
+					// Same colour shapes the single-instance path accepts (#952),
+					// so a batch is never fussier about the payload than one call.
+					FLinearColor Color;
+					FString SourceField;
+					if (TryParseMaterialColorParam(*PObj, Color, SourceField))
 					{
-						double R=0,G=0,B=0,A=1;
-						(*CObj)->TryGetNumberField(TEXT("r"), R); (*CObj)->TryGetNumberField(TEXT("g"), G);
-						(*CObj)->TryGetNumberField(TEXT("b"), B); (*CObj)->TryGetNumberField(TEXT("a"), A);
-						MIC->SetVectorParameterValueEditorOnly(FName(*PName), FLinearColor((float)R,(float)G,(float)B,(float)A)); ++ParamsSet;
+						MIC->SetVectorParameterValueEditorOnly(FName(*PName), Color); ++ParamsSet;
 					}
 				}
 				else if (PType == TEXT("texture"))
@@ -1958,12 +2284,22 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetExpressionValue(const TSharedPtr<FJ
 	// Handle UMaterialExpressionConstant2Vector
 	else if (UMaterialExpressionConstant2Vector* Const2Expr = Cast<UMaterialExpressionConstant2Vector>(Expression))
 	{
-		double R = 0.0, G = 0.0;
-		if (Params->TryGetNumberField(TEXT("r"), R)) { Const2Expr->R = static_cast<float>(R); bValueSet = true; }
-		if (Params->TryGetNumberField(TEXT("g"), G)) { Const2Expr->G = static_cast<float>(G); bValueSet = true; }
-
-		if (bValueSet)
+		// #979: this branch used to read only top-level lowercase `r`/`g`, which
+		// the tool schema does not declare, so a Constant2Vector had no reachable
+		// write path at all while its 3- and 4-component siblings took a `value`
+		// object. All three now share one reader, and `{x,y}` works as documented.
+		FLinearColor Components;
+		FString SourceField;
+		if (TryParseMaterialColorParam(Params, Components, SourceField, /*bAllowTopLevelComponents*/ true))
 		{
+			Const2Expr->R = Components.R;
+			Const2Expr->G = Components.G;
+			bValueSet = true;
+
+			TSharedPtr<FJsonObject> ValueResult = MakeShared<FJsonObject>();
+			ValueResult->SetNumberField(TEXT("r"), Const2Expr->R);
+			ValueResult->SetNumberField(TEXT("g"), Const2Expr->G);
+			Result->SetObjectField(TEXT("value"), ValueResult);
 			Result->SetNumberField(TEXT("r"), Const2Expr->R);
 			Result->SetNumberField(TEXT("g"), Const2Expr->G);
 		}
@@ -1971,81 +2307,27 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetExpressionValue(const TSharedPtr<FJ
 	// Handle UMaterialExpressionConstant3Vector - has FLinearColor Constant
 	else if (UMaterialExpressionConstant3Vector* Const3Expr = Cast<UMaterialExpressionConstant3Vector>(Expression))
 	{
-		// #444: accept {r,g,b,a} or {R,G,B,A} or {x,y,z,w} in value object,
-		// or top-level r/g/b/a/x/y/z/w fields.
-		auto ReadColor = [](const TSharedPtr<FJsonObject>& Obj, FLinearColor& Out) -> bool
-		{
-			double R = 0, G = 0, B = 0, A = 1; bool bAny = false;
-			auto Pick = [&](const TCHAR* L, const TCHAR* U, const TCHAR* Alt, double& Slot)
-			{
-				double V; if (Obj->TryGetNumberField(L, V) || Obj->TryGetNumberField(U, V) || Obj->TryGetNumberField(Alt, V)) { Slot = V; bAny = true; }
-			};
-			Pick(TEXT("r"), TEXT("R"), TEXT("x"), R);
-			Pick(TEXT("g"), TEXT("G"), TEXT("y"), G);
-			Pick(TEXT("b"), TEXT("B"), TEXT("z"), B);
-			Pick(TEXT("a"), TEXT("A"), TEXT("w"), A);
-			Out = FLinearColor((float)R, (float)G, (float)B, (float)A);
-			return bAny;
-		};
-		const TSharedPtr<FJsonObject>* ColorObj = nullptr;
-		FLinearColor Color = Const3Expr->Constant;
-		if (Params->TryGetObjectField(TEXT("value"), ColorObj) && *ColorObj && ReadColor(*ColorObj, Color))
+		// #444/#979: accept {r,g,b,a}, {R,G,B,A} or {x,y,z,w} under `value` or
+		// `color`, an array, UE struct text, or the components at the top level.
+		FLinearColor Color;
+		FString SourceField;
+		if (TryParseMaterialColorParam(Params, Color, SourceField, /*bAllowTopLevelComponents*/ true))
 		{
 			Const3Expr->Constant = Color;
 			bValueSet = true;
-		}
-		else if (ReadColor(Params, Color))
-		{
-			Const3Expr->Constant = Color;
-			bValueSet = true;
-		}
-		if (bValueSet)
-		{
-			TSharedPtr<FJsonObject> ColorResult = MakeShared<FJsonObject>();
-			ColorResult->SetNumberField(TEXT("r"), Const3Expr->Constant.R);
-			ColorResult->SetNumberField(TEXT("g"), Const3Expr->Constant.G);
-			ColorResult->SetNumberField(TEXT("b"), Const3Expr->Constant.B);
-			ColorResult->SetNumberField(TEXT("a"), Const3Expr->Constant.A);
-			Result->SetObjectField(TEXT("value"), ColorResult);
+			Result->SetObjectField(TEXT("value"), LinearColorToJson(Const3Expr->Constant));
 		}
 	}
 	// Handle UMaterialExpressionConstant4Vector
 	else if (UMaterialExpressionConstant4Vector* Const4Expr = Cast<UMaterialExpressionConstant4Vector>(Expression))
 	{
-		auto ReadColor4 = [](const TSharedPtr<FJsonObject>& Obj, FLinearColor& Out) -> bool
-		{
-			double R = 0, G = 0, B = 0, A = 1; bool bAny = false;
-			auto Pick = [&](const TCHAR* L, const TCHAR* U, const TCHAR* Alt, double& Slot)
-			{
-				double V; if (Obj->TryGetNumberField(L, V) || Obj->TryGetNumberField(U, V) || Obj->TryGetNumberField(Alt, V)) { Slot = V; bAny = true; }
-			};
-			Pick(TEXT("r"), TEXT("R"), TEXT("x"), R);
-			Pick(TEXT("g"), TEXT("G"), TEXT("y"), G);
-			Pick(TEXT("b"), TEXT("B"), TEXT("z"), B);
-			Pick(TEXT("a"), TEXT("A"), TEXT("w"), A);
-			Out = FLinearColor((float)R, (float)G, (float)B, (float)A);
-			return bAny;
-		};
-		const TSharedPtr<FJsonObject>* ColorObj = nullptr;
-		FLinearColor Color = Const4Expr->Constant;
-		if (Params->TryGetObjectField(TEXT("value"), ColorObj) && *ColorObj && ReadColor4(*ColorObj, Color))
+		FLinearColor Color;
+		FString SourceField;
+		if (TryParseMaterialColorParam(Params, Color, SourceField, /*bAllowTopLevelComponents*/ true))
 		{
 			Const4Expr->Constant = Color;
 			bValueSet = true;
-		}
-		else if (ReadColor4(Params, Color))
-		{
-			Const4Expr->Constant = Color;
-			bValueSet = true;
-		}
-		if (bValueSet)
-		{
-			TSharedPtr<FJsonObject> ColorResult = MakeShared<FJsonObject>();
-			ColorResult->SetNumberField(TEXT("r"), Const4Expr->Constant.R);
-			ColorResult->SetNumberField(TEXT("g"), Const4Expr->Constant.G);
-			ColorResult->SetNumberField(TEXT("b"), Const4Expr->Constant.B);
-			ColorResult->SetNumberField(TEXT("a"), Const4Expr->Constant.A);
-			Result->SetObjectField(TEXT("value"), ColorResult);
+			Result->SetObjectField(TEXT("value"), LinearColorToJson(Const4Expr->Constant));
 		}
 	}
 	// Handle UMaterialExpressionScalarParameter - has float DefaultValue
@@ -2070,23 +2352,13 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetExpressionValue(const TSharedPtr<FJ
 	// Handle UMaterialExpressionVectorParameter - has FLinearColor DefaultValue
 	else if (UMaterialExpressionVectorParameter* VectorParamExpr = Cast<UMaterialExpressionVectorParameter>(Expression))
 	{
-		const TSharedPtr<FJsonObject>* ValueObj = nullptr;
-		if (Params->TryGetObjectField(TEXT("value"), ValueObj))
+		FLinearColor Color;
+		FString SourceField;
+		if (TryParseMaterialColorParam(Params, Color, SourceField, /*bAllowTopLevelComponents*/ false))
 		{
-			double R = 0.0, G = 0.0, B = 0.0, A = 1.0;
-			(*ValueObj)->TryGetNumberField(TEXT("r"), R);
-			(*ValueObj)->TryGetNumberField(TEXT("g"), G);
-			(*ValueObj)->TryGetNumberField(TEXT("b"), B);
-			(*ValueObj)->TryGetNumberField(TEXT("a"), A);
-			VectorParamExpr->DefaultValue = FLinearColor(R, G, B, A);
+			VectorParamExpr->DefaultValue = Color;
 			bValueSet = true;
-
-			TSharedPtr<FJsonObject> ColorResult = MakeShared<FJsonObject>();
-			ColorResult->SetNumberField(TEXT("r"), R);
-			ColorResult->SetNumberField(TEXT("g"), G);
-			ColorResult->SetNumberField(TEXT("b"), B);
-			ColorResult->SetNumberField(TEXT("a"), A);
-			Result->SetObjectField(TEXT("value"), ColorResult);
+			Result->SetObjectField(TEXT("value"), LinearColorToJson(VectorParamExpr->DefaultValue));
 		}
 
 		FString ParamName;
@@ -2244,9 +2516,14 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetExpressionValue(const TSharedPtr<FJ
 	}
 
 	Material->PostEditChange();
-	Material->MarkPackageDirty();
 
+	// #979: the value was written in memory and the package only marked dirty,
+	// so a caller who then asked something else to save it could be told the
+	// save failed while the write had in fact landed - two answers, neither of
+	// them the whole truth. Persist here, and report whether that worked
+	// alongside the value that was written either way.
 	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("saved"), SaveAssetPackage(Material));
 	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
 	Result->SetNumberField(TEXT("expressionIndex"), ExpressionIndex);
 	Result->SetStringField(TEXT("expressionClass"), ExpressionClass);

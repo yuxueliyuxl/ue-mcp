@@ -56,10 +56,22 @@ jobs:
         # that editor and at no other.
         #
         # The engine-dependent half of plan item 7.2 (the golden diff and the
-        # lifecycle matrix against a live editor) is NOT here and cannot be:
+        # lifecycle matrix against a live editor) is NOT here and will not be:
         # these runners are ubuntu-latest with no Unreal install, so there is
         # no editor to start and no second one to address. Everything above the
         # handler is real; only the engine behind it is stubbed.
+        #
+        # #871 settled that deliberately. The engine-dependent tier is
+        # LOCAL-ONLY by decision, not by omission awaiting a runner. It is
+        # `npm run test:smoke` plus `npm run test:live` against tests/ue_mcp,
+        # run on a machine that has an engine, before a release is cut. A
+        # hosted Unreal runner was priced against what it would buy and was
+        # not worth it: in-engine builds and live runs already happen locally,
+        # and CI cannot compile the plugin either, so the runner would gate on
+        # a build it could not itself produce.
+        #
+        # If that calculus changes, the tier to add is the existing live
+        # harness pointed at tests/ue_mcp only, and nothing here needs to move.
         run: npm run test:multi-editor
 
       - name: Audit (high+ only, production deps)

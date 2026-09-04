@@ -16,6 +16,8 @@ private:
 	static TSharedPtr<FJsonValue> ReadSequenceInfo(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddTrack(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SequenceControl(const TSharedPtr<FJsonObject>& Params);
+	// #881: move the playhead to an exact time and evaluate there.
+	static TSharedPtr<FJsonValue> ScrubSequence(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetPlaybackRange(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddSection(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetKeyframes(const TSharedPtr<FJsonObject>& Params);

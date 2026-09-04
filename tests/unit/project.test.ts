@@ -289,7 +289,6 @@ describe("ProjectContext plugin discovery across a switch", () => {
   function makeProjectWithPlugin(pluginName: string): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ue-mcp-plugin-cache-"));
     const uproject = path.join(dir, "Test.uproject");
-    // No EngineAssociation: keeps discoverPlugins off any real engine install.
     fs.writeFileSync(uproject, JSON.stringify({ FileVersion: 3 }));
     const pluginDir = path.join(dir, "Plugins", pluginName);
     fs.mkdirSync(path.join(pluginDir, "Content"), { recursive: true });
@@ -297,13 +296,19 @@ describe("ProjectContext plugin discovery across a switch", () => {
     return uproject;
   }
 
+  // A project with no EngineAssociation still resolves to an engine now (the
+  // one beside it, the one it was last opened with, or the default install), so
+  // the discovered set can carry that engine's plugins as well. What matters
+  // here is that the project's own plugins move with the loaded project.
   it("rediscovers plugins after the loaded project changes", () => {
     const ctx = new ProjectContext();
     ctx.setProject(makeProjectWithPlugin("AlphaPlugin"));
-    expect(ctx.discoverPlugins().map((p) => p.name)).toEqual(["AlphaPlugin"]);
+    expect(ctx.discoverPlugins().map((p) => p.name)).toContain("AlphaPlugin");
 
     ctx.setProject(makeProjectWithPlugin("BetaPlugin"));
-    expect(ctx.discoverPlugins().map((p) => p.name)).toEqual(["BetaPlugin"]);
+    const names = ctx.discoverPlugins().map((p) => p.name);
+    expect(names).toContain("BetaPlugin");
+    expect(names).not.toContain("AlphaPlugin");
     // The stale cache used to keep resolving the previous project's mounts.
     expect(ctx.resolvePluginPath("/AlphaPlugin/Thing")).toBeNull();
     expect(ctx.resolvePluginPath("/BetaPlugin/Thing")).not.toBeNull();

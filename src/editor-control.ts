@@ -4,7 +4,7 @@ import { spawn } from "child_process";
 import * as net from "net";
 import WebSocket from "ws";
 import { readUeMcpConfig, type ProjectContext } from "./project.js";
-import { findEngineInstall } from "./deployer.js";
+import { EngineResolutionError, selectEngine, trySelectEngine, type EngineLookup } from "./engine-root.js";
 import { invalidatePluginFreshness } from "./plugin-freshness.js";
 import {
   editorOwnsProject,
@@ -15,7 +15,7 @@ import {
   readLogState,
   type EngineState,
 } from "./engine-observer.js";
-import { isPidAlive, lockfileIsFromThisLaunch, resolveBridgeTarget } from "./editor-target.js";
+import { findLiveInstanceRecord, isPidAlive, lockfileIsFromThisLaunch, resolveBridgeTarget } from "./editor-target.js";
 import { startProgress } from "./ui/progress.js";
 import type { ProgressFn } from "./types.js";
 
@@ -51,85 +51,38 @@ function readEngineAssociation(projectPath: string): string | null {
   }
 }
 
-function findUEBuildTool(engineAssociation?: string | null, configuredPath?: string | null): string | null {
-  // UE_BUILD_TOOL_PATH is one value for the process and still wins;
-  // `editor.buildToolPath` is the per-project equivalent (#817), which matters
-  // as soon as two projects are on two engine versions.
-  const envPath = process.env.UE_BUILD_TOOL_PATH;
-  if (envPath) return envPath;
-  if (typeof configuredPath === "string" && configuredPath.trim() !== "") return configuredPath.trim();
-
-  const scriptName = IS_WINDOWS ? "Build.bat" : "Build.sh";
-
-  // Prefer the engine the project's EngineAssociation actually points at, so a
-  // 5.7 project builds with 5.7's Build tool - not whatever version happens to
-  // sort first in the fallback search below. The editor launch already respects
-  // the association (findEditorExecutable); without this the CLI build could
-  // silently compile against a different engine than the editor runs, masking
-  // API incompatibilities until the editor's own rebuild fails.
-  const associatedRoot = findEngineInstall(engineAssociation ?? null);
-  if (associatedRoot) {
-    const associatedTool = path.join(associatedRoot, "Engine", "Build", "BatchFiles", scriptName);
-    if (fs.existsSync(associatedTool)) return associatedTool;
-  }
-
-  const versions = ["5.8", "5.7", "5.6", "5.5", "5.4", "5.3"];
-
-  const searchRoots: string[] = IS_WINDOWS
-    ? [
-        "C:/Program Files/Epic Games",
-        "D:/Program Files/Epic Games",
-        "E:/Program Files/Epic Games",
-        "C:/Epic Games",
-        "D:/Epic Games",
-        "E:/Epic Games",
-      ]
-    : process.platform === "darwin"
-      ? ["/Users/Shared/Epic Games"]
-      : [
-          path.join(process.env.HOME ?? "/home", "UnrealEngine"),
-          "/opt/UnrealEngine",
-        ];
-
-  for (const basePath of searchRoots) {
-    for (const version of versions) {
-      const buildToolPath = path.join(basePath, `UE_${version}`, "Engine", "Build", "BatchFiles", scriptName);
-      if (fs.existsSync(buildToolPath)) {
-        return buildToolPath;
-      }
-    }
-  }
-
-  // Linux source builds: ~/UnrealEngine/Engine/Build/BatchFiles/Build.sh (no version subdir)
-  if (!IS_WINDOWS && process.platform !== "darwin") {
-    const home = process.env.HOME ?? "/home";
-    const sourceBuild = path.join(home, "UnrealEngine", "Engine", "Build", "BatchFiles", "Build.sh");
-    if (fs.existsSync(sourceBuild)) return sourceBuild;
-  }
-
-  return null;
+/**
+ * The engine lookup for one project: its .uproject, its association and its
+ * per-project `editor:` config, handed to the single resolver in
+ * `engine-root.ts` (#959, #961, #962, #974).
+ */
+function engineLookupFor(
+  projectPath: string | null | undefined,
+  engineAssociation?: string | null,
+  editorConfig?: { path?: string; buildToolPath?: string },
+): EngineLookup {
+  return {
+    projectPath: projectPath ?? null,
+    engineAssociation: engineAssociation ?? null,
+    configBuildToolPath: editorConfig?.buildToolPath ?? null,
+    configEditorPath: editorConfig?.path ?? null,
+  };
 }
 
 /**
- * #766/#790: the editor binary lives at a different path per platform. Only the
- * Win64 path was ever checked, which is the whole reason start_editor was
- * Windows-only - engine discovery itself (findUEBuildTool) has always worked
- * cross-platform. On macOS the launchable binary is inside the .app bundle.
+ * The editor binary this project launches, or null.
+ *
+ * The whole order lives in `engine-root.ts` now: env pins, the per-project
+ * config, the EngineAssociation (as a path, a registered GUID or a launcher
+ * version), an engine tree beside or above the project, the engine the project
+ * was last opened with, then the default install locations. The build tool goes
+ * through the same list, so the editor this launches and the engine
+ * `build_project` compiles with are the same tree by construction.
+ *
+ * #766/#790: the binary lives at a different path per platform, which is what
+ * `engineEditorBinaries` covers. On macOS the launchable one is inside the .app
+ * bundle.
  */
-function editorBinaryCandidates(engineRoot: string): string[] {
-  const binaries = path.join(engineRoot, "Engine", "Binaries");
-  if (IS_WINDOWS) {
-    return [path.join(binaries, "Win64", "UnrealEditor.exe")];
-  }
-  if (process.platform === "darwin") {
-    return [
-      path.join(binaries, "Mac", "UnrealEditor.app", "Contents", "MacOS", "UnrealEditor"),
-      path.join(binaries, "Mac", "UnrealEditor"),
-    ];
-  }
-  return [path.join(binaries, "Linux", "UnrealEditor")];
-}
-
 function findEditorExecutable(project?: ProjectContext): string | null {
   // Same rule as the build tool: the env var is the global default and wins,
   // `editor.path` is how one project names its own binary (#817).
@@ -138,22 +91,26 @@ function findEditorExecutable(project?: ProjectContext): string | null {
   const configured = project?.config.editor?.path;
   if (typeof configured === "string" && configured.trim() !== "") return configured.trim();
 
-  const associatedEngineRoot = findEngineInstall(project?.engineAssociation ?? null);
-  if (associatedEngineRoot) {
-    for (const candidate of editorBinaryCandidates(associatedEngineRoot)) {
-      if (fs.existsSync(candidate)) return candidate;
-    }
+  const lookup = engineLookupFor(project?.projectPath, project?.engineAssociation, project?.config.editor);
+  return trySelectEngine(lookup, "editor")?.editorExecutable ?? null;
+}
+
+/**
+ * Why no editor binary was found, naming every path probed.
+ *
+ * A user who is told only to set an env var cannot tell a missing install from
+ * a wrong root from a layout the resolver does not understand (#974).
+ */
+function editorExecutableFailure(project?: ProjectContext): string {
+  try {
+    selectEngine(
+      engineLookupFor(project?.projectPath, project?.engineAssociation, project?.config.editor),
+      "editor",
+    );
+  } catch (err) {
+    if (err instanceof EngineResolutionError) return err.message;
   }
-
-  const buildTool = findUEBuildTool(project?.engineAssociation ?? null, project?.config.editor?.buildToolPath);
-  if (!buildTool) return null;
-
-  const engineRoot = path.resolve(buildTool, "..", "..", "..", "..");
-  for (const candidate of editorBinaryCandidates(engineRoot)) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-
-  return null;
+  return NO_EDITOR_BINARY_MSG;
 }
 
 /**
@@ -505,10 +462,41 @@ function describeTimeline(timeline: ReadyPhase[]): string {
   return timeline.map((entry) => `${entry.phase} ${entry.atSeconds}s`).join(" -> ");
 }
 
+/** Startup-only editor settings travel in the environment, because the bridge
+ *  reads them before it is listening. Kept in one place so a second setting
+ *  cannot quietly drop the first by rebuilding the env inline. */
+function buildEditorLaunchEnv(dialogPolicy?: string, paramEcho?: boolean): NodeJS.ProcessEnv {
+  if (!dialogPolicy && !paramEcho) return process.env;
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (dialogPolicy) env.UE_MCP_DIALOG_POLICY = dialogPolicy;
+  if (paramEcho) env.UE_MCP_PARAM_ECHO = "1";
+  return env;
+}
+
 export async function startEditor(
   project: ProjectContext,
   timeoutSeconds = 300,
   onProgress?: ProgressFn,
+  opts: {
+    /**
+     * #968: `pattern=response;...`, handed to the editor as
+     * UE_MCP_DIALOG_POLICY so the plugin can answer a prompt raised during
+     * startup. The bridge is not listening yet at that point, so a policy set
+     * over the socket afterwards is always too late for the modal that stalled
+     * the launch in the first place.
+     */
+    dialogPolicy?: string;
+
+    /**
+     * Arm the bridge's parameter echo for this editor. The live tier's leak
+     * assertions, which prove a routing key never reaches an editor, can only
+     * run when the editor was LAUNCHED with it: it is read at startup, so
+     * turning it on over the socket afterwards is too late, exactly like the
+     * dialog policy above. Without it those cases skip and say why, which
+     * leaves the sharpest part of the tier unexercised by default.
+     */
+    paramEcho?: boolean;
+  } = {},
 ): Promise<{ success: boolean; message: string; state?: EngineState; timeline?: ReadyPhase[]; elapsedSeconds?: number }> {
   // Every check below is about ONE editor: the one holding this project. Know
   // which project that is before looking at anything, because without it the
@@ -551,7 +539,7 @@ export async function startEditor(
   if (!editorExe) {
     return {
       success: false,
-      message: NO_EDITOR_BINARY_MSG,
+      message: editorExecutableFailure(project),
     };
   }
 
@@ -562,6 +550,7 @@ export async function startEditor(
     const editorProcess = spawn(editorExe, [project.projectPath], {
       stdio: "ignore",
       detached: true,
+      env: buildEditorLaunchEnv(opts.dialogPolicy, opts.paramEcho),
     });
 
     editorProcess.unref();
@@ -681,25 +670,47 @@ async function requestEditorSelfQuit(port: number, host: string): Promise<boolea
 }
 
 /**
- * Stop the editor by asking it to quit ITSELF through the bridge. ue-mcp NEVER
- * issues an OS kill: `taskkill /IM UnrealEditor.exe` matches by image name and
- * would also close the user's other editors (e.g. their real project). `force`
- * is accepted for back-compat but there is deliberately no force-kill path.
- * Success is confirmed by the project's own bridge port going quiet, so it is
- * specific to this editor even when others are open.
+ * Which editor belongs to the loaded project, decided once so that every
+ * lifecycle action agrees about it.
  *
- * The port comes from this project's lockfile and nowhere else, and the process
- * it names is checked before the quit goes out (#819).
+ * #967/#970: stop_editor and request_editor_shutdown act on the same editor
+ * through different code paths, and only one of them checked ownership. The
+ * check it used compared a lockfile pid against a process, then printed the
+ * process's whole command line as evidence of a project mismatch - which, when
+ * the command line parse was broken, was the loaded project's own .uproject.
+ * Both actions now ask this one function, so they can no longer disagree.
  */
-export async function stopEditor(force = false, projectDir?: string): Promise<{ success: boolean; message: string; state?: EngineState }> {
-  void force;
+export type EditorOwnership =
+  | {
+      owned: true;
+      port: number;
+      pid: number | null;
+      /** Where the address came from, for a caller that wants to say so. */
+      source: string;
+      /** Set when the shared lockfile was stale and a live editor was found instead. */
+      healed?: string;
+    }
+  | { owned: false; message: string; state?: EngineState };
 
-  const projectPath = uprojectInDir(projectDir);
+/**
+ * The editor holding `projectPath` open, resolved from what this project
+ * published and cross-checked against the process table.
+ *
+ * A lockfile that no longer describes a live editor of this project is a stale
+ * lockfile, and it is said in those words. It is never reported as a project
+ * mismatch, and the file is never blamed while a healthy editor is still
+ * listening: the recovery is to resolve the process that actually holds the
+ * .uproject, which is what this does before it refuses anything.
+ */
+export async function resolveOwnedEditor(
+  projectDir?: string | null,
+  projectPath?: string | null,
+): Promise<EditorOwnership> {
   if (!projectDir || !projectPath) {
     return {
-      success: false,
+      owned: false,
       message:
-        "No project is loaded, so stop_editor has no editor to aim at. Use project(action='set_project') first. " +
+        "No project is loaded, so there is no editor to aim at. Use project(action='set_project') first. " +
         "A lifecycle action never falls back to whichever editor it can find.",
     };
   }
@@ -708,11 +719,11 @@ export async function stopEditor(force = false, projectDir?: string): Promise<{ 
   if (!target.ok) {
     const running = await findInteractiveEditors(projectPath);
     if (running.length === 0) {
-      return { success: false, message: `Editor is not running for this project. ${target.reason}` };
+      return { owned: false, message: `Editor is not running for this project. ${target.reason}` };
     }
     const state = await readEngineState(projectPath, { probeWindows: true });
     return {
-      success: false,
+      owned: false,
       message:
         `Editor is running (pid ${running.map((p) => p.pid).join(", ")}) but no bridge port is published for it, ` +
         `so it cannot be asked to quit cleanly. ${target.reason} ${state.summary} ` +
@@ -721,41 +732,83 @@ export async function stopEditor(force = false, projectDir?: string): Promise<{ 
     };
   }
 
+  // Plugin builds before the lockfile carried a pid leave nothing to identify
+  // the listener with, so the process table has to answer instead.
+  if (target.pid === null) {
+    if ((await findInteractiveEditors(projectPath)).length === 0) {
+      return {
+        owned: false,
+        message:
+          `The bridge lockfile at ${target.lockfilePath} records no pid (older plugin build) and no editor for this ` +
+          `project is running, so port ${target.port} cannot be shown to belong to it. Nothing was asked to quit.`,
+      };
+    }
+    return { owned: true, port: target.port, pid: null, source: target.source };
+  }
+
   // The lockfile was written by an editor that had THIS project open, but it
   // outlives a crash, and the port it names can be taken by something else
-  // afterwards. Confirm the process it points at is still that editor before
-  // sending anything a quit request (#819).
-  if (target.pid !== null) {
-    const owner = await findEditorByPid(target.pid);
-    if (!owner) {
-      return {
-        success: false,
-        message:
-          `The bridge lockfile at ${target.lockfilePath} names pid ${target.pid}, which is no longer running - ` +
-          "the editor exited without removing it. Nothing was asked to quit, because port " +
-          `${target.port} may since have been taken by an unrelated process. Delete that file if it persists.`,
-      };
-    }
-    if (owner.projectPath !== null && !editorOwnsProject(owner, projectPath)) {
-      return {
-        success: false,
-        message:
-          `The bridge lockfile at ${target.lockfilePath} names pid ${target.pid}, but that process now has ` +
-          `${owner.projectPath} open, not this project. Nothing was asked to quit. Delete that file if it persists.`,
-      };
-    }
-  } else if ((await findInteractiveEditors(projectPath)).length === 0) {
-    // Plugin builds before the lockfile carried a pid leave nothing to identify
-    // the listener with, so the process table has to answer instead.
+  // afterwards (#819). A process whose command line could not be read is not
+  // evidence against it: "might be ours" is the only honest answer there, and
+  // the lockfile already says whose it is.
+  const owner = await findEditorByPid(target.pid);
+  if (owner && (owner.projectPath === null || editorOwnsProject(owner, projectPath))) {
+    return { owned: true, port: target.port, pid: target.pid, source: target.source };
+  }
+
+  // The lockfile does not describe an editor of this project any more. Before
+  // refusing, look for the editor that does: it publishes its own address to
+  // instances/<pid>.json, which no other instance can take away (#934). Telling
+  // the user to delete a file while a healthy editor is listening would throw
+  // away the bridge's only handle on it, which is exactly what used to happen.
+  const live = await findInteractiveEditors(projectPath);
+  const record = live.length > 0 ? findLiveInstanceRecord(projectDir, (pid) => live.some((p) => p.pid === pid)) : null;
+  if (record) {
     return {
-      success: false,
-      message:
-        `The bridge lockfile at ${target.lockfilePath} records no pid (older plugin build) and no editor for this ` +
-        `project is running, so port ${target.port} cannot be shown to belong to it. Nothing was asked to quit.`,
+      owned: true,
+      port: record.port,
+      pid: record.pid,
+      source: "instance-record",
+      healed:
+        `${target.lockfilePath} names pid ${target.pid}, which is no longer the editor for this project. ` +
+        `The editor that is (pid ${record.pid}) was resolved from ${record.recordPath} instead.`,
     };
   }
 
-  const port = target.port;
+  const staleDetail = owner
+    ? `names pid ${target.pid}, which is no longer the editor for this project - that process now has ` +
+      `${owner.projectPath} open`
+    : `names pid ${target.pid}, which is no longer running`;
+  return {
+    owned: false,
+    message:
+      `Stale lockfile: ${target.lockfilePath} ${staleDetail}. No editor holding ${projectPath} open is running ` +
+      `either, so nothing was asked to quit and port ${target.port} was not dialled - it may since have been taken ` +
+      "by an unrelated process. The file is safe to delete; the next editor for this project republishes it.",
+  };
+}
+
+/**
+ * Stop the editor by asking it to quit ITSELF through the bridge. ue-mcp NEVER
+ * issues an OS kill: `taskkill /IM UnrealEditor.exe` matches by image name and
+ * would also close the user's other editors (e.g. their real project). `force`
+ * is accepted for back-compat but there is deliberately no force-kill path.
+ * Success is confirmed by the project's own bridge port going quiet, so it is
+ * specific to this editor even when others are open.
+ *
+ * The port comes from what this project published and nowhere else, and the
+ * process behind it is checked before the quit goes out (#819).
+ */
+export async function stopEditor(force = false, projectDir?: string): Promise<{ success: boolean; message: string; state?: EngineState }> {
+  void force;
+
+  const projectPath = uprojectInDir(projectDir);
+  const ownership = await resolveOwnedEditor(projectDir, projectPath);
+  if (!ownership.owned) {
+    return { success: false, message: ownership.message, ...(ownership.state ? { state: ownership.state } : {}) };
+  }
+
+  const port = ownership.port;
   const host = bridgeHost(projectDir);
   const bridgeUp = await isBridgeAvailable(host, port);
   if (!bridgeUp && (await findInteractiveEditors(projectPath)).length === 0) {
@@ -785,7 +838,12 @@ export async function stopEditor(force = false, projectDir?: string): Promise<{ 
   for (let i = 0; i < 20; i++) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     if (!(await isBridgeAvailable(host, port))) {
-      return { success: true, message: "Editor quit itself via the bridge" };
+      return {
+        success: true,
+        message: ownership.healed
+          ? `Editor quit itself via the bridge. ${ownership.healed}`
+          : "Editor quit itself via the bridge",
+      };
     }
   }
   return {
@@ -841,31 +899,60 @@ function getPlatformString(): string {
   return "Linux";
 }
 
+export interface BuildOptions {
+  onOutput?: (line: string) => void;
+  /** Development (default), DebugGame, Shipping, Test. */
+  configuration?: string;
+  /** Win64, Mac, Linux. Defaults to the host platform. */
+  platform?: string;
+  /** Pass -Clean, which makes UnrealBuildTool rebuild from scratch. */
+  clean?: boolean;
+}
+
+/**
+ * Compile a project's C++ out of process, with UnrealBuildTool.
+ *
+ * Out of process is the point: UnrealBuildTool refuses to link while an editor
+ * holds the module DLLs, so a full rebuild is exactly the case where the editor
+ * must be down, and an editor that is down cannot answer a bridge call (#958).
+ */
 export async function buildProject(
   projectPath: string,
-  opts: { onOutput?: (line: string) => void } = {},
+  opts: BuildOptions = {},
 ): Promise<BuildResult> {
   const resolvedPath = path.resolve(projectPath);
-  const buildTool = findUEBuildTool(
-    readEngineAssociation(resolvedPath),
-    readProjectEditorConfig(resolvedPath).buildToolPath,
-  );
-  if (!buildTool) {
-    return {
-      success: false,
-      exitCode: null,
-      message:
-        "Unreal Engine build tool not found. Set UE_BUILD_TOOL_PATH or install UE5.3+ to a default location.",
-    };
-  }
 
   if (!fs.existsSync(resolvedPath)) {
     return { success: false, exitCode: null, message: `Project file not found: ${resolvedPath}` };
   }
 
+  // The failure names every location probed. The old message named one env var
+  // and nothing else, so a missing tool, a wrong root and an unsupported layout
+  // all read identically (#974).
+  let buildTool: string;
+  try {
+    const engine = selectEngine(
+      engineLookupFor(
+        resolvedPath,
+        readEngineAssociation(resolvedPath),
+        readProjectEditorConfig(resolvedPath),
+      ),
+      "buildTool",
+    );
+    if (!engine.buildTool) throw new EngineResolutionError("Resolved engine names no build tool.", []);
+    buildTool = engine.buildTool;
+  } catch (err) {
+    return {
+      success: false,
+      exitCode: null,
+      message: err instanceof EngineResolutionError ? err.message : String(err),
+    };
+  }
+
   const projectName = path.basename(resolvedPath, ".uproject");
   const target = `${projectName}Editor`;
-  const platform = getPlatformString();
+  const platform = opts.platform?.trim() || getPlatformString();
+  const configuration = opts.configuration?.trim() || "Development";
 
   // #740: the quotes around the project path are SHELL syntax, not part of the
   // value. On Windows the args are joined into a single `cmd /c` string, so
@@ -874,8 +961,8 @@ export async function buildProject(
   // characters and reported "Unable to find project file" for a file that was
   // plainly there - while the same command pasted into a terminal worked,
   // because the shell removed them first.
-  const commonArgs = [target, platform, "Development"];
-  const tailArgs = ["-WaitMutex", "-FromMsBuild"];
+  const commonArgs = [target, platform, configuration];
+  const tailArgs = ["-WaitMutex", "-FromMsBuild", ...(opts.clean ? ["-Clean"] : [])];
   const windowsArgs = [...commonArgs, `-Project="${resolvedPath}"`, ...tailArgs];
   const posixArgs = [...commonArgs, `-Project=${resolvedPath}`, ...tailArgs];
 
@@ -906,7 +993,7 @@ export async function buildProject(
       invalidatePluginFreshness(resolvedPath);
       resolve(
         code === 0
-          ? { success: true, exitCode: 0, message: "Build succeeded" }
+          ? { success: true, exitCode: 0, message: `Build succeeded (${target} ${platform} ${configuration})` }
           : { success: false, exitCode: code, message: `Build failed with exit code ${code}` },
       );
     });

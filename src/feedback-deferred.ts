@@ -47,6 +47,13 @@ export interface DeferredFeedback {
   /** One line on why the entry is aimed at that tracker, shown by
    *  `feedback show`/`review` so a human can sanity-check the routing. */
   routing?: string;
+  /** Short token a human can read out of the accompanying `<id>.md` and hand
+   *  back to the agent to authorize posting these exact bytes (#991). Only
+   *  written by the elicitation fallback path; deferred entries have none. */
+  confirmToken?: string;
+  /** Why the elicitation gate could not be reached, when this entry exists
+   *  because of that rather than because the user chose defer mode. */
+  blockedReason?: string;
 }
 
 function ensureDir(): void {
@@ -67,7 +74,15 @@ function generateId(now: Date): string {
 }
 
 export function deferSubmission(
-  payload: { title: string; body: string; labels: string[]; repo?: string; routing?: string },
+  payload: {
+    title: string;
+    body: string;
+    labels: string[];
+    repo?: string;
+    routing?: string;
+    confirmToken?: string;
+    blockedReason?: string;
+  },
   project: string | null,
   author: "user" | "bot",
 ): DeferredFeedback {
@@ -84,6 +99,8 @@ export function deferSubmission(
     author,
     ...(payload.repo ? { repo: payload.repo } : {}),
     ...(payload.routing ? { routing: payload.routing } : {}),
+    ...(payload.confirmToken ? { confirmToken: payload.confirmToken } : {}),
+    ...(payload.blockedReason ? { blockedReason: payload.blockedReason } : {}),
   };
   const filePath = path.join(pendingDir(), `${id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(entry, null, 2), { mode: 0o600 });

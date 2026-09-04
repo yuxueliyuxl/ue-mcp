@@ -22,6 +22,8 @@ flowchart LR
 5. Server requests an **MCP elicitation** - your client surfaces an approval prompt with the full body, the destination tracker, an optional revisions text field, and an Accept / Decline action.
 6. Based on your choice the server submits the POST, returns a revision directive to the agent, or discards.
 
+If step 5 cannot reach a human, the report is saved to disk and a prefilled issue URL comes back instead ([jump to section](#when-the-approval-form-never-reaches-you)).
+
 ## Routing to the right tracker
 
 ue-mcp is a core server plus a set of npm-distributed plugins, each with its own repo and its own issue tracker. An agent that hits a wall in a plugin-provided surface has no way to know the surface is not core, so without routing every report lands on the core tracker and has to be re-filed by hand.
@@ -132,8 +134,22 @@ The `Tracker` field only ever offers the two repos named on the prompt (the rout
 
 The agent has no way to bypass this prompt or forge a response - the consent signal comes from your client's UI, not from a tool result.
 
-!!! info "Requires elicitation support"
-    `feedback(submit)` requires the connected MCP client to advertise the `elicitation` capability. Claude Code 2.1.76+ supports it. If your client does not, the call returns a `feedback.blocked` directive with `code: "elicitation_unsupported"` instead of posting.
+## When the approval form never reaches you
+
+Some clients answer the elicitation request themselves. The VS Code Claude Code extension auto-declines in 15 to 75 ms, before anything is rendered, and the server can tell: a decline that fast is the client, not a human who read a form. That detection has existed since [#772](https://github.com/db-lyon/ue-mcp/issues/772), but until [#991](https://github.com/db-lyon/ue-mcp/issues/991) it was a dead end, and eight detailed reports from one team died in it over a week.
+
+Three cases now take the same fallback: the client never advertised `elicitation`, the client threw on the request, or the client answered faster than a human could read. In all three, **nothing posts** and **nothing is lost**:
+
+1. The scrubbed payload is written to `~/.ue-mcp/pending-feedback/<id>.json` plus a readable `<id>.md` next to it, the same store `npx ue-mcp feedback list/show/approve/discard` already drains.
+2. A prefilled `https://github.com/<owner>/<repo>/issues/new?title=...&body=...` URL comes back in the tool result. One click lands you in the issue form with the body already written: no elicitation, no GitHub auth, no CLI.
+3. The `<id>.md` file starts with a short **confirmation token**. If you tell the agent "yes, submit it", read the token out and the agent calls `feedback(submit)` with `confirmToken` set to it. That posts the saved bytes verbatim and consumes the token.
+
+The prefilled URL is built against the encoded length, not the plain one - a body of 5,000 plain characters can encode to over 15,000 and would be silently truncated by the browser. When the body does not fit, the link carries the longest prefix that does and names the file holding the rest. When not even the title fits, no link is returned at all, because a link that loses half the report is worse than none.
+
+`confirmToken` is a human-confirmation step, not an authorization boundary: the token lives in a file, so an agent with filesystem access could read it. It is deliberately the last of the three doors, and the token never appears in the tool result. The first two doors need no trust at all.
+
+!!! info "Elicitation support"
+    The approval prompt needs the connected MCP client to advertise the `elicitation` capability; Claude Code 2.1.76+ does. Without it the call returns a `feedback.fallback` directive with `code: "elicitation_unsupported"` and the three doors above, instead of posting.
 
 ## Authorship
 

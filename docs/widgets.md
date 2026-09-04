@@ -22,6 +22,29 @@ of confusion:
   before PIE starts returns an error rather than quietly answering with an
   Editor Utility Widget.
 
+## When an authoring action says it cannot find the asset
+
+Every authoring action resolves its WidgetBlueprint fresh on every call, from
+the path you passed. Nothing is cached between calls. What used to make that
+look cached was the resolution route: it went through the AssetRegistry, and a
+registry entry can be mid-rescan, or can name an object a package reload has
+already replaced. The symptom was an intermittent "Failed to load
+WidgetBlueprint" on an asset that was plainly on disk and that
+`asset(action="search")` could see, and it got worse rather than better after
+`asset(action="force_reload")`.
+
+Resolution now asks the object hash first, revalidates whatever it gets (an
+object a reload consigned to oblivion is never handed back), and falls through
+progressively before giving up. When it does give up, the error names which of
+three things happened, because your next move differs:
+
+| Error says | What it means | What to do |
+|---|---|---|
+| `No asset exists at '<path>'` | Nothing of that name is in the AssetRegistry and no package of that name is on disk. | Fix the path. `widget(action="list")` and `asset(action="search")` show what is really there. |
+| `'<path>' exists but could not be resolved to a live WidgetBlueprint` | The asset is there and the object handle went stale. | Retry the call. If it keeps failing, `editor(action="reload_bridge")`. |
+| `'<path>' is a <Class>, not a WidgetBlueprint` | The path names a real asset of another type. | Point at the WidgetBlueprint. |
+| `WidgetBlueprint '<path>' resolved but has no WidgetTree` | The asset loaded and is broken. | Open it in the editor, or re-create it. |
+
 ## Where the runtime actions stop
 
 The runtime actions here are point-in-time: one read of the current state, or

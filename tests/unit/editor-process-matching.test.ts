@@ -1,6 +1,11 @@
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { editorOwnsProject, selectEditorsForProject, type EditorProcess } from "../../src/engine-observer.js";
+import {
+  editorOwnsProject,
+  extractProjectPath,
+  selectEditorsForProject,
+  type EditorProcess,
+} from "../../src/engine-observer.js";
 
 const GAME_A = path.resolve(path.join("C:", "work", "GameA", "GameA.uproject"));
 const GAME_B = path.resolve(path.join("C:", "work", "GameB", "GameB.uproject"));
@@ -15,6 +20,58 @@ function proc(overrides: Partial<EditorProcess> & { pid: number }): EditorProces
     ...overrides,
   };
 }
+
+describe("extractProjectPath", () => {
+  const EXE = "C:\\Program Files\\Epic Games\\UE_5.8\\Engine\\Binaries\\Win64\\UnrealEditor.exe";
+
+  it("takes the .uproject argument, not the whole unquoted command line", () => {
+    // #967/#970/#965: the old lazy regex started at the EXECUTABLE's drive
+    // letter and ran to the end, because `[^"]` matches the space between the
+    // two arguments. Every process reported a "project path" that was the exe
+    // and the project glued together, so the editor holding a project open
+    // never matched that project. stop_editor then refused to stop a healthy
+    // editor while printing that concatenation back as its evidence.
+    const parsed = extractProjectPath(`${EXE} ${GAME_A}`);
+    expect(parsed).toBe(GAME_A);
+    expect(parsed).not.toContain("UnrealEditor.exe");
+  });
+
+  it("matches the project it was launched with", () => {
+    const cmd = `${EXE} ${GAME_A}`;
+    expect(editorOwnsProject(proc({ pid: 1, projectPath: extractProjectPath(cmd) }), GAME_A)).toBe(true);
+  });
+
+  it("reads a quoted executable and a quoted project", () => {
+    expect(extractProjectPath(`"${EXE}" "${GAME_A}"`)).toBe(GAME_A);
+  });
+
+  it("reads an unquoted project path containing spaces", () => {
+    const spaced = path.resolve(path.join("C:", "My Projects", "Game A", "Game A.uproject"));
+    expect(extractProjectPath(`${EXE} ${spaced}`)).toBe(spaced);
+  });
+
+  it("reads the -Project= form a commandlet is launched with", () => {
+    const cmd = `C:\\UE\\UnrealEditor-Cmd.exe -Project="${GAME_A}" -run=WorldPartitionBuilderCommandlet`;
+    expect(extractProjectPath(cmd)).toBe(GAME_A);
+    const unquoted = `C:\\UE\\UnrealEditor-Cmd.exe -Project=${GAME_A} -run=X`;
+    expect(extractProjectPath(unquoted)).toBe(GAME_A);
+  });
+
+  it("reads a POSIX command line", () => {
+    const posix = "/opt/UE/Engine/Binaries/Linux/UnrealEditor /home/dev/Demo/Demo.uproject -log";
+    expect(extractProjectPath(posix)).toBe(path.resolve("/home/dev/Demo/Demo.uproject"));
+  });
+
+  it("reports nothing when there is no .uproject on the line", () => {
+    expect(extractProjectPath(EXE)).toBeNull();
+    expect(extractProjectPath("")).toBeNull();
+  });
+
+  it("never returns a candidate that still contains the executable", () => {
+    // The relative-argument case, where there is no drive root to walk back to.
+    expect(extractProjectPath(`${EXE} Demo.uproject`)).toBe(path.resolve("Demo.uproject"));
+  });
+});
 
 describe("editorOwnsProject", () => {
   it("matches the editor holding this .uproject open", () => {

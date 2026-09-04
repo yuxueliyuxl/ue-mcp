@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { categoryTool, type ActionSpec, type ToolDef } from "./types.js";
+import { categoryTool, takeTimeout, type ActionSpec, type ToolDef } from "./types.js";
 import { McpError, ErrorCode } from "./errors.js";
 
 /**
@@ -258,11 +258,16 @@ export function buildMicroGateway(tools: ToolDef[]): ToolDef {
         if (!spec) {
           throw new McpError(ErrorCode.UNKNOWN_ACTION, `Unknown action "${method}" on ${category}. Use tools(action="describe", category="${category}").`);
         }
-        const args = p.args && typeof p.args === "object" ? (p.args as Record<string, unknown>) : {};
+        const rawArgs = p.args && typeof p.args === "object" ? (p.args as Record<string, unknown>) : {};
+        // #989: the gateway honours the same per-call budget the category tools
+        // take, whether it arrives beside `args` or inside it.
+        const inner = takeTimeout(rawArgs);
+        const requestedTimeout = ctx.callTimeoutMs ?? inner.timeoutMs;
+        const args = inner.rest;
         if (spec.handler) return spec.handler(ctx, args);
         if (spec.bridge) {
           const mapped = spec.mapParams ? spec.mapParams(args) : args;
-          return ctx.bridge.call(spec.bridge, mapped, spec.timeoutMs);
+          return ctx.bridge.call(spec.bridge, mapped, requestedTimeout ?? spec.timeoutMs);
         }
         throw new McpError(ErrorCode.NO_HANDLER, `Action ${category}.${method} has no handler.`);
       },

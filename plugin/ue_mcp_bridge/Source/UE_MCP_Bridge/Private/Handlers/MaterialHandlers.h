@@ -76,6 +76,11 @@ private:
 	static TSharedPtr<FJsonValue> BeginMaterialTransaction(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> EndMaterialTransaction(const TSharedPtr<FJsonObject>& Params);
 
+	// #946: single-call PBR build from a texture set. Picks each TextureSample's
+	// sampler type from the texture itself, which is the step that fails
+	// silently by hand when the texture is virtual (UDIM).
+	static TSharedPtr<FJsonValue> BuildMaterial(const TSharedPtr<FJsonObject>& Params);
+
 	// #225: single-call simple material authoring + EMaterialUsage flag
 	static TSharedPtr<FJsonValue> CreateMaterialSimple(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetMaterialUsage(const TSharedPtr<FJsonObject>& Params);

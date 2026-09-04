@@ -1215,7 +1215,11 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepLevelSequence()
 	UMovieScene* MovieScene = Seq->GetMovieScene();
 	if (MovieScene)
 	{
-		AActor* HeroSphere = FindActorByLabel(World, TEXT("Demo_HeroSphere"));
+		// The demo owns this label, so a single match is expected. Taking the
+		// first of several would still be a guess, so it takes none (#983).
+		TArray<AActor*> HeroMatches;
+		MCPCollectActorsByToken(World, TEXT("Demo_HeroSphere"), EMCPActorMatch::Label, HeroMatches);
+		AActor* HeroSphere = HeroMatches.Num() == 1 ? HeroMatches[0] : nullptr;
 		if (HeroSphere)
 		{
 			FGuid BindingGuid = MovieScene->AddPossessable(

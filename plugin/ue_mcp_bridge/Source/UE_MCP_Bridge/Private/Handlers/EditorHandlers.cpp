@@ -28,6 +28,7 @@
 #include "Framework/Docking/TabManager.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "ISettingsModule.h"
+#include "Interfaces/IMainFrameModule.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/ConfigContext.h"
@@ -41,6 +42,7 @@
 #include "RenderingThread.h"
 #include "Misc/AutomationTest.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Slate/SceneViewport.h"
 #include "HAL/PlatformMemory.h"
 #include "Misc/App.h"
@@ -246,6 +248,7 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// order in BridgeServer.cpp, which is not a contract.
 	Registry.RegisterHandler(TEXT("save_dirty"), &SaveDirty);
 	Registry.RegisterHandler(TEXT("list_dirty_packages"), &ListDirtyPackages);
+	Registry.RegisterHandler(TEXT("get_world_state"), &GetWorldState);
 	Registry.RegisterHandler(TEXT("request_editor_shutdown"), &RequestEditorShutdown);
 	Registry.RegisterHandler(TEXT("list_pie_instances"), &ListPIEInstances);
 	Registry.RegisterHandler(TEXT("invoke_object_function"), &InvokeObjectFunction);
@@ -254,6 +257,8 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("read_bone_transforms"), &ReadBoneTransforms);
 	Registry.RegisterHandler(TEXT("teleport_runtime_actor"), &TeleportRuntimeActor);
 	Registry.RegisterHandler(TEXT("set_movement_mode"), &SetMovementMode);
+	Registry.RegisterHandler(TEXT("set_runtime_visibility"), &SetRuntimeVisibility);
+	Registry.RegisterHandler(TEXT("restore_runtime_visibility"), &RestoreRuntimeVisibility);
 	// #802: resolve a live instance path, and write to a live instance.
 	Registry.RegisterHandler(TEXT("find_object"), &FindLiveObjects);
 	Registry.RegisterHandler(TEXT("set_object_property"), &SetObjectProperty);
@@ -1163,7 +1168,11 @@ TSharedPtr<FJsonValue> FEditorHandlers::HitTestViewportPixel(const TSharedPtr<FJ
 		{
 			FString Label;
 			if (!V->TryGetString(Label)) continue;
-			if (AActor* A = FindActorByLabel(World, Label)) Query.AddIgnoredActor(A);
+			// #983: an ignore list is the plural case, so a label naming
+			// several actors ignores all of them.
+			TArray<AActor*> Matches;
+			MCPCollectActorsByToken(World, Label, EMCPActorMatch::LabelNameOrPath, Matches);
+			for (AActor* A : Matches) Query.AddIgnoredActor(A);
 		}
 	}
 
@@ -1190,6 +1199,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::HitTestViewportPixel(const TSharedPtr<FJ
 	AActor* HitActor = Hit.GetActor();
 	UPrimitiveComponent* HitComp = Hit.GetComponent();
 	if (HitActor) Result->SetStringField(TEXT("actorLabel"), HitActor->GetActorLabel());
+	if (HitActor) Result->SetStringField(TEXT("actorPath"), HitActor->GetPathName());
 	if (HitActor) Result->SetStringField(TEXT("actorClass"), HitActor->GetClass()->GetName());
 	if (HitComp)
 	{
@@ -1433,8 +1443,18 @@ TSharedPtr<FJsonValue> FEditorHandlers::GetBuildStatus(const TSharedPtr<FJsonObj
 }
 TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Filename;
-	if (auto Err = RequireString(Params, TEXT("filename"), Filename)) return Err;
+	// #966: capture_scene_png names this parameter `outputPath` and this action
+	// named it `filename`, for the same thing, so passing one to the other
+	// failed on a call that was otherwise correct. Both are accepted by both.
+	FString Filename = OptionalString(Params, TEXT("filename"));
+	if (Filename.IsEmpty())
+	{
+		Filename = OptionalString(Params, TEXT("outputPath"));
+	}
+	if (Filename.IsEmpty())
+	{
+		return MCPError(TEXT("Missing 'filename' (also accepted as 'outputPath'): where to write the image"));
+	}
 
 	// Ensure the filename has a proper extension
 	if (!Filename.EndsWith(TEXT(".png")) && !Filename.EndsWith(TEXT(".jpg")) && !Filename.EndsWith(TEXT(".bmp")))
@@ -1899,6 +1919,71 @@ TSharedPtr<FJsonValue> FEditorHandlers::ListDirtyPackages(const TSharedPtr<FJson
 	return MCPResult(Result);
 }
 
+// #920 / #921: one read that answers "which world is open, and what is unsaved"
+// together. level(get_current) and list_dirty_packages are two calls, so the
+// editor can change between them and neither answer proves which world the
+// other described. Both reports were filed independently by the same team,
+// which is a fair signal that two calls is genuinely not good enough for a QA
+// gate. This runs in one game-thread dispatch, so the pair is consistent.
+TSharedPtr<FJsonValue> FEditorHandlers::GetWorldState(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return MCPError(TEXT("Editor not available"));
+	}
+
+	UWorld* EditorWorld = GEditor->GetEditorWorldContext().World();
+	if (!EditorWorld)
+	{
+		// Fail closed. An empty answer here would read as "nothing is open and
+		// nothing is dirty", which is the reassuring shape of a wrong answer.
+		return MCPError(TEXT("No editor world is currently resolvable, so world state cannot be reported"));
+	}
+
+	auto Result = MCPSuccess();
+
+	UPackage* WorldPackage = EditorWorld->GetOutermost();
+	Result->SetStringField(TEXT("editorWorldName"), EditorWorld->GetName());
+	Result->SetStringField(TEXT("editorWorldPackage"), WorldPackage ? WorldPackage->GetName() : FString());
+	Result->SetBoolField(TEXT("worldPackageDirty"), WorldPackage != nullptr && WorldPackage->IsDirty());
+
+	if (ULevel* Persistent = EditorWorld->PersistentLevel)
+	{
+		if (UPackage* LevelPackage = Persistent->GetOutermost())
+		{
+			Result->SetStringField(TEXT("persistentLevelPackage"), LevelPackage->GetName());
+		}
+	}
+
+	// PIE and SIE are distinct states and a caller acting on the wrong one gets
+	// a confidently wrong result, so report both rather than one "inPIE" flag.
+	const bool bSimulating = GEditor->bIsSimulatingInEditor;
+	const bool bPlayWorld = GEditor->PlayWorld != nullptr;
+	Result->SetBoolField(TEXT("playInEditor"), bPlayWorld && !bSimulating);
+	Result->SetBoolField(TEXT("simulateInEditor"), bSimulating);
+	Result->SetStringField(TEXT("mode"), bSimulating ? TEXT("simulate") : (bPlayWorld ? TEXT("play") : TEXT("editor")));
+
+	const FDirtyEditorPackages Dirty = CollectDirtyEditorPackages();
+	TArray<FString> All;
+	All.Reserve(Dirty.Content.Num() + Dirty.Maps.Num());
+	All.Append(Dirty.Content);
+	All.Append(Dirty.Maps);
+	All.Sort();
+
+	TArray<TSharedPtr<FJsonValue>> DirtyJson;
+	DirtyJson.Reserve(All.Num());
+	for (const FString& PackageName : All)
+	{
+		DirtyJson.Add(MakeShared<FJsonValueString>(PackageName));
+	}
+	Result->SetArrayField(TEXT("dirtyPackages"), DirtyJson);
+	Result->SetNumberField(TEXT("dirtyPackageCount"), All.Num());
+	Result->SetNumberField(TEXT("dirtyContentCount"), Dirty.Content.Num());
+	Result->SetNumberField(TEXT("dirtyMapCount"), Dirty.Maps.Num());
+
+	return MCPResult(Result);
+}
+
 TSharedPtr<FJsonValue> FEditorHandlers::RequestEditorShutdown(const TSharedPtr<FJsonObject>& Params)
 {
 	if (!GEditor)
@@ -1956,7 +2041,8 @@ TSharedPtr<FJsonValue> FEditorHandlers::RequestEditorShutdown(const TSharedPtr<F
 			{
 				return true;
 			}
-			UKismetSystemLibrary::QuitEditor();
+			IMainFrameModule& MainFrameModule = FModuleManager::LoadModuleChecked<IMainFrameModule>(TEXT("MainFrame"));
+			MainFrameModule.RequestCloseEditor();
 			return false;
 		}),
 		1.0f);
@@ -1969,15 +2055,14 @@ TSharedPtr<FJsonValue> FEditorHandlers::RequestEditorShutdown(const TSharedPtr<F
 TSharedPtr<FJsonValue> FEditorHandlers::FocusViewportOnActor(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* TargetActor = FindActorByLabel(World, ActorLabel);
-	if (!TargetActor)
-	{
-		return MCPError(FString::Printf(TEXT("Actor '%s' not found"), *ActorLabel));
-	}
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* TargetActor = MCPResolveActor(World, Params, ActorErr);
+	if (!TargetActor) return ActorErr;
+	ActorLabel = TargetActor->GetActorLabel();
 
 	// Get the viewport client
 	FLevelEditorViewportClient* ViewportClient = GCurrentLevelEditingViewportClient;
@@ -2020,6 +2105,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::FocusViewportOnActor(const TSharedPtr<FJ
 	auto Result = MCPSuccess();
 	Result->SetObjectField(TEXT("viewLocation"), LocObj);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), TargetActor->GetPathName());
 	return MCPResult(Result);
 }
 TSharedPtr<FJsonValue> FEditorHandlers::CreateNewLevel(const TSharedPtr<FJsonObject>& Params)
@@ -2450,8 +2536,18 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScenePng(const TSharedPtr<FJsonOb
 	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
 	if (!World) return MCPError(FString::Printf(TEXT("World not available for scope '%s'"), *WorldScope));
 
-	FString OutputPath;
-	if (auto Err = RequireString(Params, TEXT("outputPath"), OutputPath)) return Err;
+	// #966: capture_screenshot names this parameter `filename` and this action
+	// named it `outputPath`, for the same thing, so passing one to the other
+	// failed on a call that was otherwise correct. Both are accepted by both.
+	FString OutputPath = OptionalString(Params, TEXT("outputPath"));
+	if (OutputPath.IsEmpty())
+	{
+		OutputPath = OptionalString(Params, TEXT("filename"));
+	}
+	if (OutputPath.IsEmpty())
+	{
+		return MCPError(TEXT("Missing 'outputPath' (also accepted as 'filename'): where to write the PNG"));
+	}
 
 	// Resolution
 	int32 Width = OptionalInt(Params, TEXT("width"), 1280);
@@ -2467,10 +2563,18 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScenePng(const TSharedPtr<FJsonOb
 	// #599: focusActorLabel frames the capture on a specific actor by computing
 	// a camera position from the actor's bounds and looking at its center.
 	const FString FocusLabel = OptionalString(Params, TEXT("focusActorLabel"));
-	if (!FocusLabel.IsEmpty())
+	const FString FocusPath = OptionalString(Params, TEXT("focusActorPath"));
+	if (!FocusLabel.IsEmpty() || !FocusPath.IsEmpty())
 	{
-		AActor* Focus = FindActorByLabelNameOrPath(World, FocusLabel);
-		if (!Focus) return MCPError(FString::Printf(TEXT("focusActorLabel not found: %s"), *FocusLabel));
+		// #983: framing on the wrong copy of a duplicated label is a capture
+		// that quietly shows somewhere else entirely.
+		FMCPActorSelector FocusSel;
+		FocusSel.LabelKey = TEXT("focusActorLabel");
+		FocusSel.PathKey = TEXT("focusActorPath");
+		FocusSel.Match = EMCPActorMatch::LabelNameOrPath;
+		TSharedPtr<FJsonValue> FocusErr;
+		AActor* Focus = MCPResolveActor(World, Params, FocusErr, FocusSel);
+		if (!Focus) return FocusErr;
 		FVector Origin, Extent;
 		Focus->GetActorBounds(false, Origin, Extent);
 		const double Radius = FMath::Max(Extent.Size(), 50.0);
@@ -2483,27 +2587,69 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScenePng(const TSharedPtr<FJsonOb
 		Rotation = (Origin - Location).Rotation();
 	}
 
-	// Find or spawn the reusable capture actor.
+	// #966: the capture actor used to be spawned once and LEFT IN THE LEVEL.
+	// It is a level actor, so it was saved into the map and committed to source
+	// control as though somebody had authored it, and list_dirty_packages
+	// reported nothing while it sat there, so the usual "did I change
+	// anything" check missed it entirely. A capture must leave the level
+	// exactly as it found it.
+	//
+	// Two halves. First, sweep any debris earlier builds left behind, so a
+	// project that already has one is cleaned by the next capture rather than
+	// by hand.
 	static const FString CaptureLabel = TEXT("__ClaudeSceneCapture");
-	ASceneCapture2D* CaptureActor = nullptr;
-	for (TActorIterator<ASceneCapture2D> It(World); It; ++It)
+	int32 RemovedStrayCaptures = 0;
 	{
-		if (It->GetActorLabel() == CaptureLabel)
+		TArray<ASceneCapture2D*> Strays;
+		for (TActorIterator<ASceneCapture2D> It(World); It; ++It)
 		{
-			CaptureActor = *It;
-			break;
+			if (It->GetActorLabel() == CaptureLabel)
+			{
+				Strays.Add(*It);
+			}
+		}
+		for (ASceneCapture2D* Stray : Strays)
+		{
+			// These ones ARE in the map, so their removal is a real edit and
+			// goes through Modify(): the level has to become dirty, or the
+			// debris comes straight back on the next load.
+			if (IsValid(Stray) && World->DestroyActor(Stray))
+			{
+				++RemovedStrayCaptures;
+			}
 		}
 	}
-	if (!CaptureActor)
+
+	// Second, this capture's own actor: transient, outside the scene outliner,
+	// in no actor package of its own, and destroyed on every exit from here.
+	// The transient flag alone is not enough, because the debris that prompted
+	// this was visible in the outliner and in the map's actor list either way.
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.ObjectFlags |= RF_Transient;
+#if WITH_EDITOR
+	SpawnParams.bTemporaryEditorActor = true;
+	SpawnParams.bHideFromSceneOutliner = true;
+	SpawnParams.bCreateActorPackage = false;
+#endif
+	ASceneCapture2D* CaptureActor = World->SpawnActor<ASceneCapture2D>(ASceneCapture2D::StaticClass(), Location, Rotation, SpawnParams);
+	if (!CaptureActor) return MCPError(TEXT("Failed to spawn SceneCapture2D actor"));
+	CaptureActor->SetActorHiddenInGame(true);
+
+	ON_SCOPE_EXIT
 	{
-		FActorSpawnParameters SpawnParams;
-		SpawnParams.ObjectFlags |= RF_Transient;
-		CaptureActor = World->SpawnActor<ASceneCapture2D>(ASceneCapture2D::StaticClass(), Location, Rotation, SpawnParams);
-		if (!CaptureActor) return MCPError(TEXT("Failed to spawn SceneCapture2D actor"));
-		CaptureActor->SetActorLabel(CaptureLabel);
-		CaptureActor->SetActorHiddenInGame(true);
-	}
-	CaptureActor->SetActorLocationAndRotation(Location, Rotation);
+		if (IsValid(CaptureActor))
+		{
+			// Drop the render target first: the component holds the only
+			// reference keeping it alive past this call.
+			if (USceneCaptureComponent2D* Dying = CaptureActor->GetCaptureComponent2D())
+			{
+				Dying->TextureTarget = nullptr;
+			}
+			// bShouldModifyLevel=false: this actor was never part of the map,
+			// so removing it is not an edit and must not dirty the package.
+			World->DestroyActor(CaptureActor, /*bNetForce*/ false, /*bShouldModifyLevel*/ false);
+		}
+	};
 
 	USceneCaptureComponent2D* Comp = CaptureActor->GetCaptureComponent2D();
 	if (!Comp) return MCPError(TEXT("SceneCapture2D has no capture component"));
@@ -2557,7 +2703,13 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScenePng(const TSharedPtr<FJsonOb
 	Result->SetNumberField(TEXT("width"), Width);
 	Result->SetNumberField(TEXT("height"), Height);
 	Result->SetNumberField(TEXT("sizeBytes"), (double)Size);
-	Result->SetStringField(TEXT("actorLabel"), CaptureLabel);
+	// The capture actor is gone by the time this reaches the caller, so say so
+	// rather than naming an actor they could go and look for.
+	Result->SetBoolField(TEXT("captureActorRemoved"), true);
+	if (RemovedStrayCaptures > 0)
+	{
+		Result->SetNumberField(TEXT("strayCaptureActorsRemoved"), RemovedStrayCaptures);
+	}
 	return MCPResult(Result);
 }
 
@@ -2625,12 +2777,27 @@ TSharedPtr<FJsonValue> FEditorHandlers::ListFunctionLibraries(const TSharedPtr<F
 // Headlessly run registered Automation tests whose name matches a filter and
 // report pass/fail + errors. Uses FAutomationTestFramework's synchronous
 // StartTestByName/StopTest, which fully runs non-latent tests. Latent tests
-// (that enqueue cross-frame commands) have their queued commands flushed on a
-// best-effort tick loop with a timeout.
+// (that enqueue cross-frame commands) get a bounded drain, and one that has not
+// finished when the budget runs out is abandoned and reported, never stopped
+// mid-queue.
+//
+// #993: StopTest asserts on LatentCommands.IsEmpty() inside InternalStopTest,
+// and this handler used to call it unconditionally after a drain loop that gave
+// up after a fixed iteration count. A CQTest test that starts multi-client PIE
+// still had commands queued at that point, so the assert fired and took the
+// editor down: the caller saw a WebSocket close 1006, not a test result. A
+// handler must never take the editor down.
 TSharedPtr<FJsonValue> FEditorHandlers::RunAutomationTests(const TSharedPtr<FJsonObject>& Params)
 {
 	const FString NameFilter = OptionalString(Params, TEXT("filter"));
 	const int32 MaxTests = OptionalInt(Params, TEXT("maxTests"), 50);
+	// How long one test's latent queue may take. The handler occupies the game
+	// thread for its whole run, so this is deliberately small by default: a
+	// latent command that needs real frames (PIE, anything waiting on a world
+	// tick) cannot make progress from in here however long it is given, and
+	// waiting longer only holds the editor still for longer.
+	const double LatentBudgetSeconds = FMath::Clamp(
+		OptionalNumber(Params, TEXT("latentTimeoutSeconds"), 5.0), 0.0, 120.0);
 
 	// #765: this handler runs tests SYNCHRONOUSLY via StartTestByName inside a
 	// single tick, so it never depended on the interactive-frame-rate gate that
@@ -2663,7 +2830,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunAutomationTests(const TSharedPtr<FJso
 	Framework.GetValidTestNames(AllTests);
 
 	TArray<TSharedPtr<FJsonValue>> Results;
-	int32 Ran = 0, Passed = 0, Failed = 0;
+	int32 Ran = 0, Passed = 0, Failed = 0, Abandoned = 0;
 	for (const FAutomationTestInfo& Info : AllTests)
 	{
 		const FString TestName = Info.GetTestName();
@@ -2677,21 +2844,57 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunAutomationTests(const TSharedPtr<FJso
 
 		Framework.StartTestByName(TestName, /*RoleIndex*/ 0);
 
-		// Flush latent commands (best effort, bounded) so latent tests finish.
-		int32 Guard = 0;
-		while (!Framework.ExecuteLatentCommands() && Guard++ < 1000)
+		// Drain the latent queue, bounded by wall clock rather than by a fixed
+		// iteration count. The old bound was 1000 iterations of a zero-length
+		// sleep, which elapses in no time at all and gave a command that polls
+		// for a condition no real chance to reach one. Network commands are
+		// pumped alongside, because the framework's own per-frame path does and
+		// a latent queue behind an undelivered network command never empties.
+		const double DrainStartedAt = FPlatformTime::Seconds();
+		while (!Framework.ExecuteLatentCommands()
+			&& (FPlatformTime::Seconds() - DrainStartedAt) < LatentBudgetSeconds)
 		{
-			FPlatformProcess::Sleep(0.0f);
+			Framework.ExecuteNetworkCommands();
+			FPlatformProcess::Sleep(0.001f);
+		}
+
+		// #993: StopTest asserts that the latent queue is empty. Anything still
+		// queued here needs frames this handler cannot give it, because the
+		// handler owns the game thread for its whole run and the engine loop
+		// only advances once it returns. Clear the queue and record the test as
+		// abandoned; calling StopTest with commands outstanding is what took
+		// the editor down.
+		const bool bAbandoned = !Framework.IsLatentCommandQueueEmpty();
+		if (bAbandoned)
+		{
+			Framework.DequeueAllCommands();
 		}
 
 		FAutomationTestExecutionInfo ExecInfo;
-		const bool bPassed = Framework.StopTest(ExecInfo);
+		const bool bStopReportedPass = Framework.StopTest(ExecInfo);
+		const bool bPassed = bStopReportedPass && !bAbandoned;
 		++Ran;
-		if (bPassed) ++Passed; else ++Failed;
+		if (bAbandoned) ++Abandoned;
+		else if (bPassed) ++Passed;
+		else ++Failed;
+
+		// An abandoned test may have left PIE running, and leaving it up would
+		// silently change what every later call in this session sees.
+		if (bAbandoned && GEditor && (GEditor->PlayWorld != nullptr || GEditor->bIsSimulatingInEditor))
+		{
+			GEditor->RequestEndPlayMap();
+		}
 
 		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 		R->SetStringField(TEXT("test"), DisplayName.IsEmpty() ? TestName : DisplayName);
 		R->SetBoolField(TEXT("passed"), bPassed);
+		R->SetBoolField(TEXT("abandoned"), bAbandoned);
+		if (bAbandoned)
+		{
+			R->SetStringField(TEXT("abandonedReason"), FString::Printf(
+				TEXT("Latent commands were still queued after %.1fs. They need engine frames, which cannot happen while this handler holds the game thread, so the test was abandoned rather than stopped mid-queue (stopping mid-queue asserts and terminates the editor). Run this one from the editor's Automation window, or with -ExecCmds=\"Automation RunTests %s\" at launch."),
+				LatentBudgetSeconds, *TestName));
+		}
 		R->SetNumberField(TEXT("errors"), ExecInfo.GetErrorTotal());
 		R->SetNumberField(TEXT("warnings"), ExecInfo.GetWarningTotal());
 		if (ExecInfo.GetErrorTotal() > 0)
@@ -2715,6 +2918,14 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunAutomationTests(const TSharedPtr<FJso
 	Result->SetNumberField(TEXT("ran"), Ran);
 	Result->SetNumberField(TEXT("passed"), Passed);
 	Result->SetNumberField(TEXT("failed"), Failed);
+	Result->SetNumberField(TEXT("abandoned"), Abandoned);
+	Result->SetNumberField(TEXT("latentTimeoutSeconds"), LatentBudgetSeconds);
+	if (Abandoned > 0)
+	{
+		Result->SetStringField(TEXT("warning"), FString::Printf(
+			TEXT("%d test(s) were abandoned with latent commands still queued. They need engine frames, and this handler holds the game thread for its whole run, so it cannot supply any. Raising latentTimeoutSeconds helps a test that only polls; a test that starts PIE needs the editor's Automation window or -ExecCmds=\"Automation RunTests <name>\" at launch. Nothing was stopped mid-queue, which is what used to terminate the editor (#993)."),
+			Abandoned));
+	}
 	Result->SetArrayField(TEXT("results"), Results);
 	return MCPResult(Result);
 }

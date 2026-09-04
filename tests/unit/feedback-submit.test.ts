@@ -62,9 +62,15 @@ let stateRoot: string;
 beforeEach(() => {
   stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ue-mcp-feedback-state-"));
   process.env.UE_MCP_USER_STATE = path.join(stateRoot, "state.json");
+  // #991: the unreachable-gate paths now WRITE the report to the pending
+  // store. Without this redirect a unit run would drop files in the
+  // developer's real ~/.ue-mcp/pending-feedback and they would show up in
+  // `npx ue-mcp feedback list` forever after.
+  process.env.UE_MCP_PENDING_DIR = path.join(stateRoot, "pending");
 });
 afterEach(() => {
   delete process.env.UE_MCP_USER_STATE;
+  delete process.env.UE_MCP_PENDING_DIR;
   fs.rmSync(stateRoot, { recursive: true, force: true });
 });
 
@@ -92,8 +98,14 @@ describe("feedback(submit) elicitation gate", () => {
     });
     expect(isDirectiveResponse(r)).toBe(true);
     if (!isDirectiveResponse(r)) return;
-    expect(r.machine?.kind).toBe("feedback.blocked");
+    // #991: still refuses to post, but no longer a dead end. The report is
+    // saved and a prefilled URL comes back.
+    expect(r.machine?.kind).toBe("feedback.fallback");
     expect((r.result as { code?: string }).code).toBe("elicitation_unsupported");
+    const res = r.result as { saved_report: string; manual_url: string | null; pending_id: string };
+    expect(fs.existsSync(res.saved_report)).toBe(true);
+    expect(res.manual_url).toMatch(/^https:\/\/github\.com\/db-lyon\/ue-mcp\/issues\/new\?/);
+    expect(res.pending_id).toBeTruthy();
     expect(mockSubmitFeedback).not.toHaveBeenCalled();
   });
 
@@ -185,7 +197,7 @@ describe("feedback(submit) elicitation gate", () => {
     });
     expect(isDirectiveResponse(r)).toBe(true);
     if (!isDirectiveResponse(r)) return;
-    expect(r.machine?.kind).toBe("feedback.blocked");
+    expect(r.machine?.kind).toBe("feedback.fallback");
     expect((r.result as { code?: string }).code).toBe("form_not_presented");
     // The agent must be told it MAY retry, unlike a real decline.
     expect(r.machine?.requiredActions).toContain("ask_user_in_text");

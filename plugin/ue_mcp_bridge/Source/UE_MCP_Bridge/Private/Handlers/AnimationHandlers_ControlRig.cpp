@@ -37,7 +37,7 @@ namespace
 		}
 	}
 
-	TSharedPtr<FJsonObject> PinToJson(URigVMPin* Pin, bool bIncludeDefaults, int32 Depth)
+	TSharedPtr<FJsonObject> ControlRigPinToJson(URigVMPin* Pin, bool bIncludeDefaults, int32 Depth)
 	{
 		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
 		Obj->SetStringField(TEXT("name"), Pin->GetName());
@@ -64,7 +64,7 @@ namespace
 			TArray<TSharedPtr<FJsonValue>> SubArray;
 			for (URigVMPin* Sub : SubPins)
 			{
-				if (Sub) SubArray.Add(MakeShared<FJsonValueObject>(PinToJson(Sub, bIncludeDefaults, Depth + 1)));
+				if (Sub) SubArray.Add(MakeShared<FJsonValueObject>(ControlRigPinToJson(Sub, bIncludeDefaults, Depth + 1)));
 			}
 			Obj->SetArrayField(TEXT("subPins"), SubArray);
 		}
@@ -156,7 +156,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadControlRigGraph(const TSharedPtr<
 				TArray<TSharedPtr<FJsonValue>> PinsArray;
 				for (URigVMPin* Pin : Node->GetPins())
 				{
-					if (Pin) PinsArray.Add(MakeShared<FJsonValueObject>(PinToJson(Pin, bIncludeDefaults, 0)));
+					if (Pin) PinsArray.Add(MakeShared<FJsonValueObject>(ControlRigPinToJson(Pin, bIncludeDefaults, 0)));
 				}
 				NodeObj->SetArrayField(TEXT("pins"), PinsArray);
 			}

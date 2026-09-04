@@ -79,8 +79,17 @@ export interface ActionClassification {
 
 function firstSegmentVerb(action: string): string {
   // "create_data_asset" -> "create"; "bulk_rename" -> "bulk".
-  const seg = action.split(/[._]/, 1)[0] ?? action;
-  return seg.toLowerCase();
+  const segments = action.toLowerCase().split(/[._]/);
+  const first = segments[0] ?? action.toLowerCase();
+  // "bulk" and "batch" describe the SHAPE of a call, not what it does, and
+  // both are in MUTATE_PREFIXES because every batch action there has been so
+  // far was a write. `bulk_read_properties` is not, and taking an asset lock
+  // for a read would block a human's checkout on a call that only looks. When
+  // the shape word is followed by a read verb, that verb is the answer.
+  if ((first === "bulk" || first === "batch") && segments[1] && READ_PREFIXES.includes(segments[1])) {
+    return segments[1];
+  }
+  return first;
 }
 
 function looksLikeAssetPath(v: unknown): v is string {

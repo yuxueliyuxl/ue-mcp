@@ -40,6 +40,7 @@ const PER_SESSION: Record<string, string> = {
   "editor-target.ts": "Resolves one project's bridge from its own port lockfile.",
   "editor-flag.ts": "Turns --editor into the project a one-shot command acts on.",
   "engine-observer.ts": "Observes the editor process that has one project open.",
+  "engine-root.ts": "Resolves the engine one project builds, launches and reads source from, out of that project's own layout and config.",
   "project.ts": "One ProjectContext per session, with that project's config cascade.",
   "project-switch.ts": "Moves one session's project and socket together.",
   "port.ts": "Derives a bridge port from one project's root path.",
@@ -54,9 +55,11 @@ const PER_SESSION: Record<string, string> = {
   "hook-session.ts": "Resolves which project a hook invocation is about.",
   "hook-installer.ts": "Installs the hook for one project.",
   "workaround-tracker.ts": "The workaround stack is partitioned per session, because it is posted publicly.",
+  "python-gate.ts": "Remembers which candidate actions a session ruled out, partitioned the same way the workaround stack is.",
   "privacy-scrub.ts": "Redacts the other registered roots and session names.",
   "feedback-routing.ts": "Routes using the addressed session's plugin set.",
   "feedback-deferred.ts": "Deferred entries record the editor they came from and are filtered by it.",
+  "feedback-fallback.ts": "Writes the saved report into the same per-editor deferred store, tagged with the submitting project.",
   "user-state.ts": "Keyed by absolute project root: installed hooks, and the per-project feedback mode.",
   "mcp-client-config.ts": "Writes the project positionals a server is started with.",
   "doctor.ts": "Reports every project the configured invocation names.",
@@ -93,6 +96,7 @@ const PER_SESSION: Record<string, string> = {
 /** No editor concept, or one deliberate answer for the whole process. */
 const SESSION_INDEPENDENT: Record<string, string> = {
   "action-class.ts": "A static classification of the action surface; the same answer in every editor.",
+  "bridge-timeouts.ts": "The call budget table and its resolution; the same answer for every editor.",
   "asset-path.ts": "Pure Unreal path handling.",
   "auth.ts": "GitHub identity for feedback authorship: per user, not per project.",
   "auth-cli.ts": "Runs that per-user device flow.",

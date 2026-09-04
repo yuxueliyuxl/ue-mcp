@@ -149,6 +149,23 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ScanAnimationTracks(const TSharedPtr<
 	const FString Directory = OptionalString(Params, TEXT("directory"), TEXT(""));
 	const FString SkeletonFilter = OptionalString(Params, TEXT("skeletonPath"));
 
+	// #890: the filter used to be compared as a string against
+	// USkeleton::GetPathName(), which is always the object path form, so a
+	// package path matched zero sequences and the scan still answered success.
+	// A caller could not tell that from a project that genuinely has no
+	// sequences on that skeleton. Resolve the filter to the skeleton itself and
+	// compare objects, and refuse a filter that names no skeleton at all rather
+	// than reporting it as a legitimate empty result.
+	USkeleton* FilterSkeleton = nullptr;
+	if (!SkeletonFilter.IsEmpty())
+	{
+		FilterSkeleton = LoadAssetByPath<USkeleton>(SkeletonFilter);
+		if (!FilterSkeleton)
+		{
+			return MCPAssetLoadError(SkeletonFilter, TEXT("Skeleton"));
+		}
+	}
+
 	TArray<FString> AssetPaths;
 	const TArray<TSharedPtr<FJsonValue>>* PathsArray = nullptr;
 	if (Params->TryGetArrayField(TEXT("assetPaths"), PathsArray))
@@ -185,11 +202,11 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ScanAnimationTracks(const TSharedPtr<
 	int32 ProblemCount = 0;
 	int32 InspectedCount = 0;
 	int32 FailureCount = 0;
+	int32 FilteredOutCount = 0;
 
 	for (const FString& AssetPath : AssetPaths)
 	{
-		UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-		UAnimSequence* AnimSeq = Cast<UAnimSequence>(LoadedAsset);
+		UAnimSequence* AnimSeq = LoadAssetByPath<UAnimSequence>(AssetPath);
 		if (!AnimSeq)
 		{
 			++FailureCount;
@@ -205,8 +222,9 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ScanAnimationTracks(const TSharedPtr<
 
 		USkeleton* Skeleton = AnimSeq->GetSkeleton();
 		const FString SequenceSkeletonPath = Skeleton ? Skeleton->GetPathName() : FString();
-		if (!SkeletonFilter.IsEmpty() && SequenceSkeletonPath != SkeletonFilter)
+		if (FilterSkeleton && Skeleton != FilterSkeleton)
 		{
+			++FilteredOutCount;
 			continue;
 		}
 
@@ -257,10 +275,25 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ScanAnimationTracks(const TSharedPtr<
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("directory"), Directory);
 	Result->SetNumberField(TEXT("targetTrackCount"), TargetTrackCount);
+	Result->SetNumberField(TEXT("candidateCount"), AssetPaths.Num());
 	Result->SetNumberField(TEXT("inspectedCount"), InspectedCount);
 	Result->SetNumberField(TEXT("problemCount"), ProblemCount);
 	Result->SetNumberField(TEXT("failureCount"), FailureCount);
 	Result->SetArrayField(TEXT("sequences"), Sequences);
+	if (FilterSkeleton)
+	{
+		// The resolved form, so a caller who passed a package path can see
+		// which skeleton the filter actually became (#890).
+		Result->SetStringField(TEXT("skeletonPath"), FilterSkeleton->GetPathName());
+		Result->SetNumberField(TEXT("filteredOutCount"), FilteredOutCount);
+		if (InspectedCount == 0)
+		{
+			Result->SetStringField(TEXT("note"), FString::Printf(
+				TEXT("The skeletonPath filter resolved to '%s' and matched none of the %d AnimSequence(s) scanned. ")
+				TEXT("This is a real empty result, not a path-shape miss."),
+				*FilterSkeleton->GetPathName(), AssetPaths.Num()));
+		}
+	}
 	return MCPResult(Result);
 }
 
@@ -398,6 +431,10 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetBoneKeyframes(const TSharedPtr<FJs
 	// Ensure bone track exists - add it if not present
 	const FName BoneFName(*BoneName);
 	const IAnimationDataModel* DataModel = AnimSeq->GetDataModel();
+	if (!DataModel)
+	{
+		return MCPError(TEXT("Animation sequence has no data model, so its bone tracks cannot be read or written"));
+	}
 	if (!DataModel->IsValidBoneTrackName(BoneFName))
 	{
 		Controller.AddBoneCurve(BoneFName);
@@ -530,6 +567,10 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BakeKeyframesBatch(const TSharedPtr<F
 		// Critical: create the bone track before writing keys, otherwise
 		// SetBoneTrackKeys returns false and the asset stays a T-pose.
 		const IAnimationDataModel* DataModel = AnimSeq->GetDataModel();
+		if (!DataModel)
+		{
+			return MCPError(TEXT("Animation sequence has no data model, so its bone tracks cannot be read or written"));
+		}
 		if (!DataModel->IsValidBoneTrackName(BoneFName))
 		{
 			Controller.AddBoneCurve(BoneFName);

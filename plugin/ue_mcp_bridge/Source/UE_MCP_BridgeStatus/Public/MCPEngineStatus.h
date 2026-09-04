@@ -86,6 +86,30 @@ public:
 	virtual uint32 Run() override;
 	virtual void Stop() override;
 
+	/** <Project>/Saved/UE_MCP_Bridge. */
+	static FString StatusDir();
+
+	/**
+	 * The shared `status.json`, still written so a client older than #990 finds
+	 * a snapshot where it has always looked.
+	 */
+	static FString StatusFilePath();
+
+	/**
+	 * `status.<pid>.json`, this process's own. One project directory can hold
+	 * the status of several processes, and a single shared document describes
+	 * only whichever of them wrote last (#990).
+	 */
+	static FString InstanceStatusFilePath();
+
+	/**
+	 * False in a commandlet. Nothing polls a commandlet's engine state, and a
+	 * distributed build runs dozens of them against one project directory,
+	 * where they used to fight over one file and turn a successful build into
+	 * thousands of Error lines (#990).
+	 */
+	static bool ShouldPublishStatus();
+
 private:
 	struct FSlowTaskEntry
 	{
@@ -96,7 +120,14 @@ private:
 	/** Serialise under the lock, then write atomically (temp file + move). */
 	void FlushToDisk();
 
-	static FString StatusFilePath();
+	/** Temp file plus rename, with the temp file named for this process. */
+	static bool PublishAtomically(const FString& FinalPath, const FString& Contents);
+
+	/** Drop `status.<pid>.json` files left by processes that are gone. */
+	static void RemoveStaleInstanceStatusFiles();
+
+	/** Does the shared status.json currently name this process? */
+	static bool SharedStatusBelongsToThisProcess();
 
 	mutable FCriticalSection Mutex;
 

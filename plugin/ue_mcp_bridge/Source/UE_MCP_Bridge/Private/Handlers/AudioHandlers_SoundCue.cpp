@@ -29,7 +29,7 @@
 
 namespace
 {
-	USoundNode* FindNodeByName(USoundCue* Cue, const FString& NodeName)
+	USoundNode* FindSoundCueNodeByName(USoundCue* Cue, const FString& NodeName)
 	{
 #if WITH_EDITORONLY_DATA
 		for (USoundNode* N : Cue->AllNodes)
@@ -121,7 +121,7 @@ TSharedPtr<FJsonValue> FAudioHandlers::SoundCueConnect(const TSharedPtr<FJsonObj
 	USoundCue* Cue = Cast<USoundCue>(UEditorAssetLibrary::LoadAsset(CuePath));
 	if (!Cue) return MCPError(FString::Printf(TEXT("SoundCue not found: %s"), *CuePath));
 
-	USoundNode* Child = FindNodeByName(Cue, ChildNodeId);
+	USoundNode* Child = FindSoundCueNodeByName(Cue, ChildNodeId);
 	if (!Child) return MCPError(FString::Printf(TEXT("Child node '%s' not found in cue."), *ChildNodeId));
 
 	const FString ParentNodeId = OptionalString(Params, TEXT("parentNodeId"));
@@ -132,7 +132,7 @@ TSharedPtr<FJsonValue> FAudioHandlers::SoundCueConnect(const TSharedPtr<FJsonObj
 	}
 	else
 	{
-		USoundNode* Parent = FindNodeByName(Cue, ParentNodeId);
+		USoundNode* Parent = FindSoundCueNodeByName(Cue, ParentNodeId);
 		if (!Parent) return MCPError(FString::Printf(TEXT("Parent node '%s' not found in cue."), *ParentNodeId));
 
 		int32 Index = Params->HasField(TEXT("childIndex"))

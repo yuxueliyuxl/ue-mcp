@@ -169,6 +169,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnVolume(const TSharedPtr<FJsonObject>
 	auto Result = MCPSuccess();
 	MCPSetCreated(Result);
 	Result->SetStringField(TEXT("actorLabel"), FinalLabel);
+	Result->SetStringField(TEXT("actorPath"), NewVolume->GetPathName());
 	Result->SetStringField(TEXT("actorName"), NewVolume->GetName());
 	Result->SetStringField(TEXT("volumeType"), VolumeType);
 
@@ -203,15 +204,16 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnVolume(const TSharedPtr<FJsonObject>
 TSharedPtr<FJsonValue> FLevelHandlers::SetVolumeProperties(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* TargetActor = FindActorByLabelOrName(World, ActorLabel);
-	if (!TargetActor)
-	{
-		return MCPError(FString::Printf(TEXT("Volume not found: %s"), *ActorLabel));
-	}
+	FMCPActorSelector ActorSel;
+	ActorSel.Match = EMCPActorMatch::LabelOrName;
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* TargetActor = MCPResolveActor(World, Params, ActorErr, ActorSel);
+	if (!TargetActor) return ActorErr;
+	ActorLabel = TargetActor->GetActorLabel();
 
 	TArray<TSharedPtr<FJsonValue>> Changes;
 	TArray<TSharedPtr<FJsonValue>> Skipped;
@@ -224,7 +226,9 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetVolumeProperties(const TSharedPtr<FJso
 	TArray<TPair<FString, TSharedPtr<FJsonValue>>> Pairs;
 	for (auto& Pair : Params->Values)
 	{
-		if (Pair.Key == TEXT("actorLabel") || Pair.Key == TEXT("action") || Pair.Key == TEXT("properties"))
+		// actorPath joins the selector keys that are never property writes (#983).
+		if (Pair.Key == TEXT("actorLabel") || Pair.Key == TEXT("actorPath")
+			|| Pair.Key == TEXT("action") || Pair.Key == TEXT("properties"))
 			continue;
 		Pairs.Emplace(FString(*Pair.Key), Pair.Value);
 	}
@@ -331,6 +335,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetVolumeProperties(const TSharedPtr<FJso
 	auto Result = MCPSuccess();
 	if (Changes.Num() > 0) MCPSetUpdated(Result); else MCPSetExisted(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), TargetActor->GetPathName());
 	Result->SetArrayField(TEXT("changes"), Changes);
 	if (Skipped.Num() > 0)
 	{
@@ -360,16 +365,23 @@ TSharedPtr<FJsonValue> FLevelHandlers::AddPostProcessBlendable(const TSharedPtr<
 {
 	REQUIRE_EDITOR_WORLD(World);
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 	FString MaterialPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("material"), MaterialPath)) return Err;
 
-	APostProcessVolume* Volume = nullptr;
-	for (TActorIterator<APostProcessVolume> It(World); It; ++It)
+	// #983: this ran its own label loop and took the first PostProcessVolume
+	// it reached, so a second volume with the same label was a coin flip over
+	// which one got the blendable.
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* VolumeActor = MCPResolveActor(World, Params, ActorErr);
+	if (!VolumeActor) return ActorErr;
+	ActorLabel = VolumeActor->GetActorLabel();
+	APostProcessVolume* Volume = Cast<APostProcessVolume>(VolumeActor);
+	if (!Volume)
 	{
-		if (It->GetActorLabel() == ActorLabel) { Volume = *It; break; }
+		return MCPError(FString::Printf(
+			TEXT("Actor '%s' is a %s, not a PostProcessVolume"), *ActorLabel, *VolumeActor->GetClass()->GetName()));
 	}
-	if (!Volume) return MCPError(FString::Printf(TEXT("PostProcessVolume not found: %s"), *ActorLabel));
 
 	UMaterialInterface* Material = LoadAssetByPath<UMaterialInterface>(MaterialPath);
 	if (!Material) return MCPError(FString::Printf(TEXT("Material not found: %s"), *MaterialPath));
@@ -383,6 +395,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::AddPostProcessBlendable(const TSharedPtr<
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Volume->GetPathName());
 	Result->SetStringField(TEXT("material"), Material->GetPathName());
 	Result->SetNumberField(TEXT("weight"), Weight);
 	Result->SetNumberField(TEXT("blendableCount"), Volume->Settings.WeightedBlendables.Array.Num());

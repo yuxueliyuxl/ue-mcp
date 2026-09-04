@@ -22,6 +22,9 @@ private:
 	static TSharedPtr<FJsonValue> DeleteAsset(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteAssetBatch(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> BulkRename(const TSharedPtr<FJsonObject>& Params);
+	// Bounded redirector clean-up after a move (#908). Lives in
+	// AssetHandlers_Redirectors.cpp.
+	static TSharedPtr<FJsonValue> FixupRedirectors(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateDataAsset(const TSharedPtr<FJsonObject>& Params);
 	// Bounded batch create-or-update of UDataAsset instances. Lives in
 	// AssetHandlers_BulkUpsert.cpp.
@@ -32,6 +35,9 @@ private:
 	// #726: create an asset of any concrete UObject class via its registered
 	// factory (or NewObject fallback), not just UDataAsset subclasses.
 	static TSharedPtr<FJsonValue> CreateAssetByClass(const TSharedPtr<FJsonObject>& Params);
+	// A named subobject inside an existing asset's package (#975). Lives in
+	// AssetHandlers_Subobject.cpp.
+	static TSharedPtr<FJsonValue> CreateSubobject(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SaveAsset(const TSharedPtr<FJsonObject>& Params);
 	// #429: bulk save of every dirty package - one-shot end-of-workflow flush.
 	static TSharedPtr<FJsonValue> SaveAllDirty(const TSharedPtr<FJsonObject>& Params);
@@ -97,6 +103,8 @@ private:
 	static TSharedPtr<FJsonValue> SetStringTableEntry(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveStringTableEntry(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ImportStringTable(const TSharedPtr<FJsonObject>& Params);
+	// CSV import with key-set validation and an explicit save result (#978).
+	static TSharedPtr<FJsonValue> ImportStringTableCsv(const TSharedPtr<FJsonObject>& Params);
 
 	// Export
 	static TSharedPtr<FJsonValue> ExportAsset(const TSharedPtr<FJsonObject>& Params);

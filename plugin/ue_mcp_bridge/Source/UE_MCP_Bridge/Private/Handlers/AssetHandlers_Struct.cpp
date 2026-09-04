@@ -168,7 +168,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListStructFields(const TSharedPtr<FJsonOb
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UUserDefinedStruct* Struct = Cast<UUserDefinedStruct>(UEditorAssetLibrary::LoadAsset(AssetPath));
+	UUserDefinedStruct* Struct = LoadAssetByPath<UUserDefinedStruct>(AssetPath);
 	if (!Struct) return MCPError(FString::Printf(TEXT("UserDefinedStruct not found (native structs are not editable): %s"), *AssetPath));
 
 	TSharedPtr<FJsonObject> Res = MCPSuccess();
@@ -193,7 +193,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::EditUserDefinedStruct(const TSharedPtr<FJ
 	FString Op;
 	if (auto Err = RequireString(Params, TEXT("op"), Op)) return Err;
 
-	UUserDefinedStruct* Struct = Cast<UUserDefinedStruct>(UEditorAssetLibrary::LoadAsset(AssetPath));
+	UUserDefinedStruct* Struct = LoadAssetByPath<UUserDefinedStruct>(AssetPath);
 	if (!Struct) return MCPError(FString::Printf(TEXT("UserDefinedStruct not found (native structs are not editable): %s"), *AssetPath));
 
 	TSharedPtr<FJsonObject> Res = MCPSuccess();

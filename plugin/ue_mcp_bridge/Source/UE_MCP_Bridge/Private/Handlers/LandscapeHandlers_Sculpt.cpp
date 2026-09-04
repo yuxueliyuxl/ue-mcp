@@ -30,31 +30,52 @@ namespace
 	// Landscape heights are uint16 with 32768 as "zero". One unit of height is
 	// LANDSCAPE_ZSCALE (1/128) cm before the actor's own Z scale.
 
-	/** The landscape to edit: by actor label, else the only one in the world. */
-	ALandscape* ResolveLandscape(UWorld* World, const FString& ActorLabel, FString& OutError)
+	/** The landscape to edit: by actorPath or actor label, else the only one in
+	 *  the world.
+	 *
+	 *  #983: a supplied label used to answer with Found[0], so two landscapes
+	 *  sharing a label sculpted whichever the actor iterator reached first. A
+	 *  named selector now goes through the shared resolver, which refuses and
+	 *  lists the candidate paths. The unnamed case keeps its own scan, because
+	 *  "the only landscape in the level" is a default this action is entitled
+	 *  to and the resolver has no opinion about. */
+	ALandscape* ResolveLandscape(UWorld* World, const TSharedPtr<FJsonObject>& Params, TSharedPtr<FJsonValue>& OutError)
 	{
+		FMCPActorSelector Selector;
+		Selector.bRequired = false;
+		if (AActor* Named = MCPResolveActor(World, Params, OutError, Selector))
+		{
+			ALandscape* AsLandscape = Cast<ALandscape>(Named);
+			if (!AsLandscape)
+			{
+				OutError = MCPError(FString::Printf(
+					TEXT("Actor '%s' is a %s, not a Landscape"),
+					*Named->GetActorLabel(), *Named->GetClass()->GetName()));
+				return nullptr;
+			}
+			return AsLandscape;
+		}
+		if (OutError.IsValid()) return nullptr;
+
 		TArray<ALandscape*> Found;
 		for (TActorIterator<ALandscape> It(World); It; ++It)
 		{
 			ALandscape* Candidate = *It;
 			if (!Candidate) continue;
-			if (!ActorLabel.IsEmpty() && !Candidate->GetActorLabel().Equals(ActorLabel, ESearchCase::IgnoreCase)) continue;
 			Found.Add(Candidate);
 		}
 		if (Found.Num() == 0)
 		{
-			OutError = ActorLabel.IsEmpty()
-				? TEXT("No Landscape actor in the current level. Create one with landscape(create).")
-				: FString::Printf(TEXT("No Landscape actor labelled '%s'"), *ActorLabel);
+			OutError = MCPError(TEXT("No Landscape actor in the current level. Create one with landscape(create)."));
 			return nullptr;
 		}
-		if (Found.Num() > 1 && ActorLabel.IsEmpty())
+		if (Found.Num() > 1)
 		{
 			TArray<FString> Labels;
 			for (ALandscape* L : Found) Labels.Add(L->GetActorLabel());
-			OutError = FString::Printf(
-				TEXT("%d Landscape actors in the level; pass actorLabel to choose. Available: [%s]"),
-				Found.Num(), *FString::Join(Labels, TEXT(", ")));
+			OutError = MCPError(FString::Printf(
+				TEXT("%d Landscape actors in the level; pass actorLabel or actorPath to choose. Available: [%s]"),
+				Found.Num(), *FString::Join(Labels, TEXT(", "))));
 			return nullptr;
 		}
 		return Found[0];
@@ -169,9 +190,9 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::Sculpt(const TSharedPtr<FJsonObject>&
 {
 	REQUIRE_EDITOR_WORLD(World);
 
-	FString ResolveError;
-	ALandscape* Landscape = ResolveLandscape(World, OptionalString(Params, TEXT("actorLabel")), ResolveError);
-	if (!Landscape) return MCPError(ResolveError);
+	TSharedPtr<FJsonValue> ResolveError;
+	ALandscape* Landscape = ResolveLandscape(World, Params, ResolveError);
+	if (!Landscape) return ResolveError;
 
 	ULandscapeInfo* Info = Landscape->GetLandscapeInfo();
 	if (!Info) return MCPError(TEXT("Landscape has no LandscapeInfo (not registered yet)"));
@@ -298,6 +319,8 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::Sculpt(const TSharedPtr<FJsonObject>&
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("landscape"), Landscape->GetActorLabel());
+	Result->SetStringField(TEXT("actorLabel"), Landscape->GetActorLabel());
+	Result->SetStringField(TEXT("actorPath"), Landscape->GetPathName());
 	Result->SetStringField(TEXT("mode"), Mode);
 	Result->SetNumberField(TEXT("radius"), Radius);
 	Result->SetNumberField(TEXT("amount"), Amount);
@@ -316,9 +339,9 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::PaintLayer(const TSharedPtr<FJsonObje
 {
 	REQUIRE_EDITOR_WORLD(World);
 
-	FString ResolveError;
-	ALandscape* Landscape = ResolveLandscape(World, OptionalString(Params, TEXT("actorLabel")), ResolveError);
-	if (!Landscape) return MCPError(ResolveError);
+	TSharedPtr<FJsonValue> ResolveError;
+	ALandscape* Landscape = ResolveLandscape(World, Params, ResolveError);
+	if (!Landscape) return ResolveError;
 
 	ULandscapeInfo* Info = Landscape->GetLandscapeInfo();
 	if (!Info) return MCPError(TEXT("Landscape has no LandscapeInfo (not registered yet)"));
@@ -439,6 +462,8 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::PaintLayer(const TSharedPtr<FJsonObje
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("landscape"), Landscape->GetActorLabel());
+	Result->SetStringField(TEXT("actorLabel"), Landscape->GetActorLabel());
+	Result->SetStringField(TEXT("actorPath"), Landscape->GetPathName());
 	Result->SetStringField(TEXT("layerName"), LayerName);
 	Result->SetNumberField(TEXT("strength"), Strength);
 	Result->SetNumberField(TEXT("radius"), Radius);

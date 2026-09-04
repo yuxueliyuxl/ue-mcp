@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1400" viewBox="0 0 1800 1400" role="img" aria-labelledby="title desc">
+  <title id="title">Human to machine spatial communication quick reference</title>
+  <desc id="desc">A compact reference for target, coordinate frame, viewpoint, operation, amount, constraints, axis probes, contact landmarks, animation phase, and visual verification packets.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#07111f"/><stop offset="1" stop-color="#10243d"/></linearGradient>
+    <filter id="shadow"><feDropShadow dx="0" dy="7" stdDeviation="8" flood-color="#000" flood-opacity="0.25"/></filter>
+  </defs>
+  <rect width="1800" height="1400" rx="30" fill="url(#bg)"/>
+  <text x="80" y="78" fill="#f8fafc" font-family="Segoe UI, Arial, sans-serif" font-size="44" font-weight="700">Human → machine spatial communication</text>
+  <text x="80" y="122" fill="#94a3b8" font-family="Segoe UI, Arial, sans-serif" font-size="22">Quick reference for visual tuning with UE-MCP</text>
+
+  <g transform="translate(80 165)" filter="url(#shadow)">
+    <rect width="1640" height="180" rx="22" fill="#14283f" stroke="#38bdf8" stroke-width="2"/>
+    <text x="32" y="44" fill="#38bdf8" font-family="Segoe UI, Arial" font-size="23" font-weight="700">THE SIX-FIELD SENTENCE</text>
+    <text x="32" y="90" fill="#f8fafc" font-family="Segoe UI, Arial" font-size="27" font-weight="600">Target + frame + viewpoint + operation + amount + constraints</text>
+    <text x="32" y="137" fill="#cbd5e1" font-family="Segoe UI, Arial" font-size="22">“On the LeatherHood, in character space, looking down, rotate about up, 15° clockwise, preserving location and scale.”</text>
+    <text x="32" y="166" fill="#64748b" font-family="Segoe UI, Arial" font-size="17">Obvious context may be inferred. Ask one concise question only when the frame or viewpoint changes the result.</text>
+  </g>
+
+  <g transform="translate(80 385)" font-family="Segoe UI, Arial, sans-serif">
+    <rect width="1640" height="710" rx="22" fill="#0b1a2c" stroke="#334155" stroke-width="2"/>
+    <rect width="1640" height="62" rx="22" fill="#1e3a5f"/>
+    <rect y="40" width="1640" height="22" fill="#1e3a5f"/>
+    <text x="28" y="40" fill="#f8fafc" font-size="20" font-weight="700">WHEN YOU MEAN…</text>
+    <text x="345" y="40" fill="#f8fafc" font-size="20" font-weight="700">SAY…</text>
+    <text x="1005" y="40" fill="#f8fafc" font-size="20" font-weight="700">MACHINE INTERPRETATION</text>
+
+    <g font-size="18">
+      <rect y="62" width="1640" height="72" fill="#10243d"/>
+      <text x="28" y="91" fill="#38bdf8" font-weight="700">Character-relative direction</text>
+      <text x="345" y="91" fill="#f8fafc">“Move 4 cm toward the character's right.”</text>
+      <text x="1005" y="91" fill="#cbd5e1">frame=actor · rightCm=+4</text>
+      <text x="28" y="117" fill="#94a3b8">left / right / forward / back</text>
+      <text x="1005" y="117" fill="#64748b">Character orientation, not the current camera.</text>
+
+      <rect y="134" width="1640" height="72" fill="#0b1a2c"/>
+      <text x="28" y="163" fill="#38bdf8" font-weight="700">Viewer-relative direction</text>
+      <text x="345" y="163" fill="#f8fafc">“From this camera, move it slightly left.”</text>
+      <text x="1005" y="163" fill="#cbd5e1">Explicit viewpoint → resolved frame delta</text>
+      <text x="28" y="189" fill="#94a3b8">screen left / right / toward viewer</text>
+      <text x="1005" y="189" fill="#64748b">Do not silently treat screen-left as character-left.</text>
+
+      <rect y="206" width="1640" height="72" fill="#10243d"/>
+      <text x="28" y="235" fill="#fbbf24" font-weight="700">Clock direction</text>
+      <text x="345" y="235" fill="#f8fafc">“Looking down, rotate 15° clockwise.”</text>
+      <text x="1005" y="235" fill="#cbd5e1">viewpoint + frame up axis + signed degrees</text>
+      <text x="28" y="261" fill="#94a3b8">clockwise / counterclockwise</text>
+      <text x="1005" y="261" fill="#64748b">A viewpoint is mandatory because the sign can reverse.</text>
+
+      <rect y="278" width="1640" height="72" fill="#0b1a2c"/>
+      <text x="28" y="307" fill="#34d399" font-weight="700">Exact frame / axis</text>
+      <text x="345" y="307" fill="#f8fafc">“Move 3 cm along parent up.”</text>
+      <text x="1005" y="307" fill="#cbd5e1">frame=parent · upCm=+3</text>
+      <text x="28" y="333" fill="#94a3b8">world / actor / parent / component</text>
+      <text x="1005" y="333" fill="#64748b">Forward/right/up belong to the chosen frame.</text>
+
+      <rect y="350" width="1640" height="72" fill="#10243d"/>
+      <text x="28" y="379" fill="#c4b5fd" font-weight="700">Uniform size change</text>
+      <text x="345" y="379" fill="#f8fafc">“Make it 5% larger; keep its center.”</text>
+      <text x="1005" y="379" fill="#cbd5e1">scaleMultiplier=1.05 · no location delta</text>
+      <text x="28" y="405" fill="#94a3b8">larger / smaller</text>
+      <text x="1005" y="405" fill="#64748b">Uniform scale avoids accidental shape distortion.</text>
+
+      <rect y="422" width="1640" height="72" fill="#0b1a2c"/>
+      <text x="28" y="451" fill="#fb7185" font-weight="700">Preservation constraint</text>
+      <text x="345" y="451" fill="#f8fafc">“Rotation only; preserve location and scale.”</text>
+      <text x="1005" y="451" fill="#cbd5e1">Unspecified transform fields remain unchanged</text>
+      <text x="28" y="477" fill="#94a3b8">keep contact / height / size / orientation</text>
+      <text x="1005" y="477" fill="#64748b">State invariants explicitly when visual fit depends on them.</text>
+
+      <rect y="494" width="1640" height="72" fill="#10243d"/>
+      <text x="28" y="523" fill="#fbbf24" font-weight="700">Ambiguous axis</text>
+      <text x="345" y="523" fill="#f8fafc">“Probe ±5° about component forward.”</text>
+      <text x="1005" y="523" fill="#cbd5e1">baseline + positive candidate + negative candidate</text>
+      <text x="28" y="549" fill="#94a3b8">when pitch/yaw/roll words are unreliable</text>
+      <text x="1005" y="549" fill="#64748b">Compare identical camera views; keep exact deltas in manifest.</text>
+
+      <rect y="566" width="1640" height="72" fill="#0b1a2c"/>
+      <text x="28" y="595" fill="#34d399" font-weight="700">Contact / grip alignment</text>
+      <text x="345" y="595" fill="#f8fafc">“Align handle centerline to palm and hand socket.”</text>
+      <text x="1005" y="595" fill="#cbd5e1">socket + palm/grip landmarks + close view</text>
+      <text x="28" y="621" fill="#94a3b8">hands, tools, weapons, attached props</text>
+      <text x="1005" y="621" fill="#64748b">For two-hand items, note when IK/contact constraints are needed.</text>
+
+      <rect y="638" width="1640" height="72" fill="#10243d"/>
+      <text x="28" y="667" fill="#38bdf8" font-weight="700">Animated attachment</text>
+      <text x="345" y="667" fill="#f8fafc">“Freeze at 0.42 s, tune grip, then sample the cycle.”</text>
+      <text x="1005" y="667" fill="#cbd5e1">freeze pose + stop actor/root movement before baseline</text>
+      <text x="28" y="693" fill="#94a3b8">idle, recoil, sway, locomotion</text>
+      <text x="1005" y="693" fill="#64748b">Never compare candidates from arbitrary animation frames.</text>
+    </g>
+  </g>
+
+  <g transform="translate(80 1135)" filter="url(#shadow)" font-family="Segoe UI, Arial, sans-serif">
+    <rect width="1640" height="185" rx="22" fill="#14283f" stroke="#34d399" stroke-width="2"/>
+    <text x="30" y="43" fill="#34d399" font-size="23" font-weight="700">VERIFY WITH TWO PAIRED ARTIFACTS</text>
+    <text x="30" y="86" fill="#f8fafc" font-size="22" font-weight="600">Well-lit close multi-view packet</text>
+    <text x="30" y="119" fill="#cbd5e1" font-size="18">front key light · front / side / top / three-quarter · context view optional</text>
+    <text x="30" y="151" fill="#64748b" font-size="17">Same fixed pose, actor/root transform, camera, FOV, and lighting · target fills 50-75%.</text>
+    <line x1="805" y1="35" x2="805" y2="153" stroke="#334155" stroke-width="2"/>
+    <text x="845" y="86" fill="#f8fafc" font-size="22" font-weight="600">Exact manifest</text>
+    <text x="845" y="119" fill="#cbd5e1" font-size="18">camera · target · parent/socket · relative/world transforms · axes · deltas · bounds</text>
+    <text x="845" y="151" fill="#64748b" font-size="17">Images carry visual judgment; structured data carries precision and rollback.</text>
+  </g>
+  <text x="900" y="1362" text-anchor="middle" fill="#64748b" font-family="Segoe UI, Arial" font-size="17">Apply the smallest explicit change · echo the normalized interpretation · recapture · persist only after runtime-path verification</text>
+</svg>

@@ -44,7 +44,10 @@ export const chooserTool: ToolDef = categoryTool(
     inputStruct: z.string().optional().describe("add_column: parameter struct to bind the column input (e.g. EnumContextProperty, BoolContextProperty)"),
     boundProperty: z.string().optional().describe("add_column: context property name the column reads at evaluation time"),
     enumPath: z.string().optional().describe("add_column: enum asset path for an EnumColumn"),
-    cells: z.array(z.any()).optional().describe("Per-column cell values aligned to column order; each is struct text like '(Value=2)', or a scalar. null/omitted leaves a column at its default."),
+    // #936: a concrete element type. The handler stringifies a cell through
+    // TryGetString/TryGetBool/TryGetNumber and skips nulls, so string, number,
+    // boolean and null is the whole of what a cell can be.
+    cells: z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional().describe("Per-column cell values aligned to column order; each is struct text like '(Value=2)', or a scalar. null/omitted leaves a column at its default."),
     inputs: z.record(z.any()).optional().describe("Cell values keyed by column index (as string) or column name; same value format as cells"),
   },
 );

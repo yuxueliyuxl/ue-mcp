@@ -205,7 +205,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkSetAssetProperties(const TSharedPtr<F
 			continue;
 		}
 
-		UObject* LoadedAsset = LoadObject<UObject>(nullptr, *AssetPath);
+		UObject* LoadedAsset = MCPLoadAssetObject(AssetPath);
 		if (!LoadedAsset)
 		{
 			RejectItem(BulkStatusNotFound, FString::Printf(TEXT("Preflight failed: could not load asset '%s'"), *AssetPath));

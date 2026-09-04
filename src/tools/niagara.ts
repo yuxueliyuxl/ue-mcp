@@ -75,8 +75,8 @@ export const niagaraTool: ToolDef = categoryTool(
     validate:       bp("Verify gate: does this system actually emit? Reports per emitter whether it is enabled and has a spawn module + an enabled renderer. valid=false means empty shell. Params: systemPath", "validate_niagara_system", (p) => ({ systemPath: p.systemPath })),
     spawn:          bp("Spawn VFX as a transient component (GC's before offscreen capture). For a findable preview use spawn_actor. Params: systemPath, location, rotation?, label?", "spawn_niagara_at_location"),
     spawn_actor:    bp("Spawn a PERSISTENT, labeled NiagaraActor in the editor world (findable, re-activatable, survives capture - unlike spawn). Assigns the system and activates. Params: systemPath, location?, rotation?, label?, activate? (default true) (#537)", "spawn_niagara_actor", (p) => ({ systemPath: p.systemPath, location: p.location, rotation: p.rotation, label: p.label, activate: p.activate })),
-    reactivate:     bp("Reset + reactivate the NiagaraComponent on a placed actor (replay a burst before capturing). Params: actorLabel (#537)", "reactivate_niagara", (p) => ({ actorLabel: p.actorLabel })),
-    set_parameter:  bp("Set parameter. Params: actorLabel, parameterName, value, parameterType?", "set_niagara_parameter"),
+    reactivate:     bp("Reset + reactivate the NiagaraComponent on a placed actor (replay a burst before capturing). Params: actorLabel OR actorPath (#537/#983)", "reactivate_niagara", (p) => ({ actorLabel: p.actorLabel, actorPath: p.actorPath })),
+    set_parameter:  bp("Set parameter. Params: actorLabel OR actorPath, parameterName, value, parameterType?", "set_niagara_parameter"),
     create:         bp("Create system. Params: name, packagePath?", "create_niagara_system"),
     create_emitter: bp("Create a Niagara emitter asset. templatePath copies an existing emitter as the starting point (the content browser's create-from-template path); omit it for the default empty emitter with the standard modules and a sprite renderer. inherit=true makes it a child that tracks the template instead, which then refuses local edits to inherited modules. Params: name, packagePath?, templatePath?, inherit? (default false), onConflict?", "create_niagara_emitter"),
     add_emitter:    bp("Add emitter to system. Params: systemPath, emitterPath", "add_emitter_to_system"),
@@ -140,6 +140,7 @@ export const niagaraTool: ToolDef = categoryTool(
   undefined,
   {
     assetPath: z.string().optional(), actorLabel: z.string().optional(),
+    actorPath: z.string().optional().describe("Full actor object path. The unambiguous selector, and it wins over actorLabel when both are given. Editor labels are NOT unique, and a label matching several actors is refused with the candidates rather than resolved at random (#983)"),
     directory: z.string().optional(), recursive: z.boolean().optional(),
     systemPath: z.string().optional(), emitterPath: z.string().optional(),
     location: Vec3.optional(),

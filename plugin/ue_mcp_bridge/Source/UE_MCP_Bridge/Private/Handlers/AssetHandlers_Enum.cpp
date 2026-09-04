@@ -136,7 +136,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListEnumValues(const TSharedPtr<FJsonObje
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UEnum* Enum = Cast<UEnum>(UEditorAssetLibrary::LoadAsset(AssetPath));
+	UEnum* Enum = LoadAssetByPath<UEnum>(AssetPath);
 	if (!Enum) return MCPError(FString::Printf(TEXT("Enum not found: %s"), *AssetPath));
 
 	TSharedPtr<FJsonObject> Res = MCPSuccess();
@@ -162,7 +162,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::EditUserDefinedEnum(const TSharedPtr<FJso
 	FString Op;
 	if (auto Err = RequireString(Params, TEXT("op"), Op)) return Err;
 
-	UUserDefinedEnum* Enum = Cast<UUserDefinedEnum>(UEditorAssetLibrary::LoadAsset(AssetPath));
+	UUserDefinedEnum* Enum = LoadAssetByPath<UUserDefinedEnum>(AssetPath);
 	if (!Enum) return MCPError(FString::Printf(TEXT("UserDefinedEnum not found (native UEnums cannot be edited): %s"), *AssetPath));
 
 	TSharedPtr<FJsonObject> Res = MCPSuccess();

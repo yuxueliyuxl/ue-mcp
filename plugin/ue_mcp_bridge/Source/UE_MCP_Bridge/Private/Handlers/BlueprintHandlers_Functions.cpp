@@ -4,6 +4,7 @@
 // stays in BlueprintHandlers.cpp::RegisterHandlers.
 
 #include "BlueprintHandlers.h"
+#include "BlueprintHandlers_Internal.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -13,6 +14,10 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
+// #894: an animation layer override must be created as an AnimationGraph on
+// the animation schema, not as a K2 function graph.
+#include "AnimationGraph.h"
+#include "AnimationGraphSchema.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_EditablePinBase.h"
 #include "K2Node_CustomEvent.h"
@@ -94,7 +99,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::CreateFunction(const TSharedPtr<FJson
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	// Idempotency: existing function graph short-circuits.
@@ -223,7 +228,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ListBlueprintFunctions(const TSharedP
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	// Skeleton class super is the reliable parent during an in-editor edit; fall
@@ -556,7 +561,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::RenameFunction(const TSharedPtr<FJson
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	// Find the function graph
@@ -608,7 +613,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::DeleteFunction(const TSharedPtr<FJson
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	UEdGraph* FoundGraph = nullptr;
@@ -726,7 +731,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::OverrideFunction(const TSharedPtr<FJs
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	const FName FuncName(*FunctionName);
@@ -850,18 +855,82 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::OverrideFunction(const TSharedPtr<FJs
 		return MCPResult(Result);
 	}
 
+	// #894: an animation layer override has to be an AnimationGraph. Creating a
+	// plain K2 function graph for one produces a graph the anim compiler never
+	// evaluates, so the override binds to nothing and the layer is inert while
+	// every read of the Blueprint says the override is there.
+	//
+	// The declaration is the authority on the graph's type, so mirror it rather
+	// than keeping a list of which functions happen to be layers: find the graph
+	// the override function was declared in and reuse its graph class and
+	// schema. One rule covers a layer declared on an Animation Layer Interface
+	// and one inherited from a parent Anim Blueprint, and it stays correct if
+	// Epic adds another graph-backed override kind.
+	//
+	// The predicate is deliberately the narrowest one that can be CHECKED
+	// rather than inferred. Both halves have to hold: the Blueprint answers
+	// SupportsAnimLayers (which only UAnimBlueprint does), and the graph that
+	// declared the function is a UAnimationGraph. Reading the declaration is
+	// stronger than testing the signature for a pose parameter, because it asks
+	// what the layer IS instead of what it looks like, and it cannot turn an
+	// ordinary function override on an Anim Blueprint into an animation graph.
+	//
+	// The cost of that narrowness is one case it does not cover: a layer
+	// declared on a native class has no declaring Blueprint graph to read, so
+	// it falls through to the K2 default. That is the false negative, and it is
+	// the right direction to be wrong in. Anim layers are authored on Animation
+	// Layer Interfaces and on parent Anim Blueprints, both of which are covered.
+	TSubclassOf<UEdGraph> GraphClass = UEdGraph::StaticClass();
+	TSubclassOf<UEdGraphSchema> SchemaClass = UEdGraphSchema_K2::StaticClass();
+	FString MirroredFromGraph;
+	if (Blueprint->SupportsAnimLayers())
+	{
+		if (UBlueprint* DeclaringBlueprint = UBlueprint::GetBlueprintFromClass(OverrideFuncClass))
+		{
+			for (UEdGraph* SourceGraph : DeclaringBlueprint->FunctionGraphs)
+			{
+				if (!SourceGraph || SourceGraph->GetFName() != FuncName) continue;
+				if (SourceGraph->IsA<UAnimationGraph>())
+				{
+					GraphClass = SourceGraph->GetClass();
+					MirroredFromGraph = SourceGraph->GetPathName();
+					if (UClass* SourceSchema = SourceGraph->Schema.Get())
+					{
+						SchemaClass = SourceSchema;
+					}
+					else
+					{
+						SchemaClass = UAnimationGraphSchema::StaticClass();
+					}
+				}
+				break;
+			}
+		}
+	}
+
 	// Function-form override: create the graph seeded from the override class so
 	// the entry/result terminators carry the base function's exact signature.
 	// (This is the fix for #688 - create_function produced a blank graph that
 	// never bound as the override.)
 	UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
-		Blueprint, FuncName, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+		Blueprint, FuncName, GraphClass, SchemaClass);
 	if (!NewGraph)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to create override graph: %s"), *FunctionName));
 	}
 
 	FBlueprintEditorUtils::AddFunctionGraph<UClass>(Blueprint, NewGraph, /*bIsUserCreated=*/false, OverrideFuncClass);
+
+	// #894: creating the graph with the right class and schema is only half of
+	// it. CreateFunctionGraph gives an AnimationGraph its result node, but the
+	// layer's input pose nodes come from the interface function's own pose
+	// parameters, and only ConformAnimGraphToInterface seeds those. Without
+	// this the override is correctly typed and still unusable: an empty layer
+	// with nothing to plug a pose into.
+	if (!MirroredFromGraph.IsEmpty())
+	{
+		UAnimationGraphSchema::ConformAnimGraphToInterface(Blueprint, *NewGraph, OverrideFunc);
+	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 	FKismetEditorUtilities::CompileBlueprint(Blueprint);
@@ -875,6 +944,19 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::OverrideFunction(const TSharedPtr<FJs
 	Result->SetStringField(TEXT("graphName"), NewGraph->GetName());
 	Result->SetStringField(TEXT("sourceClass"), OverrideFuncClass->GetPathName());
 	Result->SetStringField(TEXT("source"), Source);
+	// #894: report the graph's actual type. An anim layer override that came
+	// back as an EdGraph on the K2 schema was the whole bug, and it was
+	// invisible from the response.
+	Result->SetStringField(TEXT("graphClass"), NewGraph->GetClass()->GetName());
+	if (UClass* AppliedSchema = NewGraph->Schema.Get())
+	{
+		Result->SetStringField(TEXT("schemaClass"), AppliedSchema->GetName());
+	}
+	if (!MirroredFromGraph.IsEmpty())
+	{
+		Result->SetBoolField(TEXT("animationGraph"), true);
+		Result->SetStringField(TEXT("mirroredFromGraph"), MirroredFromGraph);
+	}
 
 	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("path"), AssetPath);
@@ -896,7 +978,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ListOverridableFunctions(const TShare
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
 	{
-		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+		return BlueprintNotFoundError(AssetPath);
 	}
 
 	FBlueprintEditorUtils::ConformImplementedInterfaces(Blueprint);

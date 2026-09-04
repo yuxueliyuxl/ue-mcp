@@ -73,6 +73,8 @@ void FGasHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("get_attribute"), &GetAttribute);
 	Registry.RegisterHandler(TEXT("init_asc"), &InitAsc);
 	Registry.RegisterHandler(TEXT("get_asc_state"), &GetAscState);
+	Registry.RegisterHandler(TEXT("get_live_attribute_value"), &GetLiveAttributeValue);
+	Registry.RegisterHandler(TEXT("set_live_attribute_value"), &SetLiveAttributeValue);
 }
 
 TSharedPtr<FJsonValue> FGasHandlers::CreateGasBlueprint(

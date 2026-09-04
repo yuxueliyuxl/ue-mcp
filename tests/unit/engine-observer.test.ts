@@ -2,7 +2,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { readLogState, readEngineSnapshot } from "../../src/engine-observer.js";
+import {
+  readLogState,
+  readEngineSnapshot,
+  withBridgeSnapshot,
+  type EngineState,
+} from "../../src/engine-observer.js";
 
 const temporaryRoots: string[] = [];
 
@@ -110,5 +115,126 @@ describe("readEngineSnapshot", () => {
   it("returns null when the plugin has not written one", () => {
     const project = makeProject(["LogInit: Display: Base directory: C:/UE/"]);
     expect(readEngineSnapshot(project)).toBeNull();
+  });
+});
+
+describe("readEngineSnapshot per-process files (#990)", () => {
+  function writeInstanceStatus(project: string, pid: number, snapshot: unknown, mtimeMsAgo = 0): string {
+    const file = path.join(path.dirname(project), "Saved", "UE_MCP_Bridge", `status.${pid}.json`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(snapshot));
+    if (mtimeMsAgo > 0) {
+      const when = new Date(Date.now() - mtimeMsAgo);
+      fs.utimesSync(file, when, when);
+    }
+    return file;
+  }
+
+  it("prefers a per-process file over the shared one", () => {
+    // The shared status.json describes only whichever process wrote last, so
+    // it is the fallback and not the answer.
+    const project = makeProject(["LogInit: Display: Base directory: C:/UE/"], { phase: "shared" });
+    writeInstanceStatus(project, 4242, { phase: "per-process", pid: 4242 });
+    expect(readEngineSnapshot(project)?.phase).toBe("per-process");
+    expect(readEngineSnapshot(project)?.pid).toBe(4242);
+  });
+
+  it("takes the freshest of several, which is the one still being written", () => {
+    const project = makeProject(["LogInit: Display: Base directory: C:/UE/"]);
+    writeInstanceStatus(project, 111, { phase: "crashed hours ago", pid: 111 }, 3_600_000);
+    writeInstanceStatus(project, 222, { phase: "alive", pid: 222 });
+    expect(readEngineSnapshot(project)?.phase).toBe("alive");
+  });
+
+  it("still reads an editor that writes only the shared path", () => {
+    // A deployed plugin older than this change writes status.json and nothing
+    // else, and must keep working.
+    const project = makeProject(["LogInit: Display: Base directory: C:/UE/"], { phase: "ready" });
+    expect(readEngineSnapshot(project)?.phase).toBe("ready");
+  });
+
+  it("falls through an unreadable per-process file to the shared one", () => {
+    const project = makeProject(["LogInit: Display: Base directory: C:/UE/"], { phase: "shared" });
+    writeInstanceStatus(project, 4242, {});
+    fs.writeFileSync(
+      path.join(path.dirname(project), "Saved", "UE_MCP_Bridge", "status.4242.json"),
+      "{ half written",
+    );
+    expect(readEngineSnapshot(project)?.phase).toBe("shared");
+  });
+
+  it("ignores the pid-suffixed temp files the writer renames through", () => {
+    const project = makeProject(["LogInit: Display: Base directory: C:/UE/"], { phase: "shared" });
+    const dir = path.join(path.dirname(project), "Saved", "UE_MCP_Bridge");
+    fs.writeFileSync(path.join(dir, "status.json.1234.tmp"), JSON.stringify({ phase: "mid-write" }));
+    expect(readEngineSnapshot(project)?.phase).toBe("shared");
+  });
+});
+
+describe("withBridgeSnapshot", () => {
+  /** The state a failed process probe produces: nothing found, nothing known. */
+  function blindState(overrides: Partial<EngineState> = {}): EngineState {
+    return {
+      running: false,
+      processes: [],
+      log: {
+        logPath: null,
+        secondsSinceWrite: null,
+        phase: "ready",
+        blocking: false,
+        lastLine: null,
+        tail: [],
+        errors: [],
+        warnings: [],
+      },
+      snapshot: null,
+      dialogs: [],
+      processProbeFailed: true,
+      runningEvidence: "none",
+      snapshotSource: "none",
+      summary: "No editor process for this project. Log phase: ready.",
+      blocked: false,
+      ...overrides,
+    };
+  }
+
+  it("an editor that answered the call is running, whatever the process table saw", () => {
+    // #965: one response carried running:false with processes:[] AND a live
+    // snapshot the editor had just served over the bridge. The report
+    // contradicted itself, and an agent acting on the first half went looking
+    // for an editor that was answering it.
+    const merged = withBridgeSnapshot(blindState(), {
+      phase: "ready",
+      uptimeSeconds: 72.2,
+      gameThreadTicking: true,
+    });
+
+    expect(merged.running).toBe(true);
+    expect(merged.runningEvidence).toBe("bridge-snapshot");
+    expect(merged.snapshotSource).toBe("bridge");
+    expect(merged.summary).not.toContain("No editor process");
+    expect(merged.summary).toContain("answered over the bridge");
+  });
+
+  it("keeps the failed probe visible as its own fact", () => {
+    const merged = withBridgeSnapshot(blindState(), { phase: "ready" });
+    expect(merged.processProbeFailed).toBe(true);
+    expect(merged.processes).toEqual([]);
+  });
+
+  it("surfaces a modal the bridge reported even with no process row to attach it to", () => {
+    const merged = withBridgeSnapshot(blindState(), {
+      phase: "ready",
+      modal: { title: "Restore Packages", message: "Restore auto-saved packages?", buttons: ["Yes", "No"] },
+    });
+    expect(merged.blocked).toBe(true);
+    expect(merged.summary).toContain("Restore Packages");
+    expect(merged.summary).toContain("Yes, No");
+  });
+
+  it("says the probe found nothing when the probe itself did run", () => {
+    const merged = withBridgeSnapshot(blindState({ processProbeFailed: false }), { phase: "ready" });
+    expect(merged.running).toBe(true);
+    expect(merged.summary).toContain("did not find it");
   });
 });

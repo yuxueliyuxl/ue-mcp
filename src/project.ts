@@ -6,7 +6,7 @@ import { dumpYaml } from "./yaml-dump.js";
 import { McpError, ErrorCode } from "./errors.js";
 import { info, warn } from "./log.js";
 import { UProjectSchema, UeMcpConfigSchema } from "./schemas.js";
-import { findEngineInstall } from "./deployer.js";
+import { resolveEngineRoot, type EngineLookup } from "./engine-root.js";
 import { readGlobalUeMcpBlock } from "./global-config.js";
 import { setInstalledHooks, setFeedbackMode, type FeedbackMode } from "./user-state.js";
 
@@ -228,6 +228,27 @@ export class ProjectContext {
   }
 
   /**
+   * Everything the shared engine resolver needs to place this project.
+   *
+   * One resolver answers "which engine" for engine plugins, engine-source reads
+   * and the build tool, so a source build beside the project cannot be visible
+   * to one of them and invisible to the next (#959, #962).
+   */
+  engineLookup(): EngineLookup {
+    return {
+      projectPath: this.projectPath,
+      engineAssociation: this.engineAssociation,
+      configBuildToolPath: this.config.editor?.buildToolPath ?? null,
+      configEditorPath: this.config.editor?.path ?? null,
+    };
+  }
+
+  /** The engine tree this project belongs to, or null. */
+  resolveEngineRoot(): string | null {
+    return resolveEngineRoot(this.engineLookup());
+  }
+
+  /**
    * Cache for discoverPlugins(). Engine-tree scans walk hundreds of dirs;
    * caching for the lifetime of the server is fine because plugin layouts
    * don't change while the editor is running.
@@ -258,7 +279,9 @@ export class ProjectContext {
     }
     if (this.pluginsDir && fs.existsSync(this.pluginsDir)) scan(this.pluginsDir);
     // Engine plugins (PCGBiomeCore, Niagara extras, etc.) - required for #253.
-    const engineRoot = findEngineInstall(this.engineAssociation);
+    // Through the shared resolver, so a source build beside the project has its
+    // engine plugins found the same way an installed one does (#962).
+    const engineRoot = this.resolveEngineRoot();
     if (engineRoot) {
       const enginePluginsRoot = path.join(engineRoot, "Engine", "Plugins");
       if (fs.existsSync(enginePluginsRoot)) scan(enginePluginsRoot);

@@ -2,6 +2,7 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerAssetCreate.h"
+#include "HandlerJsonProperty.h"
 #include "VolumeHelpers_Internal.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
@@ -54,148 +55,6 @@
 
 namespace
 {
-	// #149: recursive JSON→FProperty setter used by set_pcg_node_settings.
-	// Handles TArray, TSet, nested structs (JSON objects), UObject/Class refs
-	// from string paths, and soft references. Falls back to ImportText for scalars.
-	static bool SetJsonOnProperty(FProperty* Prop, void* ValueAddr, const TSharedPtr<FJsonValue>& Value, FString& OutError)
-	{
-		if (!Prop || !Value.IsValid() || !ValueAddr) { OutError = TEXT("null property/value/addr"); return false; }
-
-		// TArray
-		if (FArrayProperty* ArrProp = CastField<FArrayProperty>(Prop))
-		{
-			const TArray<TSharedPtr<FJsonValue>>* Items = nullptr;
-			if (!Value->TryGetArray(Items) || !Items) { OutError = TEXT("expected JSON array"); return false; }
-			FScriptArrayHelper H(ArrProp, ValueAddr);
-			H.Resize(Items->Num());
-			for (int32 i = 0; i < Items->Num(); ++i)
-			{
-				FString E;
-				if (!SetJsonOnProperty(ArrProp->Inner, H.GetRawPtr(i), (*Items)[i], E))
-				{
-					OutError = FString::Printf(TEXT("[%d]: %s"), i, *E); return false;
-				}
-			}
-			return true;
-		}
-
-		// TSet
-		if (FSetProperty* SetProp = CastField<FSetProperty>(Prop))
-		{
-			const TArray<TSharedPtr<FJsonValue>>* Items = nullptr;
-			if (!Value->TryGetArray(Items) || !Items) { OutError = TEXT("expected JSON array for TSet"); return false; }
-			FScriptSetHelper H(SetProp, ValueAddr);
-			H.EmptyElements();
-			for (const TSharedPtr<FJsonValue>& V : *Items)
-			{
-				const int32 Idx = H.AddDefaultValue_Invalid_NeedsRehash();
-				uint8* ElemAddr = H.GetElementPtr(Idx);
-				FString E;
-				if (!SetJsonOnProperty(SetProp->ElementProp, ElemAddr, V, E)) { OutError = E; return false; }
-			}
-			H.Rehash();
-			return true;
-		}
-
-		// Struct: recurse on JSON object fields; otherwise fall through to ImportText
-		if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
-		{
-			const TSharedPtr<FJsonObject>* SubObj = nullptr;
-			if (Value->TryGetObject(SubObj) && SubObj && (*SubObj).IsValid())
-			{
-				for (const auto& Pair : (*SubObj)->Values)
-				{
-					FProperty* SubProp = StructProp->Struct->FindPropertyByName(FName(*Pair.Key));
-					if (!SubProp) { OutError = FString::Printf(TEXT("struct field '%s' not found"), *Pair.Key); return false; }
-					void* SubAddr = SubProp->ContainerPtrToValuePtr<void>(ValueAddr);
-					FString E;
-					if (!SetJsonOnProperty(SubProp, SubAddr, Pair.Value, E))
-					{
-						OutError = FString::Printf(TEXT("%s.%s: %s"), *StructProp->GetName(), *Pair.Key, *E); return false;
-					}
-				}
-				return true;
-			}
-		}
-
-		// Hard UObject ref - accept asset path
-		if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
-		{
-			FString Path;
-			if (Value->TryGetString(Path) && !Path.IsEmpty())
-			{
-				UObject* Loaded = StaticLoadObject(ObjProp->PropertyClass, nullptr, *Path);
-				if (!Loaded) { OutError = FString::Printf(TEXT("asset not found: %s"), *Path); return false; }
-				ObjProp->SetObjectPropertyValue(ValueAddr, Loaded);
-				return true;
-			}
-		}
-
-		// Hard UClass ref - accept class path
-		if (FClassProperty* ClassProp = CastField<FClassProperty>(Prop))
-		{
-			FString Path;
-			if (Value->TryGetString(Path) && !Path.IsEmpty())
-			{
-				UClass* Loaded = LoadClass<UObject>(nullptr, *Path);
-				if (!Loaded) { OutError = FString::Printf(TEXT("class not found: %s"), *Path); return false; }
-				ClassProp->SetObjectPropertyValue(ValueAddr, Loaded);
-				return true;
-			}
-		}
-
-		// Soft object / soft class - accept path string
-		if (FSoftObjectProperty* SoftObjProp = CastField<FSoftObjectProperty>(Prop))
-		{
-			FString Path;
-			if (Value->TryGetString(Path))
-			{
-				FSoftObjectPath PathObj(Path);
-				FSoftObjectPtr Ptr(PathObj);
-				SoftObjProp->SetPropertyValue(ValueAddr, Ptr);
-				return true;
-			}
-		}
-
-		// Fallback: coerce JSON to string, run ImportText_Direct
-		FString Str;
-		if (Value->TryGetString(Str)) {}
-		else if (Value->Type == EJson::Number) Str = FString::SanitizeFloat(Value->AsNumber());
-		else if (Value->Type == EJson::Boolean) Str = Value->AsBool() ? TEXT("true") : TEXT("false");
-		else Str = Value->AsString();
-
-		const TCHAR* R = Prop->ImportText_Direct(*Str, ValueAddr, nullptr, PPF_None);
-		if (R == nullptr) { OutError = FString::Printf(TEXT("ImportText failed for '%s'"), *Str); return false; }
-		return true;
-	}
-
-	// #149: walk dotted property names into nested structs before assigning.
-	// Enables "SplineMeshDescriptor.StaticMesh" style keys.
-	static bool SetDottedPropertyFromJson(UObject* Owner, const FString& DottedName, const TSharedPtr<FJsonValue>& Value, FString& OutError)
-	{
-		TArray<FString> Parts;
-		DottedName.ParseIntoArray(Parts, TEXT("."));
-		if (Parts.Num() == 0) { OutError = TEXT("empty property name"); return false; }
-
-		void* Container = Owner;
-		UStruct* ContainerStruct = Owner->GetClass();
-		FProperty* Prop = nullptr;
-		for (int32 i = 0; i < Parts.Num(); ++i)
-		{
-			Prop = ContainerStruct->FindPropertyByName(FName(*Parts[i]));
-			if (!Prop) { OutError = FString::Printf(TEXT("property '%s' not found at '%s'"), *Parts[i], *DottedName); return false; }
-			if (i < Parts.Num() - 1)
-			{
-				FStructProperty* SP = CastField<FStructProperty>(Prop);
-				if (!SP) { OutError = FString::Printf(TEXT("'%s' is not a struct - cannot descend"), *Parts[i]); return false; }
-				Container = SP->ContainerPtrToValuePtr<void>(Container);
-				ContainerStruct = SP->Struct;
-			}
-		}
-		void* ValueAddr = Prop->ContainerPtrToValuePtr<void>(Container);
-		return SetJsonOnProperty(Prop, ValueAddr, Value, OutError);
-	}
-
 	// #213: shared class lookup. Mirrors AddPCGNode's tolerant resolver - accepts
 	// short name, "/Script/PCG.X" path, or "U"-prefixed short name.
 	static UClass* FindPCGSettingsClass(const FString& ClassName)
@@ -212,7 +71,7 @@ namespace
 	}
 
 	// #213: locate a node by name within a graph, including Input/Output specials.
-	static UPCGNode* FindNodeByName(UPCGGraph* Graph, const FString& Name)
+	static UPCGNode* FindPCGNodeByName(UPCGGraph* Graph, const FString& Name)
 	{
 		if (!Graph || Name.IsEmpty()) return nullptr;
 		for (UPCGNode* Node : Graph->GetNodes())
@@ -226,7 +85,7 @@ namespace
 
 	// #213: structured property serializer used by export_pcg_graph. Emits every
 	// editable property recursively as JSON so the result round-trips through
-	// SetDottedPropertyFromJson on import. Mirrors the lambda in
+	// MCPJsonProperty::SetDottedPropertyFromJson on import. Mirrors the lambda in
 	// ReadPCGNodeSettings (#214/#215) but kept as a standalone function so both
 	// callers can share it without rebuilding the closure each call.
 	static TSharedPtr<FJsonValue> SerializePropForExport(FProperty* Prop, const void* Addr)
@@ -1014,7 +873,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::SetPCGNodeSettings(const TSharedPtr<FJsonOb
 	for (const auto& Prop : PropertiesToSet)
 	{
 		FString SubErr;
-		if (SetDottedPropertyFromJson(Settings, Prop.Key, Prop.Value, SubErr))
+		if (MCPJsonProperty::SetDottedPropertyFromJson(Settings, Prop.Key, Prop.Value, SubErr))
 		{
 			SetResults->SetField(Prop.Key, Prop.Value);
 		}
@@ -1051,15 +910,14 @@ TSharedPtr<FJsonValue> FPCGHandlers::SetPCGNodeSettings(const TSharedPtr<FJsonOb
 TSharedPtr<FJsonValue> FPCGHandlers::ExecutePCGGraph(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* FoundActor = FindActorByLabel(World, ActorLabel);
-	if (!FoundActor)
-	{
-		return MCPError(FString::Printf(TEXT("Actor not found with label: %s"), *ActorLabel));
-	}
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* FoundActor = MCPResolveActor(World, Params, ActorErr);
+	if (!FoundActor) return ActorErr;
+	ActorLabel = FoundActor->GetActorLabel();
 
 	// Get PCG component from the actor
 	UPCGComponent* PCGComp = FoundActor->FindComponentByClass<UPCGComponent>();
@@ -1080,6 +938,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::ExecutePCGGraph(const TSharedPtr<FJsonObjec
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), FoundActor->GetPathName());
 	Result->SetStringField(TEXT("componentName"), PCGComp->GetName());
 	if (PCGComp->GetGraph())
 	{
@@ -1349,15 +1208,14 @@ TSharedPtr<FJsonValue> FPCGHandlers::ReadPCGNodeSettings(const TSharedPtr<FJsonO
 TSharedPtr<FJsonValue> FPCGHandlers::GetPCGComponentDetails(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* FoundActor = FindActorByLabel(World, ActorLabel);
-	if (!FoundActor)
-	{
-		return MCPError(FString::Printf(TEXT("Actor not found with label: %s"), *ActorLabel));
-	}
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* FoundActor = MCPResolveActor(World, Params, ActorErr);
+	if (!FoundActor) return ActorErr;
+	ActorLabel = FoundActor->GetActorLabel();
 
 	// Get all PCG components on the actor
 	TArray<UPCGComponent*> PCGComps;
@@ -1370,6 +1228,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::GetPCGComponentDetails(const TSharedPtr<FJs
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), FoundActor->GetPathName());
 	Result->SetStringField(TEXT("actorClass"), FoundActor->GetClass()->GetName());
 
 	TArray<TSharedPtr<FJsonValue>> ComponentsArray;
@@ -1525,7 +1384,10 @@ TSharedPtr<FJsonValue> FPCGHandlers::SetStaticMeshSpawnerMeshes(const TSharedPtr
 namespace
 {
 	// Locate a UPCGComponent by actor label. Returns error JsonValue on failure.
-	TSharedPtr<FJsonValue> FindPCGComponentByLabel(const FString& ActorLabel, UPCGComponent*& OutComp, AActor*& OutActor)
+	// #983: takes the parameter bag so it can read actorPath, and refuses a
+	// label that names more than one actor rather than regenerating whichever
+	// PCG volume the iterator reached first.
+	TSharedPtr<FJsonValue> FindPCGComponentByLabel(const TSharedPtr<FJsonObject>& Params, UPCGComponent*& OutComp, AActor*& OutActor)
 	{
 		OutComp = nullptr;
 		OutActor = nullptr;
@@ -1537,8 +1399,10 @@ namespace
 		}
 		if (!World) return MCPError(TEXT("Editor world not available"));
 
-		OutActor = FindActorByLabel(World, ActorLabel);
-		if (!OutActor) return MCPError(FString::Printf(TEXT("Actor not found with label: %s"), *ActorLabel));
+		TSharedPtr<FJsonValue> ActorErr;
+		OutActor = MCPResolveActor(World, Params, ActorErr);
+		if (!OutActor) return ActorErr;
+		const FString ActorLabel = OutActor->GetActorLabel();
 		OutComp = OutActor->FindComponentByClass<UPCGComponent>();
 		if (!OutComp) return MCPError(FString::Printf(TEXT("No PCGComponent on actor: %s"), *ActorLabel));
 		return nullptr;
@@ -1553,10 +1417,11 @@ namespace
 TSharedPtr<FJsonValue> FPCGHandlers::ForceRegeneratePCG(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	UPCGComponent* PCGComp = nullptr; AActor* Actor = nullptr;
-	if (auto Err = FindPCGComponentByLabel(ActorLabel, PCGComp, Actor)) return Err;
+	if (auto Err = FindPCGComponentByLabel(Params, PCGComp, Actor)) return Err;
+	ActorLabel = Actor->GetActorLabel();
 
 	UPCGGraph* OriginalGraph = PCGComp->GetGraph();
 	if (!OriginalGraph)
@@ -1573,6 +1438,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::ForceRegeneratePCG(const TSharedPtr<FJsonOb
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetStringField(TEXT("componentName"), PCGComp->GetName());
 	Result->SetStringField(TEXT("graphName"), OriginalGraph->GetName());
 	Result->SetStringField(TEXT("graphPath"), OriginalGraph->GetPathName());
@@ -1583,16 +1449,18 @@ TSharedPtr<FJsonValue> FPCGHandlers::ForceRegeneratePCG(const TSharedPtr<FJsonOb
 TSharedPtr<FJsonValue> FPCGHandlers::CleanupPCG(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	UPCGComponent* PCGComp = nullptr; AActor* Actor = nullptr;
-	if (auto Err = FindPCGComponentByLabel(ActorLabel, PCGComp, Actor)) return Err;
+	if (auto Err = FindPCGComponentByLabel(Params, PCGComp, Actor)) return Err;
+	ActorLabel = Actor->GetActorLabel();
 
 	const bool bRemoveComponents = OptionalBool(Params, TEXT("removeComponents"), true);
 	PCGComp->Cleanup(bRemoveComponents);
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetStringField(TEXT("componentName"), PCGComp->GetName());
 	Result->SetBoolField(TEXT("removeComponents"), bRemoveComponents);
 	Result->SetBoolField(TEXT("cleaned"), true);
@@ -1602,10 +1470,11 @@ TSharedPtr<FJsonValue> FPCGHandlers::CleanupPCG(const TSharedPtr<FJsonObject>& P
 TSharedPtr<FJsonValue> FPCGHandlers::ToggleGraphPCG(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	UPCGComponent* PCGComp = nullptr; AActor* Actor = nullptr;
-	if (auto Err = FindPCGComponentByLabel(ActorLabel, PCGComp, Actor)) return Err;
+	if (auto Err = FindPCGComponentByLabel(Params, PCGComp, Actor)) return Err;
+	ActorLabel = Actor->GetActorLabel();
 
 	// If the caller supplies graphPath, load and use that; otherwise re-apply the current graph.
 	FString GraphPath;
@@ -1626,6 +1495,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::ToggleGraphPCG(const TSharedPtr<FJsonObject
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetStringField(TEXT("componentName"), PCGComp->GetName());
 	Result->SetStringField(TEXT("graphName"), TargetGraph->GetName());
 	Result->SetStringField(TEXT("graphPath"), TargetGraph->GetPathName());
@@ -1758,7 +1628,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::ImportGraph(const TSharedPtr<FJsonObject>& 
 			{
 				const FString SettingName(*Pair.Key);
 				FString SubErr;
-				if (SetDottedPropertyFromJson(DefaultSettings, SettingName, Pair.Value, SubErr))
+				if (MCPJsonProperty::SetDottedPropertyFromJson(DefaultSettings, SettingName, Pair.Value, SubErr))
 				{
 					++SettingsApplied;
 				}
@@ -1788,7 +1658,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::ImportGraph(const TSharedPtr<FJsonObject>& 
 		auto Resolve = [&](const FString& Name) -> UPCGNode*
 		{
 			if (UPCGNode** Found = ByLocalName.Find(Name); Found && *Found) return *Found;
-			return FindNodeByName(Graph, Name);
+			return FindPCGNodeByName(Graph, Name);
 		};
 
 		auto FirstOutputPin = [](UPCGNode* N) -> FName

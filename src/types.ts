@@ -3,6 +3,7 @@ import type { IBridge } from "./bridge.js";
 import type { ProjectContext } from "./project.js";
 import type { EditorSession, SessionRegistry } from "./session.js";
 import { McpError, ErrorCode } from "./errors.js";
+import { MAX_BRIDGE_TIMEOUT_MS } from "./bridge-timeouts.js";
 
 /**
  * Elicit a deterministic, user-mediated form response via the MCP client.
@@ -55,6 +56,11 @@ export interface ToolContext {
    *  `plugins` introspection category. Session-scoped for the same reason
    *  as getFlows: `plugins:` is per project. */
   getPlugins?: (forSession?: EditorSession) => PluginInfo[];
+  /** The per-call timeout budget the caller asked for, in milliseconds (#989).
+   *  Set by the category dispatcher when a call carried `timeoutMs`. A handler
+   *  that makes its own bridge calls should pass it through; one that does not
+   *  simply keeps the default. */
+  callTimeoutMs?: number;
   /** MCP elicitation gate. When defined, calling this blocks the active
    *  tool invocation until the user responds in their MCP client UI. When
    *  undefined, the connected client does not declare the elicitation
@@ -310,6 +316,25 @@ export interface CategoryOptions {
   normalizeParams?: (params: Record<string, unknown>) => Record<string, unknown>;
 }
 
+/**
+ * The per-call timeout budget, offered by every category tool (#989).
+ *
+ * It is a routing instruction, never a handler parameter: the dispatcher reads
+ * it and strips it, so it cannot reach a bridge method as an argument.
+ */
+export const TIMEOUT_PARAM = z
+  .number()
+  .int()
+  .positive()
+  .max(MAX_BRIDGE_TIMEOUT_MS)
+  .optional()
+  .describe(
+    "How long to wait for this call, in milliseconds. Omitted, the wait is 30s, "
+    + "or longer for the actions the editor itself allows longer. Raise it for a "
+    + "large batch or an editor busy compiling shaders. A timeout never means the "
+    + "call did not happen: read the state back before retrying.",
+  );
+
 export function categoryTool(
   name: string,
   summary: string,
@@ -333,6 +358,11 @@ export function categoryTool(
     description: `${summary}\n\nActions:\n${docs}`,
     schema: {
       action: z.enum(actionNames).describe("Action to perform"),
+      // #989: a call budget the caller controls. The client used to wait a flat
+      // 30s for every bridge call, and a large batch on a machine that is also
+      // compiling shaders finished in the editor after the client had already
+      // reported a failure. A retry then applied the mutation twice.
+      timeoutMs: TIMEOUT_PARAM,
       ...extraSchema,
     },
     actions,
@@ -349,13 +379,22 @@ export function categoryTool(
         // hunting for an action the tool actually has.
         throw new McpError(ErrorCode.UNKNOWN_ACTION, `Unknown action '${action}'. Available: ${Object.keys(actions).join(", ")}`);
       }
-      const normalized = options?.normalizeParams ? options.normalizeParams(params) : params;
+      // Routing, not an argument. Pulled out before normalizeParams so no
+      // mapParams can forward it into a bridge call as a parameter (#989).
+      const { timeoutMs: requestedTimeout, rest: withoutTimeout } = takeTimeout(params);
+      const normalized = options?.normalizeParams ? options.normalizeParams(withoutTimeout) : withoutTimeout;
       if (spec.handler) {
-        return spec.handler(ctx, normalized);
+        // The budget travels on the context, not in the parameters: a custom
+        // handler that forwards its params to the bridge must not turn it into
+        // a bridge argument (#989).
+        return spec.handler(requestedTimeout === undefined ? ctx : { ...ctx, callTimeoutMs: requestedTimeout }, normalized);
       }
       if (spec.bridge) {
         const mapped = spec.mapParams ? spec.mapParams(normalized) : stripAction(normalized);
-        return ctx.bridge.call(spec.bridge, mapped, spec.timeoutMs);
+        // The caller's budget wins over the action's authored one: an action
+        // that declares 120s is stating a floor it needs, not a ceiling the
+        // caller may not raise.
+        return ctx.bridge.call(spec.bridge, mapped, requestedTimeout ?? spec.timeoutMs);
       }
       throw new McpError(ErrorCode.NO_HANDLER, `Action '${action}' has no handler or bridge method`);
     },
@@ -371,6 +410,21 @@ export function categoryTool(
 function stripAction(params: Record<string, unknown>): Record<string, unknown> {
   const { action: _, ...rest } = params;
   return rest;
+}
+
+/**
+ * Separate the per-call timeout budget from the action's own parameters.
+ * A non-positive or non-numeric value is discarded rather than refused: the
+ * schema already rejects it, and a direct caller gets the default.
+ */
+export function takeTimeout(
+  params: Record<string, unknown>,
+): { timeoutMs?: number; rest: Record<string, unknown> } {
+  const { timeoutMs, ...rest } = params;
+  const usable = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? Math.min(timeoutMs, MAX_BRIDGE_TIMEOUT_MS)
+    : undefined;
+  return { timeoutMs: usable, rest };
 }
 
 /**

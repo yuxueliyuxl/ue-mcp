@@ -26,6 +26,10 @@ void FFoliageHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("get_foliage_type_settings"), &GetFoliageSettings);
 	Registry.RegisterHandler(TEXT("set_foliage_type_settings"), &SetFoliageTypeSettings);
 	Registry.RegisterHandler(TEXT("create_foliage_type"), &CreateFoliageType);
+	// #988: predicate-driven batch. Scanning and saving hundreds of FoliageType
+	// assets outlives the default handler timeout.
+	Registry.RegisterHandlerWithTimeout(
+		TEXT("batch_set_foliage_settings_where"), &BatchSetFoliageSettingsWhere, 300.0f);
 }
 
 TSharedPtr<FJsonValue> FFoliageHandlers::ListFoliageTypes(const TSharedPtr<FJsonObject>& Params)
@@ -150,7 +154,12 @@ TSharedPtr<FJsonValue> FFoliageHandlers::SampleFoliage(const TSharedPtr<FJsonObj
 TSharedPtr<FJsonValue> FFoliageHandlers::GetFoliageSettings(const TSharedPtr<FJsonObject>& Params)
 {
 	FString FoliageTypePath;
-	if (auto Err = RequireString(Params, TEXT("foliageTypePath"), FoliageTypePath)) return Err;
+	if (!Params->TryGetStringField(TEXT("foliageTypePath"), FoliageTypePath) || FoliageTypePath.IsEmpty())
+	{
+		// #988: a caller who reaches this error usually wants the whole set,
+		// not one asset, so the error names the action that answers that.
+		return MCPError(TEXT("Missing required parameter 'foliageTypePath'. To read or filter many types at once use foliage(list_types) or asset(bulk_read_properties); to WRITE settings to every type matching a predicate use foliage(batch_set_settings_where)."));
+	}
 
 	UFoliageType* FoliageType = LoadObject<UFoliageType>(nullptr, *FoliageTypePath);
 	if (!FoliageType)
@@ -227,7 +236,7 @@ TSharedPtr<FJsonValue> FFoliageHandlers::SetFoliageTypeSettings(const TSharedPtr
 	}
 	if (FoliageTypePath.IsEmpty())
 	{
-		return MCPError(TEXT("Missing 'foliageTypePath' or 'foliageTypeName' parameter"));
+		return MCPError(TEXT("Missing 'foliageTypePath' or 'foliageTypeName' parameter. To write the same settings to every type matching a predicate on an existing value, use foliage(batch_set_settings_where) instead of calling this once per asset (#988)."));
 	}
 
 	const TSharedPtr<FJsonObject>* SettingsObj = nullptr;

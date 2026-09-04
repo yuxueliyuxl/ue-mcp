@@ -144,6 +144,7 @@ private:
 	static TSharedPtr<FJsonValue> SaveDirty(const TSharedPtr<FJsonObject>& Params);
 	// #340: enumerate currently-dirty content/map packages
 	static TSharedPtr<FJsonValue> ListDirtyPackages(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GetWorldState(const TSharedPtr<FJsonObject>& Params);
 	// Gracefully close the editor after dirty-package and PIE safety checks.
 	static TSharedPtr<FJsonValue> RequestEditorShutdown(const TSharedPtr<FJsonObject>& Params);
 	// PIE runtime inspection/control (#739/#756/#757/#761/#764/#770/#777/#778).
@@ -154,6 +155,9 @@ private:
 	static TSharedPtr<FJsonValue> ReadBoneTransforms(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> TeleportRuntimeActor(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetMovementMode(const TSharedPtr<FJsonObject>& Params);
+	// Bounded, reversible visibility changes on live PIE actors/components.
+	static TSharedPtr<FJsonValue> SetRuntimeVisibility(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RestoreRuntimeVisibility(const TSharedPtr<FJsonObject>& Params);
 	// #802: locate live UObject instances, and write to one.
 	static TSharedPtr<FJsonValue> FindLiveObjects(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetObjectProperty(const TSharedPtr<FJsonObject>& Params);

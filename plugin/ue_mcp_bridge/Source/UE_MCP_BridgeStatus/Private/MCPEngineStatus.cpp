@@ -128,10 +128,25 @@ void FMCPEngineStatus::Install()
 
 	RebindFeedbackContextIfNeeded();
 
+	// #990: nothing polls a commandlet's engine state, and 32 of them writing
+	// one document four times a second was a build-breaking error storm. Do not
+	// even start the thread there.
+	if (!ShouldPublishStatus())
+	{
+		UE_LOG(LogMCPBridgeStatus, Log,
+			TEXT("[UE-MCP] Engine status snapshot installed without a writer thread: this process is a commandlet, and nothing polls a commandlet's engine state."));
+		return;
+	}
+
+	// Per-process status files from editors that crashed. Swept once, here, by
+	// the next process that can prove them stale, so a machine that crashes
+	// repeatedly does not accumulate a directory of them.
+	RemoveStaleInstanceStatusFiles();
+
 	bStopWriter = false;
 	WriterThread = FRunnableThread::Create(this, TEXT("MCPEngineStatusWriter"), 0, TPri_BelowNormal);
 
-	UE_LOG(LogMCPBridgeStatus, Log, TEXT("[UE-MCP] Engine status snapshot installed -> %s"), *StatusFilePath());
+	UE_LOG(LogMCPBridgeStatus, Log, TEXT("[UE-MCP] Engine status snapshot installed -> %s"), *InstanceStatusFilePath());
 }
 
 void FMCPEngineStatus::Shutdown()
@@ -188,9 +203,36 @@ void FMCPEngineStatus::Shutdown()
 	ModalProvider = nullptr;
 	CompileProvider = nullptr;
 
-	// Leave no stale file behind: a status.json from a dead editor claiming a
-	// 40% slow task is worse than no file at all.
-	IFileManager::Get().Delete(*StatusFilePath(), false, false, true);
+	// Leave no stale file behind: a status from a dead editor claiming a 40%
+	// slow task is worse than no file at all. This process's own file always
+	// goes; the shared one only if this process is the last thing that wrote
+	// it, so an editor shutting down does not blind a client watching another
+	// editor of the same project (#990).
+	IFileManager::Get().Delete(*InstanceStatusFilePath(), false, false, true);
+	if (SharedStatusBelongsToThisProcess())
+	{
+		IFileManager::Get().Delete(*StatusFilePath(), false, false, true);
+	}
+}
+
+bool FMCPEngineStatus::SharedStatusBelongsToThisProcess()
+{
+	FString Raw;
+	if (!FFileHelper::LoadFileToString(Raw, *StatusFilePath()))
+	{
+		return false;
+	}
+	TSharedPtr<FJsonObject> Parsed;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Raw);
+	if (!FJsonSerializer::Deserialize(Reader, Parsed) || !Parsed.IsValid())
+	{
+		// Unreadable, so nothing can be shown to own it. Leaving it costs one
+		// stale file; removing it could take a live editor's snapshot away.
+		return false;
+	}
+	double Pid = 0.0;
+	return Parsed->TryGetNumberField(TEXT("pid"), Pid)
+		&& (uint32)Pid == FPlatformProcess::GetCurrentProcessId();
 }
 
 void FMCPEngineStatus::RebindFeedbackContextIfNeeded()
@@ -370,6 +412,10 @@ TSharedPtr<FJsonObject> FMCPEngineStatus::Snapshot() const
 	FScopeLock Lock(&Mutex);
 
 	Out->SetStringField(TEXT("phase"), Phase);
+	// #990: which process this describes. One project directory can hold the
+	// status of several, and a document that does not name its subject cannot
+	// be told apart from one that does.
+	Out->SetNumberField(TEXT("pid"), (double)FPlatformProcess::GetCurrentProcessId());
 	Out->SetNumberField(TEXT("uptimeSeconds"), Now - InstallSeconds);
 	Out->SetNumberField(TEXT("modulesLoaded"), ModulesLoaded);
 
@@ -450,13 +496,105 @@ TSharedPtr<FJsonObject> FMCPEngineStatus::Snapshot() const
 	return Out;
 }
 
+FString FMCPEngineStatus::StatusDir()
+{
+	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UE_MCP_Bridge"));
+}
+
 FString FMCPEngineStatus::StatusFilePath()
 {
-	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UE_MCP_Bridge"), TEXT("status.json"));
+	return FPaths::Combine(StatusDir(), TEXT("status.json"));
+}
+
+FString FMCPEngineStatus::InstanceStatusFilePath()
+{
+	return FPaths::Combine(StatusDir(),
+		FString::Printf(TEXT("status.%u.json"), FPlatformProcess::GetCurrentProcessId()));
+}
+
+bool FMCPEngineStatus::ShouldPublishStatus()
+{
+	// #990: a commandlet publishes nothing. A distributed HLOD build runs 32
+	// WorldPartitionBuilderCommandlet slots, each its own UnrealEditor-Cmd.exe
+	// with this plugin loaded, and all 32 wrote the same status.json from their
+	// own writer threads four times a second. One run produced 3,743
+	// Error-severity log lines, up to 147 in a single slot, and every slot then
+	// finished with "Failure - 112 error(s)" even where the HLOD work had
+	// succeeded, which breaks exit-status and error-count success detection for
+	// CI. One commandlet died in a retry storm. Nothing polls a commandlet's
+	// engine state in the first place: this exists so an agent can see what an
+	// INTERACTIVE editor is doing while its game thread is blocked.
+	//
+	// Asked per flush rather than once at Install, because the commandlet flag
+	// is set during engine startup and Install runs at PostConfigInit.
+	return !IsRunningCommandlet();
+}
+
+bool FMCPEngineStatus::PublishAtomically(const FString& FinalPath, const FString& Contents)
+{
+	// Write then move: a reader polling at the same rate would otherwise catch
+	// a half-written file and report "no snapshot" at the exact moment the
+	// snapshot matters.
+	//
+	// #990: the temp file carries this process's pid, the way
+	// FMCPBridgeStateFiles::PublishJson has always done it. Without that every
+	// process in the project directory wrote and renamed one shared
+	// `status.json.tmp`, so concurrent writers deleted each other's temp file
+	// out from under the rename and each failure was logged at Error severity.
+	const FString TempPath = FString::Printf(TEXT("%s.%u.tmp"), *FinalPath, FPlatformProcess::GetCurrentProcessId());
+	if (!FFileHelper::SaveStringToFile(Contents, *TempPath))
+	{
+		return false;
+	}
+	if (!IFileManager::Get().Move(*FinalPath, *TempPath, /*Replace*/ true, /*EvenIfReadOnly*/ true))
+	{
+		IFileManager::Get().Delete(*TempPath, /*RequireExists*/ false, /*EvenReadOnly*/ false, /*Quiet*/ true);
+		return false;
+	}
+	return true;
+}
+
+void FMCPEngineStatus::RemoveStaleInstanceStatusFiles()
+{
+	const FString Dir = StatusDir();
+	TArray<FString> FileNames;
+	IFileManager::Get().FindFiles(FileNames, *FPaths::Combine(Dir, TEXT("status.*.json")), /*Files*/ true, /*Directories*/ false);
+
+	const uint32 OwnPid = FPlatformProcess::GetCurrentProcessId();
+	for (const FString& FileName : FileNames)
+	{
+		// "status.<pid>.json" - the middle token is the pid, and anything that
+		// is not a number is not a file this writes.
+		FString Middle = FileName;
+		Middle.RemoveFromStart(TEXT("status."));
+		Middle.RemoveFromEnd(TEXT(".json"));
+		if (Middle.IsEmpty() || !Middle.IsNumeric())
+		{
+			continue;
+		}
+
+		const uint32 Pid = (uint32)FCString::Strtoui64(*Middle, nullptr, 10);
+		if (Pid == 0 || Pid == OwnPid || FPlatformProcess::IsApplicationRunning(Pid))
+		{
+			continue;
+		}
+
+		const FString FilePath = FPaths::Combine(Dir, FileName);
+		if (IFileManager::Get().Delete(*FilePath, /*RequireExists*/ false, /*EvenReadOnly*/ false, /*Quiet*/ true))
+		{
+			UE_LOG(LogMCPBridgeStatus, Log,
+				TEXT("[UE-MCP] Removed the stale engine status file for pid %u: that process is gone."), Pid);
+		}
+	}
 }
 
 void FMCPEngineStatus::FlushToDisk()
 {
+	if (!ShouldPublishStatus())
+	{
+		return;
+	}
+
 	TSharedPtr<FJsonObject> Json = Snapshot();
 	Json->SetStringField(TEXT("writtenAt"), FDateTime::UtcNow().ToIso8601());
 
@@ -464,15 +602,15 @@ void FMCPEngineStatus::FlushToDisk()
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Serialised);
 	FJsonSerializer::Serialize(Json.ToSharedRef(), Writer);
 
-	// Write then move: a reader polling at the same rate would otherwise catch
-	// a half-written file and report "no snapshot" at the exact moment the
-	// snapshot matters.
-	const FString Final = StatusFilePath();
-	const FString Temp = Final + TEXT(".tmp");
-	if (FFileHelper::SaveStringToFile(Serialised, *Temp))
-	{
-		IFileManager::Get().Move(*Final, *Temp, true, true);
-	}
+	// The per-process file first: it is the one nobody else can overwrite, and
+	// it is what a reader that understands several editors of one project uses.
+	PublishAtomically(InstanceStatusFilePath(), Serialised);
+
+	// And the shared path, so a client older than this change still finds a
+	// snapshot where it has always looked. Two editors of one project take
+	// turns here; the per-process files above are where each one's own truth
+	// stays intact.
+	PublishAtomically(StatusFilePath(), Serialised);
 }
 
 uint32 FMCPEngineStatus::Run()
