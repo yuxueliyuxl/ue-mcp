@@ -1410,7 +1410,7 @@ namespace
 		for (UEdGraphPin* Pin : FC->Pins)
 		{
 			if (!Pin) continue;
-			TSharedPtr<FJsonObject> PinObj = PinToJson(Pin);
+			TSharedPtr<FJsonObject> PinObj = NiagaraPinToJson(Pin);
 			PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Output ? TEXT("output") : TEXT("input"));
 			Pins.Add(MakeShared<FJsonValueObject>(PinObj));
 		}
@@ -2596,7 +2596,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::DescribeScriptGraph(const TSharedPtr<FJ
 			for (UEdGraphPin* Pin : N->Pins)
 			{
 				if (!Pin) continue;
-				TSharedPtr<FJsonObject> PinObj = PinToJson(Pin);
+				TSharedPtr<FJsonObject> PinObj = NiagaraPinToJson(Pin);
 				PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Output ? TEXT("output") : TEXT("input"));
 				AllPins.Add(MakeShared<FJsonValueObject>(PinObj));
 			}
@@ -2623,7 +2623,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::DescribeScriptGraph(const TSharedPtr<FJ
 			for (UEdGraphPin* Pin : OutputNode->Pins)
 			{
 				if (!Pin) continue;
-				TSharedPtr<FJsonObject> PinObj = PinToJson(Pin);
+				TSharedPtr<FJsonObject> PinObj = NiagaraPinToJson(Pin);
 				PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Output ? TEXT("output") : TEXT("input"));
 				Pins.Add(MakeShared<FJsonValueObject>(PinObj));
 			}
