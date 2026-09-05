@@ -70,8 +70,6 @@ private:
 	// targets, custom HLSL, pins, data-interface input nodes) so an agent can
 	// replicate module logic without opening the editor.
 	static TSharedPtr<FJsonValue> DescribeModuleGraph(const TSharedPtr<FJsonObject>& Params);
-	// Toggle a module node's enabled state (exported SetModuleIsEnabled path).
-	static TSharedPtr<FJsonValue> SetModuleEnabled(const TSharedPtr<FJsonObject>& Params);
 	// Dump the source graph of an arbitrary NiagaraScript object (embedded
 	// module/scratch scripts) - nodes, pins, assignment targets, custom HLSL.
 	static TSharedPtr<FJsonValue> DescribeScriptGraph(const TSharedPtr<FJsonObject>& Params);

@@ -114,7 +114,6 @@ void FNiagaraHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("create_scratch_module"), &CreateScratchModule);
 	// GPU-refactor support
 	Registry.RegisterHandler(TEXT("describe_niagara_module_graph"), &DescribeModuleGraph);
-	Registry.RegisterHandler(TEXT("set_niagara_module_enabled"), &SetModuleEnabled);
 	Registry.RegisterHandler(TEXT("describe_niagara_script_graph"), &DescribeScriptGraph);
 	Registry.RegisterHandler(TEXT("set_niagara_di_function"), &SetDiFunction);
 	Registry.RegisterHandler(TEXT("graph_add_node"), &GraphAddNode);
