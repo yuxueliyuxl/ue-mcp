@@ -2918,7 +2918,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::DescribeModuleGraph(const TSharedPtr<FJ
 	return MCPResult(Res);
 }
 
-TSharedPtr<FJsonValue> FNiagaraHandlers::SetModuleEnabled(const TSharedPtr<FJsonObject>& Params)
+TSharedPtr<FJsonValue> FNiagaraHandlers::SetModuleEnabledLegacy(const TSharedPtr<FJsonObject>& Params)
 {
 	FString SystemPath;
 	if (auto Err = RequireString(Params, TEXT("systemPath"), SystemPath)) return Err;

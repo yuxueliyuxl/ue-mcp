@@ -56,6 +56,7 @@ private:
 	static TSharedPtr<FJsonValue> SetCustomHlsl(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveModule(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetModuleEnabled(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetModuleEnabledLegacy(const TSharedPtr<FJsonObject>& Params);
 	// Remove an emitter handle from a system (CRUD delete).
 	static TSharedPtr<FJsonValue> RemoveEmitterFromSystem(const TSharedPtr<FJsonObject>& Params);
 	// Structural verify gate: does the system have emitters that will emit?
