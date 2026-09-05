@@ -240,6 +240,12 @@ public:
 	// Get game thread executor (to set editor ready)
 	FMCPGameThreadExecutor& GetGameThreadExecutor() { return GameThreadExecutor; }
 
+	// Lightweight status accessors used by the editor toolbar.
+	bool IsRunning() const { return bIsRunning; }
+	int32 GetPort() const { return ServerPort; }
+	const FString& GetPortSource() const { return PortSource; }
+	int32 GetHandshakenClientCount() const { return ActiveConnectionCount.GetValue(); }
+
 	// Process a JSON-RPC message
 	FString ProcessMessage(const FString& Message);
 

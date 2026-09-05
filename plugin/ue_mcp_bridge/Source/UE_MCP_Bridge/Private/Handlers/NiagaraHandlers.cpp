@@ -1670,29 +1670,6 @@ namespace
 		return O;
 	}
 
-	TSharedPtr<FJsonObject> NiagaraPinToJson(const UEdGraphPin* Pin)
-	{
-		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
-		O->SetStringField(TEXT("name"), Pin->PinName.ToString());
-		O->SetStringField(TEXT("type"), Pin->PinType.PinCategory.ToString());
-		O->SetStringField(TEXT("subCategory"), Pin->PinType.PinSubCategory.ToString());
-		O->SetStringField(TEXT("defaultValue"), Pin->DefaultValue);
-		O->SetBoolField(TEXT("linked"), Pin->LinkedTo.Num() > 0);
-		if (Pin->LinkedTo.Num() > 0)
-		{
-			TArray<TSharedPtr<FJsonValue>> Links;
-			for (UEdGraphPin* L : Pin->LinkedTo)
-			{
-				if (L && L->GetOwningNode())
-				{
-					Links.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%s.%s"), *L->GetOwningNode()->GetName(), *L->PinName.ToString())));
-				}
-			}
-			O->SetArrayField(TEXT("linkedTo"), Links);
-		}
-		return O;
-	}
-
 	// Shared node-to-JSON for function-call module nodes: class, function name,
 	// script asset, enabled state, assignment targets/defaults, custom HLSL,
 	// and pins. Used by describe_module_graph and describe_script_graph.
