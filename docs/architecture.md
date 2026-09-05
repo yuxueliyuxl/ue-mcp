@@ -136,7 +136,7 @@ The plugin runs a raw WebSocket server on a dedicated thread, dispatches incomin
 
 ### Handler Categories
 
-28 C++ handler groups are registered in `BridgeServer.cpp`. Together they expose <!-- count:actions -->855+<!-- /count --> method names (some of which are aliases mapped onto a smaller number of canonical handlers):
+34 C++ handler groups are registered in `BridgeServer.cpp`. Together they expose <!-- count:actions -->1090+<!-- /count --> method names (some of which are aliases mapped onto a smaller number of canonical handlers):
 
 | Handler group | Coverage |
 |---------|----------|
@@ -168,6 +168,12 @@ The plugin runs a raw WebSocket server on a dedicated thread, dispatches incomin
 | DiffHandlers | Semantic Blueprint and asset diffing |
 | ProjectHandlers | Project info, world subsystem queries |
 | DemoHandlers | Neon Shrine demo builder |
+| AssetBulkReadHandlers | Batched property reads across many assets in one call |
+| AssetGeometryHandlers | Geometry Script mesh authoring and fracture |
+| AssetMeshBooleanHandlers | Boolean mesh operations |
+| CollisionQueryHandlers | World traces, overlaps and sweeps |
+| MassHandlers | Mass Entity fragments, traits and processors |
+| SkeletalMeshHandlers | Skeletal mesh LODs, sections and instancing settings |
 
 ### Plugin Modules
 

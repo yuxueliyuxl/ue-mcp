@@ -116,6 +116,39 @@ describe("action classification", () => {
     expect(requiresExplicitEditor(stranger.class)).toBe(true);
   });
 
+  it("does not let a trailing read verb turn a mutation into a read", () => {
+    // The case this rule was written from. `wire_rvt_sample` added a sampler
+    // node to a material and classified as a READ, because `sample` is a read
+    // verb and the old rule accepted one anywhere in the name. Untargeted
+    // dispatch would have let it edit whichever editor was active. It was
+    // caught by a person reading the name, not by anything here, and renamed
+    // to `add_rvt_sampler`, which fixed the name and not the rule.
+    //
+    // A read verb now counts only in the leading segment. Everything else
+    // falls to `unresolved`, which is gated like a mutation and which the
+    // drift guard at the top of this file fails on, so the next one is a CI
+    // failure asking for a decision rather than a wrong-editor write.
+    const trailing = classifyActionClass("material", "wire_rvt_sample");
+    expect(trailing).toEqual({ class: "unknown", source: "unresolved" });
+    expect(requiresExplicitEditor(trailing.class)).toBe(true);
+
+    // The shipped spelling leads with a mutate verb and is unambiguous.
+    expect(classifyActionClass("material", "add_rvt_sampler").class).toBe("mutate");
+
+    // A leading read verb still settles it with no override needed.
+    expect(classifyActionClass("material", "read_runtime_virtual_texture")).toEqual({
+      class: "read",
+      source: "lexicon",
+    });
+
+    // And the genuine reads whose names lead with a subsystem are decided by
+    // an override that says so, not by a verb the scanner happened to find.
+    expect(classifyActionClass("audio", "metasound_validate")).toEqual({
+      class: "read",
+      source: "override",
+    });
+  });
+
   it("does not require a target for the session-registry actions", () => {
     // These never reach a bridge: they name their subject in their own
     // parameters, so no routing decision can send them to the wrong editor.

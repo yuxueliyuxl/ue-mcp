@@ -13,6 +13,7 @@ import {
   type FallbackReport,
 } from "../feedback-fallback.js";
 import { getFeedbackMode, type FeedbackMode } from "../user-state.js";
+import { clientAdvertisesElicitation } from "../editor-control.js";
 import { warn } from "../log.js";
 import { routeFeedback, type RoutingDecision } from "../feedback-routing.js";
 import { CORE_REPO, newIssueUrl, parseRepoSlug, repoSlug, sameRepo, type GitHubRepo } from "../registry-catalog.js";
@@ -592,7 +593,7 @@ export const feedbackTool: ToolDef = categoryTool(
   {
     submit: {
       description:
-        "Submit feedback about a tool gap (missing action, wrong behavior, crash, or a case you had to work around). Provide a specific title and a summary; pythonWorkaround and idealTool are optional enrichment, not prerequisites. Checks the plugin registry first and files against the owning plugin's repo when one matches, then blocks on an MCP elicitation prompt that asks the USER (not the agent) to approve or decline the exact payload - and to override the tracker - before anything is posted to GitHub. If the client cannot show that form (it never advertised elicitation, it throws, or it auto-answers in milliseconds without rendering anything), nothing is lost: the report is written to disk and the result carries a prefilled GitHub issue URL for the user to click.",
+        "Submit feedback about a tool gap (missing action, wrong behavior, crash, or a case you had to work around). Provide a specific title and a summary; pythonWorkaround and idealTool are optional enrichment, not prerequisites. Checks the plugin registry first and files against the owning plugin's repo when one matches, then blocks on an MCP elicitation prompt that asks the USER (not the agent) to approve or decline the exact payload - and to override the tracker - before anything is posted to GitHub. If the client cannot show that form (it never advertised elicitation, it throws, or it auto-answers in milliseconds without rendering anything), nothing is lost: the report is written to disk and the result carries a prefilled GitHub issue URL for the user to click. Params: title, summary, pythonWorkaround?, idealTool?, author?, repo?, confirmToken?",
       handler: async (ctx: ToolContext, params: Record<string, unknown>) => {
         // ── Confirmation-token path (#991) ───────────────────────
         // The elicitation gate could not reach a human on an earlier call,
@@ -694,7 +695,14 @@ export const feedbackTool: ToolDef = categoryTool(
         // The client never advertised elicitation, so there is no form to
         // show. Previously a dead end; now it degrades to the fallback, which
         // needs nothing from the client at all.
-        if (mode === "interactive" && !ctx.elicit) {
+        //
+        // Asked as a capability, not as "is there a function". The server
+        // builds the gate at startup, before any client has connected, so
+        // ctx.elicit is defined for every client and testing it for undefined
+        // made this branch unreachable: a client that advertised nothing got
+        // the elicitation path and its error, rather than the fallback that
+        // needs nothing from it.
+        if (mode === "interactive" && !clientAdvertisesElicitation(ctx.elicit)) {
           const report = saveFallback("client did not advertise the elicitation capability");
           return elicitationFallbackDirective(
             `[FEEDBACK NOT SUBMITTED - NO APPROVAL CHANNEL]`,
@@ -867,8 +875,10 @@ export const feedbackTool: ToolDef = categoryTool(
         }
 
         // ── Interactive mode (default): elicitation gate ───────────
-        // NOTE: ctx.elicit is guaranteed defined here because the
-        // mode === "interactive" + !ctx.elicit case returned above.
+        // NOTE: ctx.elicit is guaranteed defined here. The capability check
+        // above returns for interactive mode when the client advertised no
+        // elicitation, and a missing gate is one of the states that check
+        // reports as "cannot be asked", so nothing reaches here without one.
         let elicitResult;
         // #772: a client that never renders the form still answers, and it
         // answers instantly. Time the round trip so an auto-decline can be

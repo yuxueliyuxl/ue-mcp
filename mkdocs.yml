@@ -69,7 +69,10 @@ nav:
     - Runtime Inspection: runtime-widget-inspection.md
     - Runtime Interaction: runtime-widget-interaction.md
     - Layout Diagnostics: runtime-widget-layout-diagnostics.md
-  - Flows: flows.md
+  - Flows:
+    - flows.md
+    - Journal: journal.md
+    - Skill Packs: skill-packs.md
   - Plugins:
     - plugins.md
     - Registry (plugins.ue-mcp.com): https://plugins.ue-mcp.com

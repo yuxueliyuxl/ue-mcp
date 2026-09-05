@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { categoryTool, type ToolDef, type ActionSpec } from "./types.js";
+import { actionEnum, categoryTool, type ToolDef, type ActionSpec } from "./types.js";
 import { McpError, ErrorCode } from "./errors.js";
 import { coerceAssetPathValue } from "./asset-path.js";
 
@@ -389,7 +389,7 @@ export function enrichToolsWithEpicCatalog(
     const t = byName.get(catName);
     if (!t) continue;
     const actionNames = Object.keys(t.actions) as [string, ...string[]];
-    t.schema.action = z.enum(actionNames).describe("Action to perform");
+    t.schema.action = actionEnum(actionNames);
     if (!t.schema.input) {
       t.schema.input = z.record(z.unknown()).optional()
         .describe("Epic tool arguments as a JSON object (for epic_* actions)");

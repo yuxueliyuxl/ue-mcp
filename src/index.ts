@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { SessionRegistry, type EditorSession } from "./session.js";
 import type { ProjectContext } from "./project.js";
+import { ueMcpConfigRejections, describeConfigRejections } from "./project.js";
 import { attach, attachSummary } from "./deployer.js";
 import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_LEAN, SERVER_INSTRUCTIONS_MICRO, multiEditorInstructions } from "./instructions.js";
 import { resolveContextStrategy, applyLeanContext, buildMicroGateway } from "./lean-context.js";
@@ -49,6 +50,7 @@ import * as path from "node:path";
 import yaml from "js-yaml";
 
 import { ALL_TOOLS, setLiveToolGraph } from "./tools.js";
+import { nearestActions } from "./action-schema.js";
 import { enrichToolsWithEpicCatalog, type EpicCatalog } from "./epic-enrich.js";
 import { checkPluginFreshness } from "./plugin-freshness.js";
 import { saveCatalogCache, loadCatalogCache, loadBakedCatalog } from "./epic-cache.js";
@@ -172,6 +174,14 @@ async function main() {
       if (freshness.stale && freshness.message) {
         console.error(`[ue-mcp] WARNING: ${freshness.message}`);
       }
+
+      // D3: a malformed `ue-mcp:` key no longer takes the whole block with it,
+      // and the key that was dropped is named where somebody starting the
+      // server can see it. bridge.port lost this way put the client on the
+      // derived port while the editor bound the pinned one.
+      for (const line of describeConfigRejections(ueMcpConfigRejections(session.project.projectDir))) {
+        console.error(`[ue-mcp] WARNING: ${line}`);
+      }
     } catch (e) {
       console.error(`[ue-mcp] Failed to initialize project '${arg}': ${e instanceof Error ? e.message : e}`);
     }
@@ -246,7 +256,7 @@ async function main() {
   // Each session gets the strategy applied to its OWN graph, so its registry
   // dispatches only what that project actually provides.
   const loads = [...perSession.values()];
-  for (const load of loads) {
+  const applyContextStrategy = (load: SessionLoad): void => {
     const enabled = load.surface.tools.filter((t) => !load.surface.disabled.has(t.name));
     if (contextStrategy === "micro") {
       const gateway = buildMicroGateway(enabled);
@@ -254,14 +264,16 @@ async function main() {
       // Keep every category task in the registry so flows still resolve.
       load.registryTools = [gateway, ...load.surface.tools];
     } else if (contextStrategy === "lean") {
-      const leaned = applyLeanContext(load.surface.tools);
-      load.advertisedTools = leaned.filter((t) => !load.surface.disabled.has(t.name));
-      load.registryTools = leaned;
+      const leaned = applyLeanContext(enabled);
+      load.advertisedTools = leaned;
+      // Discovery describes callable categories; internal flows retain the full registry.
+      load.registryTools = [...leaned, ...load.surface.tools.filter((t) => load.surface.disabled.has(t.name))];
     } else {
       load.advertisedTools = enabled;
       load.registryTools = load.surface.tools;
     }
-  }
+  };
+  for (const load of loads) applyContextStrategy(load);
 
   // What the client is advertised. At one editor this is that editor's list,
   // the same objects it always was. Beyond one it is the union, so an action
@@ -277,7 +289,17 @@ async function main() {
   // execute_python gate and the feedback router all ask "what does this server
   // expose", and with a graph per session that answer no longer lives in the
   // module-level declaration they used to read.
-  const dispatchUnion = unionSurface(loads.map((l) => ({ ...l.surface, tools: l.registryTools })));
+  //
+  // Recomputed when a session is registered at runtime: built from the startup
+  // set alone, it could not refuse for an editor added later, and that editor's
+  // own `disable:` list was not enforced anywhere (D1).
+  let dispatchUnion = unionSurface(loads.map((l) => ({ ...l.surface, tools: l.registryTools })));
+  const refreshDispatchUnion = (): void => {
+    dispatchUnion = unionSurface(
+      [...perSession.values()].map((l) => ({ ...l.surface, tools: l.registryTools })),
+    );
+    setLiveToolGraph(dispatchUnion.tools);
+  };
   setLiveToolGraph(dispatchUnion.tools);
   const registryTools = primaryLoad.registryTools;
   if (contextStrategy !== "full") {
@@ -290,7 +312,12 @@ async function main() {
   // Reads the addressed session's project, so a flow declared in one project's
   // ue-mcp.yml is not reported as belonging to another's.
   const getFlows = (forSession?: EditorSession): Array<{ name: string; description?: string }> => {
-    const load = perSession.get(forSession ?? primary) ?? primaryLoad;
+    // No `?? primaryLoad`. A session whose surface is not built yet has no
+    // flows of its own, and reporting the FIRST project's flows as that
+    // editor's is how project(get_status, editor="B") came to advertise
+    // project A's reset_level as something B would run (D1).
+    const load = perSession.get(forSession ?? primary);
+    if (!load) return [];
     try {
       const cfg = loadFlowConfig(load.surface.tools, load.configDir, {
         tasks: load.pluginLoad.taskDefs,
@@ -307,7 +334,11 @@ async function main() {
 
   const getPlugins = (forSession?: EditorSession): PluginInfo[] => {
     const target = forSession ?? primary;
-    const load = perSession.get(target) ?? primaryLoad;
+    // Same rule as getFlows: another project's plugin list is not this
+    // editor's, and an empty list is the truthful answer for a session whose
+    // own surface has not been built (D1).
+    const load = perSession.get(target);
+    if (!load) return [];
     return load.surface.pluginRecords.map((r) => toPluginInfo(r, target.project));
   };
 
@@ -315,7 +346,7 @@ async function main() {
   // during initialize. We lazily probe at call time so the function is bound
   // to whatever the live capabilities are, not a stale snapshot.
   const buildElicit = (mcp: McpServer): ElicitFn | undefined => {
-    return async (params) => {
+    const elicit: ElicitFn = async (params) => {
       const caps = mcp.server.getClientCapabilities();
       if (!caps?.elicitation) {
         // Surface a JSON-RPC-style error shape so callers can distinguish
@@ -328,6 +359,14 @@ async function main() {
       const result = await mcp.server.elicitInput(params);
       return result as Awaited<ReturnType<ElicitFn>>;
     };
+    // The gate is built before any client has connected, so this function
+    // exists whatever the client turns out to support, and its presence proves
+    // nothing. Callers deciding whether the user CAN be asked ask this, which
+    // reads the live capability at call time. Without it, every client looks
+    // like an elicitation client and a mode that is meant to fall back to defer
+    // would resolve to interactive for clients that advertised nothing.
+    elicit.clientAdvertisesElicitation = () => !!mcp.server.getClientCapabilities()?.elicitation;
+    return elicit;
   };
 
   // Each session already wraps its own raw bridge in the guard pipeline; the
@@ -336,6 +375,21 @@ async function main() {
   // registry starts empty (pass-through) and is populated once the task
   // registry exists, below.
   const guardedBridge = primary.guarded;
+  const getToolGraph = (forSession: EditorSession = primary): ToolDef[] => {
+    const load = perSession.get(forSession);
+    // D1 again. A session whose surface failed to build has no graph of its
+    // own, and answering from the union would name another project's actions.
+    // Returning nothing instead reads as "no action matched", which sends the
+    // caller to execute_python for something the editor does in fact provide.
+    if (!load) {
+      throw new McpError(
+        ErrorCode.NOT_FOUND,
+        `Editor '${forSession.name}' has no tool surface built, so its actions cannot be searched or described. `
+        + "Re-register it with project(add_editor); discovery does not fall back to another editor's graph.",
+      );
+    }
+    return load.surface.tools.filter((t) => !load.surface.disabled.has(t.name));
+  };
   const ctx: ToolContext = {
     bridge: guardedBridge,
     project,
@@ -343,6 +397,7 @@ async function main() {
     sessions,
     getFlows,
     getPlugins,
+    getToolGraph,
   };
 
   // Per-asset locking for concurrent agents. Opt-in; when off, withAssetLocks
@@ -356,7 +411,7 @@ async function main() {
   // The registry is the dispatch layer, so it has to be built from the graph
   // the addressed session actually has. Sharing one registry is what made a
   // second editor dispatch the first editor's plugin tasks (#817).
-  for (const load of loads) {
+  const buildRegistryFor = (load: SessionLoad): void => {
     const sessionRegistry = buildFlowRegistry(load.registryTools);
     for (const { name, ctor } of load.pluginLoad.taskRegistrations) {
       sessionRegistry.register(name, ctor);
@@ -365,7 +420,8 @@ async function main() {
       sessionRegistry.registerClassPath(classPath, ctor);
     }
     load.registry = sessionRegistry;
-  }
+  };
+  for (const load of loads) buildRegistryFor(load);
   const registry = primaryLoad.registry!;
   const taskCount = registry.listRegistered().length;
 
@@ -375,7 +431,7 @@ async function main() {
   // Guards are discovered per session, from that session's own registry and
   // against that session's own raw bridge, so a guard declared by one project's
   // plugins cannot veto another project's calls.
-  for (const load of loads) {
+  const discoverGuardsFor = (load: SessionLoad): void => {
     const guardCtx: ToolContext = {
       bridge: load.surface.session.guarded,
       project: load.surface.session.project,
@@ -383,11 +439,58 @@ async function main() {
       sessions,
       getFlows: () => getFlows(load.surface.session),
       getPlugins: () => getPlugins(load.surface.session),
+      getToolGraph: (forSession) => getToolGraph(forSession ?? load.surface.session),
     };
     for (const g of discoverTaskGuards(load.registry!, guardCtx, load.surface.session.bridge)) {
       load.surface.session.guards.register(g);
     }
-  }
+  };
+  for (const load of loads) discoverGuardsFor(load);
+
+  /**
+   * The dispatch surface for one session, built on demand (D1).
+   *
+   * `perSession` used to be written exactly once, in the startup loop, so a
+   * session registered at runtime by project(add_editor) never had an entry
+   * and every lookup fell back to the FIRST project's load. That editor then
+   * dispatched through project A's task registry and A's plugin tasks, ran A's
+   * flows step by step inside B, reported A's flows as its own, and had its own
+   * `disable:` list enforced nowhere. Building the surface here, from that
+   * session's own project, is what makes the fallback unnecessary.
+   *
+   * A build already running is shared, so two callers racing on a new editor wait on
+   * one build rather than enriching the same graph twice. A build that fails
+   * leaves no entry, and every reader refuses instead of substituting another
+   * project's.
+   */
+  const pendingLoads = new Map<EditorSession, Promise<SessionLoad>>();
+  const ensureSessionLoad = async (session: EditorSession): Promise<SessionLoad> => {
+    const existing = perSession.get(session);
+    if (existing) return existing;
+    const inFlight = pendingLoads.get(session);
+    if (inFlight) return inFlight;
+
+    const build = (async () => {
+      const load = await buildSessionLoad(session, pkg.version, true);
+      applyContextStrategy(load);
+      buildRegistryFor(load);
+      perSession.set(session, load);
+      surfaces.push(load.surface);
+      discoverGuardsFor(load);
+      // The union is what explainMissingAction refuses from, so it has to know
+      // about this editor before the first call is routed to it.
+      refreshDispatchUnion();
+      return load;
+    })().finally(() => pendingLoads.delete(session));
+
+    pendingLoads.set(session, build);
+    return build;
+  };
+  // project(add_editor) awaits this, so an editor is never addressable before
+  // its own surface exists.
+  sessions.prepareSession = async (session) => {
+    await ensureSessionLoad(session);
+  };
   for (const session of sessions.list()) {
     if (session.guards.size === 0) continue;
     const label = sessions.size > 1 ? `editor '${session.name}': ` : "";
@@ -429,7 +532,10 @@ async function main() {
 
   const server = new McpServer({
     name: "ue-mcp",
-    version: "0.6.4",
+    // Read from package.json, never written here. A literal was frozen at
+    // 0.6.4 in April and every release since told its clients that, while
+    // doctor and the update check read the real one and disagreed with it.
+    version: pkg.version,
   }, {
     instructions: serverInstructions,
   });
@@ -534,6 +640,7 @@ async function main() {
         sessions,
         getFlows: () => getFlows(session),
         getPlugins: () => getPlugins(session),
+        getToolGraph: (forSession) => getToolGraph(forSession ?? session),
         elicit: ctx.elicit,
         onProgress: makeProgressReporter(extra),
         client: server.server.getClientVersion(),
@@ -543,7 +650,29 @@ async function main() {
       // A call for an action the session does not provide is refused here,
       // naming the editors that do, rather than reaching a bridge that would
       // answer "Unknown method" with no way to tell which editor was wrong.
-      const sessionRegistry = perSession.get(session)?.registry ?? registry;
+      //
+      // D1: built on demand rather than falling back to the first project's
+      // registry. That fallback is how an editor registered at runtime came to
+      // dispatch through another project's tasks and plugins.
+      let sessionLoad: SessionLoad;
+      try {
+        sessionLoad = await ensureSessionLoad(session);
+      } catch (e) {
+        return {
+          content: withUpgradeNotice([
+            {
+              type: "text" as const,
+              text:
+                `Error [NOT_CONNECTED]: Editor '${session.name}' has no tool surface of its own, so this call cannot ` +
+                `be dispatched to it. Running it through another project's registry would execute that project's ` +
+                `tasks in this editor, which is exactly what must not happen. Cause: ` +
+                `${e instanceof Error ? e.message : String(e)}`,
+            },
+          ]),
+          isError: true,
+        };
+      }
+      const sessionRegistry = sessionLoad.registry ?? registry;
       const refusal = sessions.size > 1
         ? explainMissingAction(
             dispatchUnion,
@@ -555,6 +684,33 @@ async function main() {
       if (refusal) {
         return {
           content: withUpgradeNotice([{ type: "text" as const, text: `Error [NOT_FOUND]: ${refusal}` }]),
+          isError: true,
+        };
+      }
+
+      // An action this registry does not have, on a server driving one editor.
+      //
+      // `action` is advertised as an enum but parsed as a string, because a
+      // strict enum made the MCP layer reject a typo with the serialized zod
+      // issue - the full options array, every action named twice, about 8KB on
+      // a large category. Parsing it loosely moves the refusal here, where the
+      // answer can be the two spellings the caller probably meant. Without
+      // this, a typo reaches flowkit's registry and comes back as a list of
+      // .ts paths it tried to load the action from, which is worse than what
+      // it replaced.
+      if (!sessionRegistry.listRegistered().includes(taskName)) {
+        const available = Object.keys(tool.actions);
+        const close = nearestActions(action, available);
+        return {
+          content: withUpgradeNotice([
+            {
+              type: "text" as const,
+              text: `Error [NOT_FOUND]: Unknown action '${action}' on '${tool.name}'.`
+                + (close.length ? ` Did you mean: ${close.join(", ")}?` : "")
+                + ` ${available.length} actions available - project(action="describe_action", category="${tool.name}")`
+                + ` lists them with their parameters, and project(action="search_tools") searches by intent.`,
+            },
+          ]),
           isError: true,
         };
       }
@@ -641,8 +797,23 @@ async function main() {
   // ue-mcp.yml belongs to that project, and its steps have to dispatch through
   // that project's registry or a step naming an action only that project has
   // would fail as unknown.
-  const loadFor = (target: ToolContext | undefined): SessionLoad =>
-    (target?.session ? perSession.get(target.session) : undefined) ?? primaryLoad;
+  //
+  // D1: a session with no load of its own is REFUSED, not served the first
+  // project's. flow(run, editor="B") resolved session B, passed the targeting
+  // gate, then read project A's ue-mcp.yml and ran A's steps inside B's editor.
+  // Refusing is honest; borrowing another project's config is not.
+  const loadFor = (target: ToolContext | undefined): SessionLoad => {
+    const session = target?.session;
+    if (!session) return primaryLoad;
+    const load = perSession.get(session);
+    if (load) return load;
+    throw new McpError(
+      ErrorCode.NOT_FOUND,
+      `Editor '${session.name}' has no flow config or task registry of its own yet, so nothing can be run in it. ` +
+        `Its surface is built when it is registered; re-register it with ` +
+        `project(action='add_editor', projectPath='${session.project.projectPath ?? ""}').`,
+    );
+  };
   const reloadConfigFor = (target?: ToolContext): FlowConfig => {
     const load = loadFor(target);
     return loadFlowConfig(load.surface.tools, load.configDir, {
@@ -1009,6 +1180,9 @@ if (subcmd === "init") {
 } else if (subcmd === "feedback") {
   process.argv.splice(2, 1);
   import("./feedback-cli.js");
+} else if (subcmd === "dialog") {
+  process.argv.splice(2, 1);
+  import("./dialog-cli.js");
 } else if (subcmd === "resolve") {
   import("./resolve.js");
 } else if (subcmd === "build") {

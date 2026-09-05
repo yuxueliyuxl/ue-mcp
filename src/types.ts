@@ -4,6 +4,14 @@ import type { ProjectContext } from "./project.js";
 import type { EditorSession, SessionRegistry } from "./session.js";
 import { McpError, ErrorCode } from "./errors.js";
 import { MAX_BRIDGE_TIMEOUT_MS } from "./bridge-timeouts.js";
+import { nearestActions } from "./action-schema.js";
+import { prepareCall, finishCall } from "./call-pipeline.js";
+
+/**
+ * Re-exported from its home in `call-pipeline.ts`, where the whole inbound
+ * half of a call lives. Importers are unaffected by the move.
+ */
+export { takeTimeout } from "./call-pipeline.js";
 
 /**
  * Elicit a deterministic, user-mediated form response via the MCP client.
@@ -12,7 +20,24 @@ import { MAX_BRIDGE_TIMEOUT_MS } from "./bridge-timeouts.js";
  * capability - handlers that rely on this gate must refuse to proceed in
  * that case rather than fall back to an agent-mediated approval.
  */
-export type ElicitFn = (params: ElicitParams) => Promise<ElicitResult>;
+export interface ElicitFn {
+  (params: ElicitParams): Promise<ElicitResult>;
+  /**
+   * Whether the CONNECTED client advertised the `elicitation` capability.
+   *
+   * The presence of the function is NOT that answer. The server builds the
+   * gate at startup, before any client has connected, so it always has a
+   * function to hand over and the capability is only knowable once a client is
+   * on the other end. Callers that branch on "can this user actually be asked"
+   * must call this rather than test the function for undefined, which is true
+   * of every client and would silently promote a client that advertised
+   * nothing into the interactive path.
+   *
+   * Absent on a gate built outside the server (tests, embedders), where the
+   * function was handed over deliberately and is taken at face value.
+   */
+  clientAdvertisesElicitation?: () => boolean;
+}
 
 export interface ElicitParams {
   message: string;
@@ -56,6 +81,8 @@ export interface ToolContext {
    *  `plugins` introspection category. Session-scoped for the same reason
    *  as getFlows: `plugins:` is per project. */
   getPlugins?: (forSession?: EditorSession) => PluginInfo[];
+  /** Enabled source categories for the addressed editor, including injected actions. */
+  getToolGraph?: (forSession?: EditorSession) => ToolDef[];
   /** The per-call timeout budget the caller asked for, in milliseconds (#989).
    *  Set by the category dispatcher when a call carried `timeoutMs`. A handler
    *  that makes its own bridge calls should pass it through; one that does not
@@ -146,6 +173,20 @@ export interface ToolDef {
    * structurally instead.
    */
   rebuild?: (actions: Record<string, ActionSpec>) => ToolDef;
+  /**
+   * The category-wide options this tool was built with.
+   *
+   * Published on the ToolDef rather than kept in the `categoryTool` closure
+   * because DISPATCH needs them, and dispatch is the flow registry, not that
+   * closure. `normalizeParams` spent its whole life invisible to the live
+   * route for exactly this reason: a category advertised the spellings it
+   * accepts, the schema let them through, and the folding that was supposed to
+   * canonicalise them only ever ran on the route the tests use.
+   *
+   * Structural copies (`{ ...tool }`) and rebuilt copies both carry it, since
+   * `rebuild` passes the same options back through this constructor.
+   */
+  options?: CategoryOptions;
 }
 
 /**
@@ -314,6 +355,16 @@ export interface CategoryOptions {
    * parameter combination with a specific message.
    */
   normalizeParams?: (params: Record<string, unknown>) => Record<string, unknown>;
+  /**
+   * This tool is a gateway: every real parameter arrives nested under this key
+   * rather than at the top level.
+   *
+   * Set to `args` by the micro-context gateway. Dispatch reads it so the path
+   * repair, the field projection and the per-call budget apply to the
+   * parameters the target action will actually see, instead of to the
+   * `{category, method, args}` envelope, where none of them are present.
+   */
+  nestedParamsKey?: string;
 }
 
 /**
@@ -322,6 +373,67 @@ export interface CategoryOptions {
  * It is a routing instruction, never a handler parameter: the dispatcher reads
  * it and strips it, so it cannot reach a bridge method as an argument.
  */
+/**
+ * The `action` parameter of a category tool.
+ *
+ * Advertised as an enum, parsed as a string, and the difference matters.
+ *
+ * The MCP layer validates arguments BEFORE the tool callback runs, so a strict
+ * `z.enum` meant a misspelled action never reached dispatch: it came back as a
+ * zod issue whose message is the serialized issue list, which carries the full
+ * `options` array. On level, with 140 actions, a single typo returned about
+ * 8KB naming every action twice and burying the one the caller wanted.
+ *
+ * Accepting any string moves the refusal into `categoryTool`, which answers
+ * with the closest spellings in a couple of lines. The enum stays in the
+ * published schema, so a client still gets the list and the agent still gets
+ * the guidance; only the failure path changed.
+ */
+/**
+ * The action names an `action` schema advertises.
+ *
+ * `actionEnum` wraps the enum in a union with a bare string, so reading
+ * `_def.values` off it finds nothing. Callers that want the list (the golden
+ * recorder, plugin injection tests, anything reporting the surface) go
+ * through here rather than reaching into a shape that has already moved once.
+ */
+export function actionEnumValues(schema: z.ZodType): string[] {
+  const def = (schema as unknown as { _def?: { typeName?: string; values?: unknown; options?: z.ZodTypeAny[] } })._def;
+  if (!def) return [];
+  if (def.typeName === "ZodEnum" && Array.isArray(def.values)) return def.values.map(String);
+  if (def.typeName === "ZodUnion" && Array.isArray(def.options)) {
+    for (const option of def.options) {
+      const values = actionEnumValues(option);
+      if (values.length > 0) return values;
+    }
+  }
+  return [];
+}
+
+export function actionEnum(names: [string, ...string[]]): z.ZodType {
+  return z
+    .union([z.enum(names), z.string()])
+    .describe("Action to perform. One of the listed values; anything else returns the closest matches.");
+}
+
+export const SELECT_PARAM = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  // Kept short deliberately: this is repeated in every one of the 24 tool
+  // schemas the client loads at startup, so the full account of the semantics
+  // lives in project(describe_action) rather than 24 times in the manifest.
+  .describe(
+    "Keep only these result fields (dotted paths; arrays are traversed, so "
+    + "'components.name' keeps every component's name). Unmatched paths are reported.",
+  );
+
+export const OMIT_PARAM = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .describe(
+    "Drop these result fields (dotted paths, same traversal as select). Runs after select.",
+  );
+
 export const TIMEOUT_PARAM = z
   .number()
   .int()
@@ -355,14 +467,17 @@ export function categoryTool(
 
   const def: ToolDef = {
     name,
+    options,
     description: `${summary}\n\nActions:\n${docs}`,
     schema: {
-      action: z.enum(actionNames).describe("Action to perform"),
+      action: actionEnum(actionNames),
       // #989: a call budget the caller controls. The client used to wait a flat
       // 30s for every bridge call, and a large batch on a machine that is also
       // compiling shaders finished in the editor after the client had already
       // reported a failure. A retry then applied the mutation twice.
       timeoutMs: TIMEOUT_PARAM,
+      select: SELECT_PARAM,
+      omit: OMIT_PARAM,
       ...extraSchema,
     },
     actions,
@@ -377,24 +492,51 @@ export function categoryTool(
         // Read the live keys, not the construction-time tuple: enrichment adds
         // epic_* actions after the fact, and a stale list here sends an agent
         // hunting for an action the tool actually has.
-        throw new McpError(ErrorCode.UNKNOWN_ACTION, `Unknown action '${action}'. Available: ${Object.keys(actions).join(", ")}`);
+        //
+        // A category can carry hundreds of actions, and pasting all of them
+        // into every typo's error spends more context than the call would
+        // have. Lead with the closest spellings, which is what a typo needs,
+        // and name the two ways to see the rest.
+        const available = Object.keys(actions);
+        const close = nearestActions(action, available);
+        throw new McpError(
+          ErrorCode.UNKNOWN_ACTION,
+          `Unknown action '${action}' on '${name}'.`
+            + (close.length ? ` Did you mean: ${close.join(", ")}?` : "")
+            + ` ${available.length} actions available - project(action="describe_action", category="${name}")`
+            + ` lists them with their parameters, and project(action="search_tools") searches by intent.`,
+        );
       }
-      // Routing, not an argument. Pulled out before normalizeParams so no
-      // mapParams can forward it into a bridge call as a parameter (#989).
-      const { timeoutMs: requestedTimeout, rest: withoutTimeout } = takeTimeout(params);
-      const normalized = options?.normalizeParams ? options.normalizeParams(withoutTimeout) : withoutTimeout;
+      // THE per-call preparation, in the one place it is written: the routing
+      // parameters (`timeoutMs`, `select`, `omit`) come off so no mapParams can
+      // forward one into a bridge call, the paths are repaired before anything
+      // reads them, and the category's own folding runs last over the repaired
+      // bag. This route calls it; the live route in flow/task-factory.ts calls
+      // the same function with the same preparation. Neither reimplements a
+      // step of it, and nothing per-call belongs in this closure again.
+      const pipeline = prepareCall(params, {
+        action,
+        normalizeParams: options?.normalizeParams,
+        nestedParamsKey: options?.nestedParamsKey,
+      });
+      const requestedTimeout = pipeline.timeoutMs;
+      const normalized = pipeline.params;
+      const finish = (raw: unknown): unknown => finishCall(raw, pipeline);
+
       if (spec.handler) {
         // The budget travels on the context, not in the parameters: a custom
         // handler that forwards its params to the bridge must not turn it into
         // a bridge argument (#989).
-        return spec.handler(requestedTimeout === undefined ? ctx : { ...ctx, callTimeoutMs: requestedTimeout }, normalized);
+        return finish(
+          await spec.handler(requestedTimeout === undefined ? ctx : { ...ctx, callTimeoutMs: requestedTimeout }, normalized),
+        );
       }
       if (spec.bridge) {
         const mapped = spec.mapParams ? spec.mapParams(normalized) : stripAction(normalized);
         // The caller's budget wins over the action's authored one: an action
         // that declares 120s is stating a floor it needs, not a ceiling the
         // caller may not raise.
-        return ctx.bridge.call(spec.bridge, mapped, requestedTimeout ?? spec.timeoutMs);
+        return finish(await ctx.bridge.call(spec.bridge, mapped, requestedTimeout ?? spec.timeoutMs));
       }
       throw new McpError(ErrorCode.NO_HANDLER, `Action '${action}' has no handler or bridge method`);
     },
@@ -413,27 +555,12 @@ function stripAction(params: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * Separate the per-call timeout budget from the action's own parameters.
- * A non-positive or non-numeric value is discarded rather than refused: the
- * schema already rejects it, and a direct caller gets the default.
- */
-export function takeTimeout(
-  params: Record<string, unknown>,
-): { timeoutMs?: number; rest: Record<string, unknown> } {
-  const { timeoutMs, ...rest } = params;
-  const usable = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-    ? Math.min(timeoutMs, MAX_BRIDGE_TIMEOUT_MS)
-    : undefined;
-  return { timeoutMs: usable, rest };
-}
-
-/**
  * Re-point a context at one editor. Bridge, project and session move together
  * so a handler can never resolve a path in one project while calling into
  * another project's editor.
  */
 export function sessionContext(ctx: ToolContext, session: EditorSession): ToolContext {
-  const { getFlows, getPlugins } = ctx;
+  const { getFlows, getPlugins, getToolGraph } = ctx;
   return {
     ...ctx,
     bridge: session.guarded,
@@ -444,6 +571,7 @@ export function sessionContext(ctx: ToolContext, session: EditorSession): ToolCo
     // flows and plugins under another editor's name.
     getFlows: getFlows ? () => getFlows(session) : undefined,
     getPlugins: getPlugins ? () => getPlugins(session) : undefined,
+    getToolGraph: getToolGraph ? (forSession) => getToolGraph(forSession ?? session) : undefined,
   };
 }
 

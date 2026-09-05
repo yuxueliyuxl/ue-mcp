@@ -5,7 +5,7 @@
 [![stars](https://img.shields.io/github/stars/db-lyon/ue-mcp)](https://github.com/db-lyon/ue-mcp/stargazers)
 [![MIT](https://img.shields.io/npm/l/ue-mcp)](LICENSE)
 
-**Unreal Engine Model Context Protocol Server** - gives AI assistants deep read/write access to the Unreal Editor through <!-- count:tools -->24<!-- /count --> category tools covering <!-- count:actions -->855+<!-- /count --> actions, plus a YAML flow engine for multi-step workflows and an npm plugin system for extending the surface.
+**Unreal Engine Model Context Protocol Server** - gives AI assistants deep read/write access to the Unreal Editor through <!-- count:tools -->24<!-- /count --> category tools covering <!-- count:actions -->1090+<!-- /count --> actions, plus a YAML flow engine for multi-step workflows and an npm plugin system for extending the surface.
 
 On UE 5.8+ it also wraps Epic's entire native AI Toolset Registry - 830 official Unreal tools, called in-process and surfaced as `epic_*` actions in the matching category: Sequencer in `animation`, PCG in `pcg`, static meshes in `asset`.
 
@@ -137,7 +137,7 @@ flows:
 flow(action="run", flowName="build_and_check")
 ```
 
-Every one of the <!-- count:actions -->855+<!-- /count --> actions is also a flow task. Flows support step references, retries, rollback, custom tasks in your own `.js`/`.ts`, and shell steps. See [Flows](https://ue-mcp.com/docs/flows/).
+Every one of the <!-- count:actions -->1090+<!-- /count --> actions is also a flow task. Flows support step references, retries, rollback, custom tasks in your own `.js`/`.ts`, and shell steps. See [Flows](https://ue-mcp.com/docs/flows/).
 
 ## Plugins
 
@@ -177,7 +177,7 @@ Details: [Guards](https://ue-mcp.com/docs/plugins-guards/) and [Handler Conventi
 
 | | |
 |---|---|
-| **Unreal Engine** | 5.4-5.8 (Windows), 5.6+ (Linux and macOS). `epic` category needs 5.8+. |
+| **Unreal Engine** | 5.4-5.8 (Windows), 5.6+ (Linux and macOS). Compiled and verified on 5.7 and 5.8; 5.4 to 5.6 are version-gated in source but not built here. `epic` category needs 5.8+. |
 | **Node.js** | 18 or newer |
 | **UE plugins** | `PythonScriptPlugin` (ships with the engine); `init` enables the rest for you |
 | **C++ toolchain** | Required - the bridge is a C++ plugin and compiles on first editor launch. On Windows that means Visual Studio with the C++ workload; on macOS, Xcode command line tools. |
@@ -192,6 +192,8 @@ Editor process control (`editor(start_editor)` / `stop_editor` / `restart_editor
 - [Tool Reference](https://ue-mcp.com/docs/tool-reference/) - Every tool, action, and parameter
 - [Architecture](https://ue-mcp.com/docs/architecture/) - How the server, bridge, and editor fit together
 - [Flows](https://ue-mcp.com/docs/flows/) - Multi-step YAML workflows, custom tasks, rollback
+- [Journal](https://ue-mcp.com/docs/journal/) - The per-project record of what a session did, produced, and how it ended
+- [Skill Packs](https://ue-mcp.com/docs/skill-packs/) - Written workflows an agent reads, and checking that the calls they teach still exist
 - [Plugins](https://ue-mcp.com/docs/plugins/) - Extending the surface through npm
 - [Configuration](https://ue-mcp.com/docs/configuration/) - `ue-mcp.yml` and MCP client config
 - [Troubleshooting](https://ue-mcp.com/docs/troubleshooting/) - Connection, build, and asset path issues

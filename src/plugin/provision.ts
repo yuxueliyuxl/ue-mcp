@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ToolDef, ActionSpec } from "../types.js";
+import { actionEnum } from "../types.js";
 import {
   compileSchemaFields,
   type ManifestProvidedCategory,
@@ -57,7 +58,7 @@ export function buildProvidedTool(plan: ProvisionPlan): ToolDef {
     name: plan.category,
     description,
     schema: {
-      action: z.enum(actionNames).describe("Action to perform"),
+      action: actionEnum(actionNames),
       ...extraSchema,
     },
     actions,

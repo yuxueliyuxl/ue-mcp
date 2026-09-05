@@ -115,39 +115,58 @@ struct FMCPBridgePortChoice
 };
 
 /**
+ * Takes the handle out of the live connection set.
+ *
+ * Declared LAST of the connection thread's guards and therefore destroyed
+ * FIRST, so the handle leaves the set while it is still open: half-closing a
+ * handle number the operating system has already handed to someone else is
+ * worse than not waking it at all.
+ */
+class FMCPConnectionUnlist
+{
+public:
+	FMCPConnectionUnlist(FMCPBridgeServer& InServer, FMCPSocketHandle InHandle);
+	~FMCPConnectionUnlist();
+
+	FMCPConnectionUnlist(const FMCPConnectionUnlist&) = delete;
+	FMCPConnectionUnlist& operator=(const FMCPConnectionUnlist&) = delete;
+
+private:
+	FMCPBridgeServer& Server;
+	FMCPSocketHandle Handle;
+};
+
+/**
  * Releases the connection record the accept loop made before it spawned this
  * thread.
  *
  * The accept loop registers, so a shutdown racing an accept can never conclude
- * that nothing is running. This object is declared after the socket guard and
- * therefore destroyed before it, so the handle leaves the live set while it is
- * still open: half-closing a handle number the operating system has already
- * handed to someone else is worse than not waking it at all.
+ * that nothing is running. Dropping the count is what lets
+ * WaitForConnectionsToFinish return, and once it returns the module is free to
+ * finish ShutdownModule and let the DLL unload - so nothing this thread still
+ * has to execute may live in the module's code pages after that point. This
+ * object is therefore declared FIRST of the thread's guards and destroyed
+ * LAST, after the handle has left the live set and after closesocket. Only the
+ * lambda's own return sequence follows, which is why the count is dropped here
+ * and not inside the unlist guard where a blocking closesocket still came
+ * after it.
  */
 class FMCPConnectionRelease
 {
 public:
-	FMCPConnectionRelease(FMCPBridgeServer& InServer, FMCPSocketHandle InHandle);
+	explicit FMCPConnectionRelease(FMCPBridgeServer& InServer);
 	~FMCPConnectionRelease();
 
 	FMCPConnectionRelease(const FMCPConnectionRelease&) = delete;
 	FMCPConnectionRelease& operator=(const FMCPConnectionRelease&) = delete;
 
-	/**
-	 * Called from the connection thread once the WebSocket handshake response
-	 * is on the wire. Until then this TCP connection is not a client anyone
-	 * can talk to, and the toolbar's "connected" dot should not count it.
-	 */
-	void MarkHandshaken() { bHandshaken = true; }
-
 private:
 	FMCPBridgeServer& Server;
-	FMCPSocketHandle Handle;
-	bool bHandshaken = false;
 };
 
 class FMCPBridgeServer : public FRunnable
 {
+	friend class FMCPConnectionUnlist;
 	friend class FMCPConnectionRelease;
 
 public:
@@ -221,31 +240,6 @@ public:
 	// Get game thread executor (to set editor ready)
 	FMCPGameThreadExecutor& GetGameThreadExecutor() { return GameThreadExecutor; }
 
-	// True once the listen socket is bound and the accept loop is running.
-	// The toolbar uses this to distinguish "listening with no client" from
-	// "bridge failed to start".
-	bool IsRunning() const { return bIsRunning; }
-
-	/** The port the accept loop bound, after any collision walk. */
-	int32 GetPort() const { return ServerPort; }
-
-	/** Where the port number came from ("-MCPPort command line", ...). */
-	const FString& GetPortSource() const { return PortSource; }
-
-	/**
-	 * Clients whose WebSocket handshake completed and who have not yet
-	 * disconnected. Unlike ActiveConnectionCount, a TCP connection that is
-	 * still mid-handshake does not count as a connected client, which is the
-	 * distinction the editor toolbar's status dot draws.
-	 */
-	int32 GetHandshakenClientCount() const { return HandshakenClientCount.GetValue(); }
-
-	/** Called from the connection thread once the 101 response is on the wire. */
-	void NoteHandshakenClient() { HandshakenClientCount.Increment(); }
-
-	/** Called from the connection thread when a handshaken connection ends. */
-	void NoteClientClosed() { HandshakenClientCount.Decrement(); }
-
 	// Process a JSON-RPC message
 	FString ProcessMessage(const FString& Message);
 
@@ -286,7 +280,10 @@ public:
 	/** Frame a control opcode (close, ping, pong) with its payload. */
 	static TArray<uint8> CreateControlFrame(EMCPWebSocketOpcode Opcode, const TArray<uint8>& Payload);
 
-	/** The largest assembled message the bridge will hold for one connection. */
+	/** The largest message the bridge will accept on one connection, whether it
+	 *  arrives as one frame or as fragments. A message of exactly this size is
+	 *  receivable: the unparsed receive buffer is bounded a frame header higher
+	 *  so the decoder can hold a full-size frame whole. */
 	static int64 MaxMessageBytes();
 
 private:
@@ -346,7 +343,13 @@ private:
 	// shutdown has to be able to find them, wake them, and wait for them. The
 	// module frees this object the moment Shutdown returns.
 	void RegisterConnection(FMCPSocketHandle Handle);
-	void UnregisterConnection(FMCPSocketHandle Handle);
+
+	/** Take the handle out of the live set. Does not drop the count. */
+	void UnlistConnection(FMCPSocketHandle Handle);
+
+	/** Drop the count. The last thing a connection thread does that touches
+	 *  this object, and the point after which shutdown may unload the module. */
+	void ReleaseConnectionSlot();
 
 	/** Half-close every live client socket so a blocked recv returns now
 	 *  rather than at the end of its next one-second select. */
@@ -358,7 +361,6 @@ private:
 	FCriticalSection ConnectionsMutex;
 	TSet<FMCPSocketHandle> LiveConnections;
 	FThreadSafeCounter ActiveConnectionCount;
-	FThreadSafeCounter HandshakenClientCount;
 
 	// #821: identity for this server object, so a record on disk can say which
 	// process wrote it and only that process can take it away. A pid alone is

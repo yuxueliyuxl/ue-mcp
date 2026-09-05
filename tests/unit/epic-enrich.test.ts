@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { categoryTool, bp, type ToolDef } from "../../src/types.js";
+import { actionEnumValues, categoryTool, bp, type ToolDef } from "../../src/types.js";
 import {
   routeToolset,
   enrichToolsWithEpicCatalog,
@@ -134,10 +134,14 @@ describe("enrichToolsWithEpicCatalog", () => {
     enrichToolsWithEpicCatalog(tools, CATALOG);
     const gas = tools.find((t) => t.name === "gas")!;
 
-    // The action enum must now accept the injected keys plus the original.
-    expect(gas.schema.action.safeParse("epic_list_attributes").success).toBe(true);
-    expect(gas.schema.action.safeParse("grant_ability").success).toBe(true);
-    expect(gas.schema.action.safeParse("nope_not_real").success).toBe(false);
+    // The action enum must now advertise the injected keys plus the original.
+    // It is advertised rather than enforced: `action` parses as a string so a
+    // misspelling is refused by dispatch, with suggestions, instead of by the
+    // MCP layer with the whole options array. So the assertion is on the list.
+    const advertised = actionEnumValues(gas.schema.action);
+    expect(advertised).toContain("epic_list_attributes");
+    expect(advertised).toContain("grant_ability");
+    expect(advertised).not.toContain("nope_not_real");
 
     expect(gas.schema.input).toBeDefined();
     expect(gas.schema.inputJson).toBeDefined();

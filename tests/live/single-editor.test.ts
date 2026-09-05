@@ -194,7 +194,14 @@ describe("lifecycle, without starting or stopping anything", () => {
     const project = new ProjectContext();
     project.setProject(target.uproject);
     const result = await startEditor(project, 1);
+    // A refusal, because no editor was launched. The markers are what make it
+    // readable: `alreadyRunning` says the reason was an editor that is already
+    // up, and `bridgeReady` with `port` say it can be reached at this address
+    // right now. A flow step that expects this sets ignore_failure on itself.
     expect(result.success).toBe(false);
+    expect(result.alreadyRunning).toBe(true);
+    expect(result.bridgeReady).toBe(true);
+    expect(result.port).toBe(target.port);
     expect(result.message).toContain("already running for this project");
     expect(result.message).toContain(String(target.port));
   }, 60_000);

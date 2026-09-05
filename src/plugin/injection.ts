@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ToolDef, ActionSpec } from "../types.js";
+import { actionEnum } from "../types.js";
 import { compileSchemaFields, type ManifestInjectAction } from "./manifest.js";
 
 /**
@@ -93,7 +94,7 @@ export function mergeInjectionsIntoTool(
 
   const newSchema: Record<string, z.ZodType> = {
     ...orig.schema,
-    action: z.enum(allNames).describe("Action to perform"),
+    action: actionEnum(allNames),
     ...extraSchema,
   };
 

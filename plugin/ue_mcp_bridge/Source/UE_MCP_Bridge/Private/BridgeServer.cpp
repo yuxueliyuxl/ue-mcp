@@ -92,6 +92,23 @@ namespace
 	constexpr int64 kMaxWebSocketMessageBytes = 64ll * 1024ll * 1024ll; // 64 MiB
 	constexpr int32 kRecvChunkBytes = 65536;
 
+	// The largest client frame header RFC 6455 permits: two fixed bytes, eight
+	// for the 64-bit extended payload length, four for the mask key that a
+	// client must always send.
+	constexpr int64 kMaxWebSocketFrameHeaderBytes = 2 + 8 + 4;
+
+	// What the unparsed receive buffer may hold. The frame decoder needs the
+	// whole frame in the buffer before it will hand over a payload, so a bound
+	// of exactly kMaxWebSocketMessageBytes made a message of that size
+	// impossible to receive in a single frame: the buffer tripped on the header
+	// bytes first and closed with a reason naming the buffer rather than the
+	// message, while MaxMessageBytes() went on advertising a ceiling nothing
+	// could reach. The header allowance is what makes the advertised limit the
+	// one that is actually enforced, and leaves the receive-buffer bound to
+	// mean only what it says: a peer accumulating bytes it never completes a
+	// frame with.
+	constexpr int64 kMaxPendingReceiveBytes = kMaxWebSocketMessageBytes + kMaxWebSocketFrameHeaderBytes;
+
 	// The upgrade request is read to its terminator rather than in one recv, so
 	// it needs its own bounds: how long the whole read may take, and how large
 	// the headers may grow before the bridge stops waiting for a blank line.
@@ -105,22 +122,25 @@ namespace
 	constexpr double kConnectionDrainTimeoutSeconds = 10.0;
 }
 
-FMCPConnectionRelease::FMCPConnectionRelease(FMCPBridgeServer& InServer, FMCPSocketHandle InHandle)
+FMCPConnectionUnlist::FMCPConnectionUnlist(FMCPBridgeServer& InServer, FMCPSocketHandle InHandle)
 	: Server(InServer)
 	, Handle(InHandle)
 {
 }
 
+FMCPConnectionUnlist::~FMCPConnectionUnlist()
+{
+	Server.UnlistConnection(Handle);
+}
+
+FMCPConnectionRelease::FMCPConnectionRelease(FMCPBridgeServer& InServer)
+	: Server(InServer)
+{
+}
+
 FMCPConnectionRelease::~FMCPConnectionRelease()
 {
-	// A TCP connection that never finished its WebSocket handshake was never a
-	// client anyone could talk to, so it must not leave a handshake count
-	// behind either. The flag is only set once the 101 response is on the wire.
-	if (bHandshaken)
-	{
-		Server.NoteClientClosed();
-	}
-	Server.UnregisterConnection(Handle);
+	Server.ReleaseConnectionSlot();
 }
 
 FMCPBridgeServer::FMCPBridgeServer(int32 Port, const FString& InPortSource, bool bInPortPinned)
@@ -243,16 +263,22 @@ void FMCPBridgeServer::RegisterConnection(FMCPSocketHandle Handle)
 	LiveConnections.Add(Handle);
 }
 
-void FMCPBridgeServer::UnregisterConnection(FMCPSocketHandle Handle)
+void FMCPBridgeServer::UnlistConnection(FMCPSocketHandle Handle)
 {
-	{
-		// Out of the set before the socket is closed, under the same lock
-		// WakeAllConnections holds. Otherwise shutdown could half-close a
-		// handle number the operating system had already handed to someone else.
-		FScopeLock Lock(&ConnectionsMutex);
-		LiveConnections.Remove(Handle);
-	}
-	// The last thing a connection thread touches on this object.
+	// Out of the set before the socket is closed, under the same lock
+	// WakeAllConnections holds. Otherwise shutdown could half-close a
+	// handle number the operating system had already handed to someone else.
+	FScopeLock Lock(&ConnectionsMutex);
+	LiveConnections.Remove(Handle);
+}
+
+void FMCPBridgeServer::ReleaseConnectionSlot()
+{
+	// The last thing a connection thread touches on this object, and the last
+	// blocking call it makes at all: closesocket and the unlist have both
+	// already happened. WaitForConnectionsToFinish only reads this counter and
+	// holds no lock while it spins, so dropping it here cannot deadlock against
+	// a thread that is still inside ConnectionsMutex.
 	ActiveConnectionCount.Decrement();
 }
 
@@ -1639,6 +1665,13 @@ void FMCPClientSocket::Close()
 
 void FMCPBridgeServer::HandleWebSocketConnection(FMCPSocketHandle ClientSocketFD)
 {
+	// Destroyed last of the three, so the count the shutdown wait reads drops
+	// only after the handle has left the live set and the socket is closed.
+	// Everything this thread runs that lives in the module's code pages happens
+	// before that point, so ShutdownModule cannot complete and unload the DLL
+	// while a frame of it is still on this stack.
+	FMCPConnectionRelease Release(*this);
+
 	// The accept loop created this handle and hands it over here. From this
 	// line on, Connection is its only owner: it closes exactly once, on the way
 	// out of this function, whichever path leaves it.
@@ -1646,7 +1679,7 @@ void FMCPBridgeServer::HandleWebSocketConnection(FMCPSocketHandle ClientSocketFD
 
 	// Declared after the socket so it is destroyed before it: the handle must
 	// leave the live set while it is still open.
-	FMCPConnectionRelease Release(*this, ClientSocketFD);
+	FMCPConnectionUnlist Unlist(*this, ClientSocketFD);
 
 	// Set TCP_NODELAY on client socket for immediate send
 	int32 NoDelay = 1;
@@ -1673,12 +1706,6 @@ void FMCPBridgeServer::HandleWebSocketConnection(FMCPSocketHandle ClientSocketFD
 	}
 
 	UE_LOG(LogMCPBridge, Log, TEXT("[UE-MCP] Sent WebSocket handshake response (%d bytes)"), UTF8Response.Length());
-
-	// The client is now a real WebSocket peer: count it for the editor
-	// toolbar's connected indicator. The release object drops it again when
-	// this connection ends, whichever path leaves this function.
-	Release.MarkHandshaken();
-	NoteHandshakenClient();
 
 	// Process WebSocket messages
 	UE_LOG(LogMCPBridge, Log, TEXT("[UE-MCP] Starting WebSocket message processing"));
@@ -1780,7 +1807,17 @@ FString FMCPBridgeServer::PerformWebSocketHandshake(FMCPSocketHandle ClientSocke
 	}
 
 	// Create accept key
-	FString AcceptKey = CreateWebSocketAcceptKey(WebSocketKey);
+	const FString AcceptKey = CreateWebSocketAcceptKey(WebSocketKey);
+	if (AcceptKey.IsEmpty())
+	{
+		// The platform SHA-1 refused. Sending a 101 with a key we could not
+		// compute would leave the client rejecting a handshake the bridge had
+		// already declared good, so say so with a status the caller can read.
+		UE_LOG(LogMCPBridge, Error, TEXT("[UE-MCP] Could not compute Sec-WebSocket-Accept; refusing the upgrade"));
+		SendHttpError(ClientSocketFD, 500, TEXT("Internal Server Error"),
+			TEXT("The UE-MCP bridge could not compute the WebSocket accept key."));
+		return TEXT("");
+	}
 
 	// Build response (WebSocket spec requires exact format)
 	// Must be: HTTP/1.1 101 Switching Protocols\r\n
@@ -1878,7 +1915,21 @@ bool FMCPBridgeServer::ReadHttpRequest(FMCPSocketHandle SocketFD, FString& OutRe
 		const int32 BytesReceived = recv(SocketFD, (char*)Chunk, (int32)sizeof(Chunk), 0);
 		if (BytesReceived <= 0)
 		{
-			UE_LOG(LogMCPBridge, Warning, TEXT("[UE-MCP] Connection closed before the upgrade request completed (%d bytes read)"), Raw.Num());
+			// A close with NOTHING read is a liveness probe, not a fault. The
+			// server's own readiness check opens a TCP socket, sees it accept
+			// and destroys it without speaking HTTP, once a second while an
+			// editor is starting. Logging that at Warning wrote fifty warnings
+			// into the editor log per launch and taught the reader to ignore
+			// the category. A PARTIAL read is different: somebody began an
+			// upgrade and vanished, which is worth seeing.
+			if (Raw.Num() == 0)
+			{
+				UE_LOG(LogMCPBridge, Verbose, TEXT("[UE-MCP] Port probe connected and closed without an upgrade request"));
+			}
+			else
+			{
+				UE_LOG(LogMCPBridge, Warning, TEXT("[UE-MCP] Connection closed part way through the upgrade request (%d bytes read)"), Raw.Num());
+			}
 			return false;
 		}
 
@@ -1930,29 +1981,68 @@ FString FMCPBridgeServer::CreateWebSocketAcceptKey(const FString& ClientKey)
 
 	// Compute SHA1 hash (20 bytes)
 	FTCHARToUTF8 UTF8String(*Combined);
-	uint8 HashBytes[20];
+
+	// Zeroed, and every step below checked. The buffer used to be an
+	// uninitialised local with three unchecked CryptoAPI calls over it, so any
+	// failure sent 20 bytes of whatever the stack happened to hold as
+	// Sec-WebSocket-Accept. The client rejected the handshake and hung up while
+	// the bridge logged success and entered the frame loop, which reads to the
+	// user as an unexplained disconnect. An empty return says "no key" instead.
+	uint8 HashBytes[20] = {};
+	bool bHashed = false;
 
 #if PLATFORM_WINDOWS
+	uint32 CryptError = 0;
 	HCRYPTPROV hProv = 0;
 	HCRYPTHASH hHash = 0;
 	if (CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
 	{
 		if (CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash))
 		{
-			CryptHashData(hHash, (BYTE*)UTF8String.Get(), UTF8String.Length(), 0);
-			DWORD HashLen = 20;
-			CryptGetHashParam(hHash, HP_HASHVAL, HashBytes, &HashLen, 0);
+			DWORD HashLen = sizeof(HashBytes);
+			if (CryptHashData(hHash, (BYTE*)UTF8String.Get(), UTF8String.Length(), 0)
+				&& CryptGetHashParam(hHash, HP_HASHVAL, HashBytes, &HashLen, 0)
+				&& HashLen == sizeof(HashBytes))
+			{
+				bHashed = true;
+			}
+			else
+			{
+				// Read before the cleanup calls below, which overwrite it.
+				CryptError = FPlatformMisc::GetLastError();
+			}
 			CryptDestroyHash(hHash);
+		}
+		else
+		{
+			CryptError = FPlatformMisc::GetLastError();
 		}
 		CryptReleaseContext(hProv, 0);
 	}
+	else
+	{
+		CryptError = FPlatformMisc::GetLastError();
+	}
+	if (!bHashed)
+	{
+		UE_LOG(LogMCPBridge, Error,
+			TEXT("[UE-MCP] SHA-1 of the WebSocket key failed (CryptoAPI error 0x%08X)"),
+			CryptError);
+	}
 #else
-	// UE's cross-platform SHA1
+	// UE's cross-platform SHA1. It always writes all 20 bytes and cannot fail,
+	// so this path reaches the encode exactly as it always did.
 	FSHA1 Sha1;
 	Sha1.Update((const uint8*)UTF8String.Get(), UTF8String.Length());
 	Sha1.Final();
 	Sha1.GetHash(HashBytes);
+	bHashed = true;
 #endif
+
+	if (!bHashed)
+	{
+		return FString();
+	}
 
 	// Base64 encode
 	FString AcceptKey = FBase64::Encode(HashBytes, 20);
@@ -2151,13 +2241,16 @@ void FMCPBridgeServer::ProcessWebSocketMessages(FMCPSocketHandle ClientSocketFD,
 		PendingBytes.Append(Chunk.GetData(), BytesReceived);
 
 		// A peer that keeps sending without ever completing a frame would grow
-		// this buffer without limit. Bound it by the same number a single
-		// message is bounded by.
-		if ((int64)PendingBytes.Num() > kMaxWebSocketMessageBytes)
+		// this buffer without limit. Bound it by the largest single frame the
+		// bridge accepts: a full-size payload plus its header. Anything past
+		// that is bytes that are not going to become a frame, which is what the
+		// reason says.
+		if ((int64)PendingBytes.Num() > kMaxPendingReceiveBytes)
 		{
 			const FString Reason = FString::Printf(
-				TEXT("unparsed receive buffer of %lld bytes exceeds the %lld byte bridge limit"),
-				(int64)PendingBytes.Num(), kMaxWebSocketMessageBytes);
+				TEXT("unparsed receive buffer of %lld bytes exceeds the %lld byte bridge limit ")
+				TEXT("(a %lld byte message plus its frame header); no complete frame arrived"),
+				(int64)PendingBytes.Num(), kMaxPendingReceiveBytes, kMaxWebSocketMessageBytes);
 			UE_LOG(LogMCPBridge, Error, TEXT("[UE-MCP] %s"), *Reason);
 			SendCloseFrame(ClientSocketFD, 1009, Reason);
 			bConnectionFinished = true;

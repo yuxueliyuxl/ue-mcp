@@ -32,6 +32,20 @@ const ASSET_ACTIONS = [
   "read_animations", "create", "create_utility_widget", "run_utility_widget",
   "create_utility_blueprint", "run_utility_blueprint", "add_widget", "remove_widget",
   "move_widget", "set_root", "wrap_root", "add_to_viewport",
+  // UMG animation authoring, navigation rules and the two tree audits (T7/T8).
+  // All addressed by one Widget Blueprint.
+  "create_animation", "delete_animation", "get_animation",
+  "add_animation_track", "remove_animation_track",
+  "add_animation_key", "remove_animation_key",
+  "add_animation_event_key", "remove_animation_event_key",
+  "bind_animation_event", "unbind_animation_event",
+  "set_navigation", "clear_navigation", "restore_navigation",
+  "audit_focus_chain", "audit_accessibility",
+  // These two take assetPath as an OPTIONAL second subject: the contract of a
+  // named class, and the project-level CommonUI rules, both read without one.
+  // They are listed here because what this list pins is that an action which
+  // accepts assetPath accepts the canonical spelling and its legacy alias.
+  "get_bind_widget_contract", "audit_commonui",
 ];
 
 /**
@@ -42,6 +56,8 @@ const ASSET_ACTIONS = [
 const NON_ASSET_ACTIONS = [
   "list", "list_classes", "list_runtime", "get_runtime", "get_runtime_delegates",
   "invoke_runtime_function", "inspect_runtime_instances", "extract_subtree",
+  // Live Slate focus: a running PIE session, never an asset on disk.
+  "get_runtime_focus_path", "set_runtime_focus",
 ];
 
 describe("widget category parameter contract", () => {

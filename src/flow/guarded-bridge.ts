@@ -13,6 +13,7 @@
 import { runGuarded } from "@db-lyon/flowkit/guard";
 import type { BridgeTarget, IBridge } from "../bridge.js";
 import type { EditorSession } from "../session.js";
+import { explainEditorDownWithEvidence } from "../offline.js";
 import { GuardRegistry, makeCallContext, type ResolveExistingFile } from "./guard.js";
 
 export type { ResolveExistingFile } from "./guard.js";
@@ -48,21 +49,35 @@ export class GuardedBridge implements IBridge {
     params?: Record<string, unknown>,
     timeoutMs?: number,
   ): Promise<unknown> {
-    // `runGuarded` is already a pass-through on an empty registry, but building
-    // the context is not free and every bridge call lands here. Most servers run
-    // with no guards at all, so skip the allocation outright.
-    if (this.registry.size === 0) {
-      return this.inner.call(method, params, timeoutMs);
-    }
+    try {
+      // `runGuarded` is already a pass-through on an empty registry, but building
+      // the context is not free and every bridge call lands here. Most servers run
+      // with no guards at all, so skip the allocation outright.
+      if (this.registry.size === 0) {
+        return await this.inner.call(method, params, timeoutMs);
+      }
 
-    const ctx = makeCallContext(
-      method,
-      params ?? {},
-      timeoutMs,
-      this.inner,
-      this.resolveExistingFile,
-      this.session,
-    );
-    return runGuarded(ctx, this.registry, () => this.inner.call(method, params, timeoutMs));
+      const ctx = makeCallContext(
+        method,
+        params ?? {},
+        timeoutMs,
+        this.inner,
+        this.resolveExistingFile,
+        this.session,
+      );
+      return await runGuarded(ctx, this.registry, () => this.inner.call(method, params, timeoutMs));
+    } catch (e) {
+      // Every route into the editor comes through here (an MCP tool call, a
+      // flow step, the micro gateway), so this is the one place a missing
+      // editor can be explained once rather than three times. Only a
+      // connection failure is rewritten; everything else is rethrown as it
+      // was. See src/offline.ts (T16).
+      throw await explainEditorDownWithEvidence(e, {
+        method,
+        projectPath: this.inner.getTarget().projectPath,
+        port: this.inner.getTarget().port,
+        portSource: this.inner.getTarget().portSource,
+      });
+    }
   }
 }

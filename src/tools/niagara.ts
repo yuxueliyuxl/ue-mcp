@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { categoryTool, bp, type ActionSpec, type ToolDef } from "../types.js";
 import { Vec3, Rotator } from "../schemas.js";
+import { PAGINATION_SCHEMA, paged } from "../pagination.js";
 
 /**
  * set_module_input takes a string on the bridge, so scalars are stringified
@@ -70,20 +71,32 @@ export const niagaraTool: ToolDef = categoryTool(
   "niagara",
   "Niagara VFX: systems, emitters, spawning, parameters, and graph authoring.",
   {
-    list:           bp("List Niagara assets. Params: directory?, recursive?", "list_niagara_systems"),
+    list:           bp(paged("List Niagara assets: every NiagaraSystem and NiagaraEmitter as one row tagged with its `type`, sorted by object path within each type, plus systemCount/emitterCount for the whole listing. Lists the whole project; page through it with cursor/limit. Params: none"), "list_niagara_systems"),
     get_info:       bp("Inspect system. Params: assetPath", "get_niagara_info"),
+    list_dynamic_inputs:   bp("Report the authored override map per module: which inputs carry a plain value, which are wired to a dynamic-input script, and which hold an inline HLSL expression, with nested dynamic inputs one level down under nestedOverrides. This is a graph walk, so no property read produces it. Pair with list_module_inputs, which shows the inputs that have no override at all. Params: systemPath, emitterName?, emitterIndex?, stackContext? (ParticleSpawn|ParticleUpdate|EmitterSpawn|EmitterUpdate|all), moduleName?", "list_niagara_dynamic_inputs", (p) => ({ systemPath: p.systemPath, emitterName: p.emitterName, emitterIndex: p.emitterIndex, stackContext: p.stackContext, moduleName: p.moduleName })),
+    set_dynamic_input:     bp("Wire a dynamic-input NiagaraScript into a module input's override pin, creating the pin if needed and replacing whatever was there. A dynamic input is a graph node, not a property, so set_property cannot do this. Returns dynamicInputName, which is the module name to pass to set_module_input when setting the dynamic input's OWN inputs. Errors list the module's real input names and the modules present. Params: systemPath, stackContext, moduleName, inputName, dynamicInputScript, emitterName?, emitterIndex?", "set_niagara_dynamic_input", (p) => ({ systemPath: p.systemPath, stackContext: p.stackContext, moduleName: p.moduleName, inputName: p.inputName, dynamicInputScript: p.dynamicInputScript, emitterName: p.emitterName, emitterIndex: p.emitterIndex })),
+    remove_dynamic_input:  bp("Unwire a dynamic input, delete the nodes that fed only it, and drop the override pin so the module's own default comes back. An input with no dynamic input returns alreadyRemoved rather than an error, so a rollback replays safely. Params: systemPath, stackContext, moduleName, inputName, emitterName?, emitterIndex?", "remove_niagara_dynamic_input", (p) => ({ systemPath: p.systemPath, stackContext: p.stackContext, moduleName: p.moduleName, inputName: p.inputName, emitterName: p.emitterName, emitterIndex: p.emitterIndex })),
+    add_simulation_stage:  bp("Create a simulation stage on an emitter: the stage object AND the backing NiagaraScript, its output node with a fresh usage id, and a parameter-map input node, so the stage actually compiles. set_property cannot create a graph, which is why this is a handler. Returns simulationStageObjectPath; set IterationSource, NumIterations, ExecuteBehavior and the ElementCount bindings on it with asset(set_property). Params: systemPath, stageName, emitterName?, emitterIndex?, enabled?", "add_niagara_simulation_stage", (p) => ({ systemPath: p.systemPath, stageName: p.stageName, emitterName: p.emitterName, emitterIndex: p.emitterIndex, enabled: p.enabled })),
+    remove_simulation_stage: bp("Remove a simulation stage, its script, and the graph nodes that fed only its output node, leaving nodes shared with another stack alone. A missing stage returns alreadyRemoved with the stages that do exist. Reports removedModules, which the rollback cannot restore, rather than pretending the undo is complete. Params: systemPath, stageName, emitterName?, emitterIndex?", "remove_niagara_simulation_stage", (p) => ({ systemPath: p.systemPath, stageName: p.stageName, emitterName: p.emitterName, emitterIndex: p.emitterIndex })),
+    add_event_handler:     bp("Create an event handler on an emitter, with its event script, output node and usage id, so the handler's struct fields point at something real. Returns eventHandlerPropertyPath; set ExecutionMode, SpawnNumber and MaxEventsPerFrame through asset(set_property) on emitterObjectPath with that prefix. Params: systemPath, eventName, emitterName?, emitterIndex?, sourceEmitterId?", "add_niagara_event_handler", (p) => ({ systemPath: p.systemPath, eventName: p.eventName, emitterName: p.emitterName, emitterIndex: p.emitterIndex, sourceEmitterId: p.sourceEmitterId })),
+    remove_event_handler:  bp("Remove an event handler by its script's usage id and delete the graph chain that fed only it. A missing handler returns alreadyRemoved listing the handlers present. Echoes the ExecutionMode and SpawnNumber the rollback will not restore. Params: systemPath, eventName, emitterName?, emitterIndex?", "remove_niagara_event_handler", (p) => ({ systemPath: p.systemPath, eventName: p.eventName, emitterName: p.emitterName, emitterIndex: p.emitterIndex })),
+    get_custom_hlsl:       bp("Read every CustomHLSL node in a graph: the source body, and the pins Niagara parsed out of it. Omit nodeIndex to list them all. This is what makes HLSL iterable rather than write-once, since nothing else can read the body back. Params: scriptPath (a NiagaraScript) OR systemPath + stackContext? + emitterName?/emitterIndex?, nodeIndex?", "get_niagara_custom_hlsl", (p) => ({ scriptPath: p.scriptPath, systemPath: p.systemPath, stackContext: p.stackContext, emitterName: p.emitterName, emitterIndex: p.emitterIndex, nodeIndex: p.nodeIndex })),
+    set_custom_hlsl:       bp("Overwrite a CustomHLSL node's body and reconstruct the node, so the returned pins are the ones the new source actually declares. A bare property write would leave stale pins and an uncompiled script, which is why this is a handler. A body identical to the current one returns alreadySet and skips the recompile. Params: hlsl, scriptPath OR systemPath + stackContext? + emitterName?/emitterIndex?, nodeIndex?", "set_niagara_custom_hlsl", (p) => ({ hlsl: p.hlsl, scriptPath: p.scriptPath, systemPath: p.systemPath, stackContext: p.stackContext, emitterName: p.emitterName, emitterIndex: p.emitterIndex, nodeIndex: p.nodeIndex })),
+    remove_module:         bp("Remove a module from an emitter stack: unwire its node group, close the parameter-map chain over the gap, and delete the module with its override node and dynamic inputs. add_module had no inverse below UE 5.8, where only the Epic toolset covers this. Returns remainingModules in stack order and echoes the removedOverrides the rollback will not restore. Params: systemPath, stackContext, moduleName, emitterName?, emitterIndex?", "remove_niagara_module", (p) => ({ systemPath: p.systemPath, stackContext: p.stackContext, moduleName: p.moduleName, emitterName: p.emitterName, emitterIndex: p.emitterIndex })),
+    set_module_enabled:    bp("Enable or disable a module in place. A disabled module keeps its node, its inputs and its stack position and is skipped at compile time, which makes this the reversible way to test whether a module is causing a behaviour. Already in that state returns alreadySet. Params: systemPath, stackContext, moduleName, enabled, emitterName?, emitterIndex?", "set_niagara_module_enabled", (p) => ({ systemPath: p.systemPath, stackContext: p.stackContext, moduleName: p.moduleName, enabled: p.enabled, emitterName: p.emitterName, emitterIndex: p.emitterIndex })),
+    compile:        bp("Force a real compile of a system and report what the translator said, per script: scriptName, usage, status (NCS_UpToDate | NCS_UpToDateWithWarnings | NCS_Error | ...), errorMsg and every compile event with its severity and the node and pin guid that produced it, plus a top-level compiled boolean and a flat errors[]. This is the assertion a graph edit has to survive. validate answers whether the system EMITS, which a malformed script can still pass, and get_compiled_hlsl returns success without compiling anything at all on a CPU-sim emitter. The call blocks until the compile settles, because an asynchronous one hands back the previous compile's status. force (default true) recompiles even when nothing looks dirty, which is the case a graph edit that left change tracking untouched produces. Params: systemPath, force?, includeGpuShaders?", "compile_niagara_system", (p) => ({ systemPath: p.systemPath, force: p.force, includeGpuShaders: p.includeGpuShaders })),
     validate:       bp("Verify gate: does this system actually emit? Reports per emitter whether it is enabled and has a spawn module + an enabled renderer. valid=false means empty shell. Params: systemPath", "validate_niagara_system", (p) => ({ systemPath: p.systemPath })),
-    spawn:          bp("Spawn VFX as a transient component (GC's before offscreen capture). For a findable preview use spawn_actor. Params: systemPath, location, rotation?, label?", "spawn_niagara_at_location"),
+    spawn:          bp("Spawn VFX as a transient component (GC's before offscreen capture). For a findable preview use spawn_actor. Params: systemPath, location, rotation?, label?, scaleX?/scaleY?/scaleZ? (separate keys, not a vector object), autoDestroy? (default false)", "spawn_niagara_at_location"),
     spawn_actor:    bp("Spawn a PERSISTENT, labeled NiagaraActor in the editor world (findable, re-activatable, survives capture - unlike spawn). Assigns the system and activates. Params: systemPath, location?, rotation?, label?, activate? (default true) (#537)", "spawn_niagara_actor", (p) => ({ systemPath: p.systemPath, location: p.location, rotation: p.rotation, label: p.label, activate: p.activate })),
     reactivate:     bp("Reset + reactivate the NiagaraComponent on a placed actor (replay a burst before capturing). Params: actorLabel OR actorPath (#537/#983)", "reactivate_niagara", (p) => ({ actorLabel: p.actorLabel, actorPath: p.actorPath })),
-    set_parameter:  bp("Set parameter. Params: actorLabel OR actorPath, parameterName, value, parameterType?", "set_niagara_parameter"),
+    set_parameter:  bp("Set a user parameter on the NiagaraComponent of a placed actor. parameterType selects how the value is read: float, int and bool take `value`; vector takes valueX/valueY/valueZ, which are separate keys rather than a `value` object because that is what the handler reads. Reports previousValue and rolls back to it. Params: actorLabel OR actorPath, parameterName, parameterType? (float|vector|bool|int, default float), value (float/int/bool) OR valueX+valueY+valueZ (vector)", "set_niagara_parameter"),
     create:         bp("Create system. Params: name, packagePath?", "create_niagara_system"),
     create_emitter: bp("Create a Niagara emitter asset. templatePath copies an existing emitter as the starting point (the content browser's create-from-template path); omit it for the default empty emitter with the standard modules and a sprite renderer. inherit=true makes it a child that tracks the template instead, which then refuses local edits to inherited modules. Params: name, packagePath?, templatePath?, inherit? (default false), onConflict?", "create_niagara_emitter"),
     add_emitter:    bp("Add emitter to system. Params: systemPath, emitterPath", "add_emitter_to_system"),
     remove_emitter: bp("Remove an emitter from a system (CRUD delete). Params: systemPath, emitterName? or emitterIndex?", "remove_emitter_from_system", (p) => ({ systemPath: p.systemPath, emitterName: p.emitterName, emitterIndex: p.emitterIndex })),
     list_emitters:  bp("List emitters in system. Params: systemPath", "list_emitters_in_system"),
     set_emitter_property: bp("Set emitter property. Params: systemPath, emitterName?, propertyName, value", "set_emitter_property"),
-    list_modules:   bp("List Niagara modules. Params: directory?", "list_niagara_modules"),
+    list_modules:   bp(paged("List Niagara module scripts, sorted by object path. pathFilter narrows the whole set rather than only the first page, which is what it always claimed to do. Params: pathFilter?"), "list_niagara_modules"),
     get_emitter_info: bp("Inspect emitter. Params: assetPath", "get_emitter_info"),
     list_renderers:   bp("List renderers on an emitter. Params: systemPath, emitterName?, emitterIndex?", "list_emitter_renderers"),
     add_renderer:     bp("Add renderer (sprite/mesh/ribbon or full class). Params: systemPath, rendererType, emitterName?, emitterIndex?", "add_emitter_renderer"),
@@ -139,12 +152,25 @@ export const niagaraTool: ToolDef = categoryTool(
   },
   undefined,
   {
+    dynamicInputScript: z.string().optional().describe("set_dynamic_input: the dynamic-input NiagaraScript to wire in"),
+    enabled: z.boolean().optional().describe("add_simulation_stage: create the stage enabled (default true). set_module_enabled: the state to set"),
+    stageName: z.string().optional().describe("add/remove_simulation_stage: the simulation stage name"),
+    eventName: z.string().optional().describe("add/remove_event_handler: the event handler name"),
+    sourceEmitterId: z.string().optional().describe("add_event_handler: the emitter whose events this handler listens to"),
+    nodeIndex: z.number().optional().describe("get/set_custom_hlsl: which CustomHLSL node, when the graph has several"),
+    scriptPath: z.string().optional().describe("get/set_custom_hlsl: address a NiagaraScript asset directly instead of a system"),
     assetPath: z.string().optional(), actorLabel: z.string().optional(),
     actorPath: z.string().optional().describe("Full actor object path. The unambiguous selector, and it wins over actorLabel when both are given. Editor labels are NOT unique, and a label matching several actors is refused with the candidates rather than resolved at random (#983)"),
-    directory: z.string().optional(), recursive: z.boolean().optional(),
     systemPath: z.string().optional(), emitterPath: z.string().optional(),
     location: Vec3.optional(),
     activate: z.boolean().optional().describe("spawn_actor: activate the system on spawn (default true) (#537)"),
+    // spawn reads these four by name. Undeclared, the MCP layer stripped them
+    // before the bridge saw them, so a scaled or auto-destroying spawn reported
+    // success and spawned at unit scale that never went away.
+    scaleX: z.number().optional().describe("spawn: X scale of the spawned component (default 1)"),
+    scaleY: z.number().optional().describe("spawn: Y scale of the spawned component (default 1)"),
+    scaleZ: z.number().optional().describe("spawn: Z scale of the spawned component (default 1)"),
+    autoDestroy: z.boolean().optional().describe("spawn: destroy the component once the system finishes (default false)"),
     rotation: Rotator.optional(),
     label: z.string().optional(),
     parameterName: z.string().optional(),
@@ -153,7 +179,10 @@ export const niagaraTool: ToolDef = categoryTool(
     // via the JSON property setter (#783). set_module_input stringifies in its
     // own mapper because its handler takes a string.
     value: z.unknown().optional(),
-    parameterType: z.string().optional(),
+    parameterType: z.string().optional().describe("set_parameter: float (default) | vector | bool | int"),
+    valueX: z.number().optional().describe("set_parameter with parameterType=vector: X component"),
+    valueY: z.number().optional().describe("set_parameter with parameterType=vector: Y component"),
+    valueZ: z.number().optional().describe("set_parameter with parameterType=vector: Z component"),
     name: z.string().optional(),
     packagePath: z.string().optional(),
     templatePath: z.string().optional().describe("create_emitter: emitter asset to copy as a starting point"),
@@ -189,9 +218,18 @@ export const niagaraTool: ToolDef = categoryTool(
     inputName: z.string().optional().describe("For set_module_input: module input pin name"),
     switchName: z.string().optional().describe("For set_static_switch: static switch input name"),
     stackContext: z.string().optional().describe("ParticleSpawn|ParticleUpdate|EmitterSpawn|EmitterUpdate|all (default all)"),
-    hlsl: z.string().optional().describe("For create_module_from_hlsl: HLSL body"),
+    force: z.boolean().optional().describe("compile: recompile even when nothing looks dirty (default true)"),
+    includeGpuShaders: z.boolean().optional().describe("compile: also wait for GPU shader compilation to finish (default false)"),
+     force: z.boolean().optional().describe("compile: recompile even when nothing looks dirty (default true)"),
+     includeGpuShaders: z.boolean().optional().describe("compile: also wait for GPU shader compilation to finish (default false)"),
+     hlsl: z.string().optional().describe("create_module_from_hlsl / set_custom_hlsl: HLSL body"),
     inputs: z.array(z.record(z.unknown())).optional().describe("For create_module_from_hlsl: [{name, type}]"),
     outputs: z.array(z.record(z.unknown())).optional().describe("For create_module_from_hlsl: [{name, type}]"),
     ops: z.array(z.record(z.unknown())).optional().describe("For batch: [{action, params}]"),
+    pathFilter: z.string().optional().describe("list_modules: case-sensitive substring of the module script object path, applied to the whole set before paging"),
+    // cursor + limit for the paged list actions. Declared once: the MCP layer
+    // strips a key the category never declares, so a paged action whose
+    // category omits these silently returns page one forever.
+    ...PAGINATION_SCHEMA,
   },
 );

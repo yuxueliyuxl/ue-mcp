@@ -6,7 +6,7 @@ export const pluginsTool: ToolDef = categoryTool(
   "Introspect npm-distributed plugins that contribute actions into other categories. Read-only.",
   {
     list: {
-      description: "Every plugin loaded from ue-mcp.yml: name, version, prefix, status, and injected actions",
+      description: "Every plugin loaded from ue-mcp.yml: name, version, prefix, status, and injected actions. Params: none",
       handler: async (ctx) => {
         const all = ctx.getPlugins?.() ?? [];
         return {

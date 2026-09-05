@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { categoryTool, bp, type ToolDef } from "../types.js";
+import { PAGINATION_SCHEMA, paged } from "../pagination.js";
 import { Vec3, Rotator } from "../schemas.js";
 import { SESSION_ID } from "../locking.js";
 import { McpError, ErrorCode } from "../errors.js";
@@ -170,35 +171,66 @@ export const assetTool: ToolDef = categoryTool(
   "Asset management: list, search, read, CRUD, import meshes/textures, datatables, stringtables.",
   {
     list: bp(
-      "List assets via the AssetRegistry (sees /Game and every mounted plugin root). Paginated: returns totalMatched, offset, hasMore and nextOffset so a large folder can be walked deterministically instead of dropping the bridge on one oversized response (#790). Params: directory? (default /Game), classFilter?, recursive? (default true), maxResults? (default 500, max 5000), offset? (default 0)",
+      paged("List assets via the AssetRegistry (sees /Game and every mounted plugin root). Cursor-paginated, so a large folder is walked deterministically instead of dropping the bridge on one oversized response (#790): every page carries totalMatched, hasMore and a nextCursor to pass back. The row offset this used to page with is refused, because a row number cannot report that the folder changed underneath it. maxResults is a deprecated spelling of limit and sizes the page when limit is omitted. Params: directory? (default /Game), classFilter?, recursive? (default true), maxResults?"),
       "list_assets",
-      (p) => ({ directory: p.directory, classFilter: p.classFilter ?? p.typeFilter, recursive: p.recursive, maxResults: p.maxResults, offset: p.offset }),
+      // `offset` is still forwarded so the handler can refuse it by name. Drop
+      // it here and the MCP layer strips it instead, and a caller paging with
+      // the old parameter would silently read page one over and over.
+      (p) => ({ directory: p.directory, classFilter: p.classFilter ?? p.typeFilter, recursive: p.recursive, cursor: p.cursor, limit: p.limit ?? p.maxResults, offset: p.offset }),
     ),
     search: {
-      description: "Search by name/class/path. Params: query, directory?, maxResults?, searchAll?",
+      description: paged("Search by name/class/path. maxResults is a deprecated spelling of limit and sizes the page when limit is omitted. With extra content roots configured and no directory, this searches each root and pages ONE ROOT AT A TIME, so a cursor has to be passed back together with the directory it came from. Params: query, directory?, maxResults?, searchAll?"),
       handler: async (ctx, p) => {
-        const { action: _, ...rest } = p;
+        const { action: _, maxResults, ...rest } = p;
+        // One page size, whichever spelling the caller used. The bridge reads
+        // `limit` only, so `maxResults` is resolved here rather than in C++.
+        const limit = (p.limit as number | undefined) ?? (maxResults as number | undefined);
+        const call = { ...rest, ...(limit !== undefined ? { limit } : {}) };
         const roots = ctx.project.config.contentRoots;
         // If no directory specified and contentRoots configured, search each root and merge
         if (!p.directory && roots && roots.length > 0) {
-          const maxResults = (p.maxResults as number) ?? 50;
+          if (typeof p.cursor === "string" && p.cursor !== "") {
+            throw new McpError(
+              ErrorCode.INVALID_PARAMS,
+              `A cursor names one content root, and this call searches ${roots.length} of them (${roots.join(", ")}). `
+              + "Pass 'directory' set to the root the cursor came from, alongside the cursor, to continue that root. "
+              + "Each root's own nextCursor is reported per root on the first page.",
+            );
+          }
+          const cap = limit ?? 50;
           const allResults: Array<Record<string, unknown>> = [];
+          const perRoot: Array<Record<string, unknown>> = [];
           for (const root of roots) {
-            const res = await ctx.bridge.call("search_assets", { ...rest, directory: root }) as Record<string, unknown>;
+            const res = await ctx.bridge.call("search_assets", { ...call, directory: root }) as Record<string, unknown>;
             if (res.results && Array.isArray(res.results)) {
               allResults.push(...(res.results as Array<Record<string, unknown>>));
             }
-            if (allResults.length >= maxResults) break;
+            // Per root, because one cursor cannot address several of them. A
+            // root left unsearched because the cap was already reached says so,
+            // rather than reading as a root with nothing in it.
+            perRoot.push({
+              directory: root,
+              count: res.count ?? 0,
+              total: res.total,
+              hasMore: res.hasMore === true,
+              nextCursor: res.nextCursor,
+            });
+            if (allResults.length >= cap) break;
           }
+          const searched = perRoot.length;
           return {
             query: p.query ?? "",
             searchScope: roots,
-            resultCount: Math.min(allResults.length, maxResults),
-            results: allResults.slice(0, maxResults),
+            roots: perRoot,
+            rootsSearched: searched,
+            rootsUnsearched: roots.length - searched,
+            resultCount: Math.min(allResults.length, cap),
+            results: allResults.slice(0, cap),
+            hasMore: allResults.length > cap || perRoot.some((r) => r.hasMore === true) || searched < roots.length,
             success: true,
           };
         }
-        return ctx.bridge.call("search_assets", rest);
+        return ctx.bridge.call("search_assets", call);
       },
     },
     read:           bp("Read asset via reflection. Params: assetPath", "read_asset", (p) => ({ path: p.assetPath })),
@@ -230,6 +262,8 @@ export const assetTool: ToolDef = categoryTool(
     import_animation:     bp("Import anim from FBX. Params: filePath, name?, packagePath?, skeletonPath", "import_animation", (p) => ({ filename: p.filePath, destinationPath: p.packagePath, assetName: p.name, skeletonPath: p.skeletonPath })),
     import_texture:       bp("Import image. sRGB/compressionSettings/lodGroup/neverStream are applied at import time (folded in, no second call needed) (#661). Params: filePath, name?, packagePath?, sRGB?, compressionSettings? (Default|Normalmap|Grayscale|HDR|BC7|...), lodGroup?, neverStream?", "import_texture", (p) => ({ filename: p.filePath, destinationPath: p.packagePath, assetName: p.name, sRGB: p.sRGB, compressionSettings: p.compressionSettings, lodGroup: p.lodGroup, neverStream: p.neverStream })),
     create_render_target_2d: bp("Create and persist a TextureRenderTarget2D asset. Render format is applied before resource initialization. Params: name, packagePath? (default /Game), width? (1-8192, default 512), height? (1-8192, default 512), format? (R8|RG8|RGBA8|RGBA8_SRGB|R16F|RG16F|RGBA16F|R32F|RG32F|RGBA32F|RGB10A2, default RGBA8_SRGB), clearColor? ({r,g,b,a}, default transparent), generateMips? (default false), targetGamma? (default 0), onConflict? (skip|error)", "create_render_target_2d", (p) => ({ name: p.name, packagePath: p.packagePath, width: p.width, height: p.height, format: p.format, clearColor: p.clearColor, generateMips: p.generateMips, targetGamma: p.targetGamma, onConflict: p.onConflict })),
+    read_skeletal_mesh_build_settings: bp("Read a SkeletalMesh's per-LOD FSkeletalMeshBuildSettings without changing anything. Params: assetPath, lodIndex? (default 0), allLods? (every LOD; mutually exclusive with lodIndex). Returns assetPath, lodCount and lods[] of {lodIndex, beforeBuildSettings, afterBuildSettings (identical on a read), beforeOptimizeForInstancing, afterOptimizeForInstancing, changed}, where each settings object carries bRecomputeNormals, bRecomputeTangents, bUseMikkTSpace, bComputeWeightedNormals, bRemoveDegenerates, bUseHighPrecisionTangentBasis, bUseHighPrecisionSkinWeights, bUseFullPrecisionUVs, bUseBackwardsCompatibleF16TruncUVs, bOptimizeForInstancing, thresholdPosition, thresholdTangentNormal, thresholdUV, morphThresholdPosition and boneInfluenceLimit", "read_skeletal_mesh_build_settings", (p) => ({ assetPath: p.assetPath, lodIndex: p.lodIndex, allLods: p.allLods })),
+    set_skeletal_mesh_optimize_for_instancing: bp("Write bOptimizeForInstancing on a SkeletalMesh's LOD build settings, which reorders the skin data so instanced draws of the mesh batch. Only LODs whose current value differs are touched, and the asset is only rebuilt and saved when at least one changes, so a call that asks for the value already set is a no-op. Read the current state with read_skeletal_mesh_build_settings first. Params: assetPath, enabled, lodIndex? (default 0), allLods? (every LOD; mutually exclusive with lodIndex). Returns assetPath, lodCount and lods[] of {lodIndex, beforeBuildSettings, afterBuildSettings, beforeOptimizeForInstancing, afterOptimizeForInstancing, changed}", "set_skeletal_mesh_optimize_for_instancing", (p) => ({ assetPath: p.assetPath, enabled: p.enabled, lodIndex: p.lodIndex, allLods: p.allLods })),
     read_cloth_data:      bp("Read Chaos cloth data on a skeletal mesh: per clothing asset, its configs (reflected properties), LOD count, and per-LOD point-weight-map summary (name, target, vertex count, min/max - including the MaxDistances mask). Params: skeletalMeshPath (#595)", "read_cloth_data", (p) => ({ skeletalMeshPath: p.skeletalMeshPath })),
     set_cloth_config:     bp("Set properties on a clothing asset's Chaos cloth config via reflection. Params: skeletalMeshPath, properties (object), clothingAsset? (name filter), configType? (config class/key filter) (#595)", "set_cloth_config", (p) => ({ skeletalMeshPath: p.skeletalMeshPath, properties: p.properties, clothingAsset: p.clothingAsset, configType: p.configType })),
     export_texture:       bp("Export a Texture2D to a PNG on disk (for inspection or external diffing). Params: assetPath, outputPath (.png) (#697)", "export_texture", (p) => ({ assetPath: p.assetPath, outputPath: p.outputPath })),
@@ -240,8 +274,8 @@ export const assetTool: ToolDef = categoryTool(
     create_datatable:     bp("Create DataTable. Params: name, packagePath?, rowStruct", "create_datatable"),
     reimport_datatable:   bp("Reimport DataTable from JSON. Params: assetPath, jsonPath?, jsonString?", "reimport_datatable", (p) => ({ path: p.assetPath, jsonPath: p.jsonPath, jsonString: p.jsonString })),
     set_datatable_row:    bp("Append or overwrite a single DataTable row. Params: assetPath, rowName, row (object with row-struct fields - partial updates merge with the existing row). Idempotent; rollback restores the prior row (#437)", "set_datatable_row", (p) => ({ assetPath: p.assetPath, rowName: p.rowName, row: p.row ?? p.fields ?? p.data })),
-    add_datatable_row:    bp("Alias for set_datatable_row (#437)", "add_datatable_row", (p) => ({ assetPath: p.assetPath, rowName: p.rowName, row: p.row ?? p.fields ?? p.data })),
-    update_datatable_row: bp("Alias for set_datatable_row; partial update merges with existing row (#437)", "update_datatable_row", (p) => ({ assetPath: p.assetPath, rowName: p.rowName, row: p.row ?? p.fields ?? p.data })),
+    add_datatable_row:    bp("Alias for set_datatable_row. Params: assetPath, rowName, row (or fields / data) (#437)", "add_datatable_row", (p) => ({ assetPath: p.assetPath, rowName: p.rowName, row: p.row ?? p.fields ?? p.data })),
+    update_datatable_row: bp("Alias for set_datatable_row; partial update merges with existing row. Params: assetPath, rowName, row (or fields / data) (#437)", "update_datatable_row", (p) => ({ assetPath: p.assetPath, rowName: p.rowName, row: p.row ?? p.fields ?? p.data })),
     remove_datatable_row: bp("Remove a single DataTable row. Idempotent (alreadyDeleted=true if missing). Params: assetPath, rowName (#437)", "remove_datatable_row", (p) => ({ assetPath: p.assetPath, rowName: p.rowName })),
     get_datatable_row:    bp("Read one DataTable row's fields without dumping the whole table. Params: assetPath, rowName (#535)", "get_datatable_row", (p) => ({ assetPath: p.assetPath, rowName: p.rowName })),
     set_datatable_cell:   bp("Write a single field on a single existing row (merges, leaves other cells untouched). Errors if the row doesn't exist. Params: assetPath, rowName, fieldName, value (#535)", "set_datatable_cell", (p) => ({ assetPath: p.assetPath, rowName: p.rowName, fieldName: p.fieldName, value: p.value })),
@@ -257,7 +291,7 @@ export const assetTool: ToolDef = categoryTool(
     get_curvetable_keys:  bp("Read keys from one CurveTable row. Params: assetPath, rowName", "get_curvetable_keys", (p) => ({ assetPath: p.assetPath, rowName: p.rowName })),
     set_curvetable_keys:  bp("Replace keys on one CurveTable row. Params: assetPath, rowName, keys:[{time,value,interpMode?,arriveTangent?,leaveTangent?}]", "set_curvetable_keys", (p) => ({ assetPath: p.assetPath, rowName: p.rowName, keys: p.keys })),
     add_curvetable_key:   bp("Add or update one key on a CurveTable row. Params: assetPath, rowName, time, value, interpMode?, keyTimeTolerance?", "add_curvetable_key", (p) => ({ assetPath: p.assetPath, rowName: p.rowName, time: p.time, value: p.value, interpMode: p.interpMode, keyTimeTolerance: p.keyTimeTolerance })),
-    list_textures:        bp("List textures. Params: directory?, recursive?", "list_textures"),
+    list_textures:        bp(paged("List textures. maxResults is a deprecated spelling of limit and sizes the page when limit is omitted. Params: directory?, recursive?, maxResults?"), "list_textures", (p) => ({ directory: p.directory, recursive: p.recursive, cursor: p.cursor, limit: p.limit ?? p.maxResults })),
     get_texture_info:     bp("Get texture details. Params: assetPath", "get_texture_info"),
     set_texture_settings: bp("Set texture settings. Params: assetPath, settings (object with compressionSettings?, lodGroup?, sRGB?, neverStream?). Keys may also be passed at the top level.", "set_texture_settings", (p) => ({
       assetPath: p.assetPath,
@@ -305,7 +339,7 @@ export const assetTool: ToolDef = categoryTool(
     health_check:         bp("Diagnose stuck-unloadable asset. Returns onDisk/inRegistry/isLoaded/canLoad/isStuck flags so an agent can detect the half-shutdown state where load returns null but the file exists (#279). Params: assetPath", "asset_health_check"),
     force_reload:         bp("Aggressive reload from disk: closes open editors, reloads the package (rebuilding a Blueprint's class and CDO so container properties come back fresh, not just scalars), and reports objectReplaced. Refuses a dirty package unless discardUnsaved=true, and fails loudly when the editor would not release the old object rather than serving stale values (#279/#820). Params: assetPath, discardUnsaved? (default false)", "force_reload_asset", (p) => ({ assetPath: p.assetPath ?? p.path, discardUnsaved: p.discardUnsaved })),
     export:               bp("Export asset to disk file (Texture2D → PNG, StaticMesh → FBX, etc.). Params: assetPath, outputPath", "export_asset"),
-    search_fts:           bp("Ranked asset search (token-scored over name/class/path). Params: query, maxResults?, classFilter?", "search_assets_fts", (p) => ({ query: p.query, maxResults: p.maxResults, classFilter: p.classFilter })),
+    search_fts:           bp(paged("Ranked asset search (token-scored over name/class/path). Every match is scored and the ranked list is paged, so the top page is a page rather than the whole answer. maxResults is a deprecated spelling of limit and sizes the page when limit is omitted. Params: query, maxResults?, classFilter?"), "search_assets_fts", (p) => ({ query: p.query, classFilter: p.classFilter, cursor: p.cursor, limit: p.limit ?? p.maxResults })),
     reindex_fts:          bp("Rebuild the SQLite FTS5 asset index. Params: directory?", "reindex_assets_fts", (p) => ({ directory: p.directory })),
     get_referencers:      bp("Reverse dependency lookup (what references this). Params: packages[] OR packagePath (#150). Returns {referencersByPackage, totalReferencers}.", "get_asset_referencers", (p) => ({ packages: p.packages, packagePath: p.packagePath })),
     get_dependencies:     bp("Forward dependency lookup (what packages this asset references). Params: packages[] OR packagePath, hard? (default true), soft? (default true) (#588). Returns {dependenciesByPackage, totalDependencies}.", "get_asset_dependencies", (p) => ({ packages: p.packages, packagePath: p.packagePath, hard: p.hard, soft: p.soft })),
@@ -320,6 +354,21 @@ export const assetTool: ToolDef = categoryTool(
     get_mesh_collision:   bp("Inspect StaticMesh collision setup. Params: assetPath. Returns collisionTraceFlag, hasSimple/ComplexCollision, element counts (#177)", "get_mesh_collision"),
     get_mesh_geometry:    bp("Read actual vertex data off a StaticMesh OR SkeletalMesh: per-section positions, uvs, normals and triangle indices, from the engine's render data (no ProceduralMeshComponent plugin needed). Triangle indices are section-local, so they index that section's own positions array; add baseVertexIndex for LOD-global indices. Over 20000 vertices inline is refused - pass dumpToFile to write the full data to a JSON file instead, or narrow with sectionIndex. Params: assetPath, lodIndex? (default 0), sectionIndex? (omit for all sections), include? ([positions|uvs|normals|triangles], omit for all), uvChannel? (default 0), dumpToFile?, outputPath? (#948/#926/#953)", "get_mesh_geometry", (p) => ({ assetPath: p.assetPath ?? p.path, lodIndex: p.lodIndex, sectionIndex: p.sectionIndex, include: p.include, uvChannel: p.uvChannel, dumpToFile: p.dumpToFile, outputPath: p.outputPath })),
     measure_mesh_geometry: bp("Measure a StaticMesh OR SkeletalMesh LOD: bounds, dimensions, surfaceArea, volume, triangleCount, vertexCount, isClosed, isManifold, boundaryEdgeCount, nonManifoldEdgeCount. surfaceArea and volume are NAMED fields, never a positional pair (the engine's get_mesh_volume_area returns them in the order opposite to its name, #938). Vertices are welded by position before topology analysis so a UV seam does not read as a hole. Params: assetPath, lodIndex? (default 0), sectionIndex? (omit to measure the whole LOD) (#938/#953)", "measure_mesh_geometry", (p) => ({ assetPath: p.assetPath ?? p.path, lodIndex: p.lodIndex, sectionIndex: p.sectionIndex })),
+    read_uv_channels:     bp("Report every UV channel of a StaticMesh or SkeletalMesh LOD: bounds, UV area, unit-square coverage, overlap fraction and the triangles involved, island count, degenerate islands, seam edges, out-of-range and flipped triangles, plus which channel LightMapCoordinateIndex points at and the LOD's lightmap build settings. This is the verification half of the UV surface: every other UV action reports the same channel block after it writes, so a change can be checked rather than trusted. Overlap and coverage are RASTERISED at rasterSize rather than tested exactly, and the result says so via overlapMethod. Params: assetPath, lodIndex?, channels?, includeIslands? (default true), includeOverlap? (default true), rasterSize? (default 512)", "read_uv_channels", (p) => ({ assetPath: p.assetPath, lodIndex: p.lodIndex, channels: p.channels, includeIslands: p.includeIslands, includeOverlap: p.includeOverlap, rasterSize: p.rasterSize })),
+    set_uv_channel_count: bp("Add, remove, resize or copy a UV channel. Channel count is a mesh-description attribute with no UPROPERTY, so asset(set_property) cannot reach it. Setting the count it already has returns existed=true and skips the rebuild. Growing has an exact inverse and the rollback restores it; remove and copy-over-existing DESTROY coordinates, so those report rollbackRestoresChannelCountOnly rather than pretending the undo is complete. Params: assetPath, lodIndex?, op? (set|add|remove|copy, default set), channelCount? (op=set), count? (op=add, default 1), channel? (op=remove), fromChannel? / toChannel? (op=copy), save? (default true), dryRun?", "set_uv_channel_count", (p) => ({ assetPath: p.assetPath, lodIndex: p.lodIndex, op: p.op, channelCount: p.channelCount, count: p.count, channel: p.channel, fromChannel: p.fromChannel, toChannel: p.toChannel, save: p.save, dryRun: p.dryRun })),
+    unwrap_uvs:           bp("Auto-unwrap and pack islands into one channel via Geometry Script, adding the channel if it does not exist. It converts the LOD to a DynamicMesh and back, so the WHOLE LOD is rewritten rather than only its UVs; the result says so. Pass backupToChannel for a lossless rollback, otherwise only the channel count is restorable. Without the Geometry Script plugin it returns reason='geometry_scripting_unavailable' naming what to enable instead of failing opaquely. Params: assetPath, lodIndex?, channel? (default 0), method? (xatlas|patchBuilder|expMap|conformal|spectralConformal|planar|box|cylinder, default xatlas), pack? (default true), textureResolution? (default 1024), maxIterations?, initialPatchCount?, islandSource? (UVIslands|PolyGroups), projectionTransform?, preserveVertexOrder? (default true), backupToChannel?, save? (default true), dryRun?, rasterSize?", "unwrap_uvs", (p) => ({ assetPath: p.assetPath, lodIndex: p.lodIndex, channel: p.channel, method: p.method, pack: p.pack, textureResolution: p.textureResolution, maxIterations: p.maxIterations, initialPatchCount: p.initialPatchCount, islandSource: p.islandSource, projectionTransform: p.projectionTransform, preserveVertexOrder: p.preserveVertexOrder, backupToChannel: p.backupToChannel, save: p.save, dryRun: p.dryRun, rasterSize: p.rasterSize })),
+    transform_uvs:        bp("One action for every UV transform: the whole channel, chosen islands, triangles facing a direction, or one material slot, plus flips. The filter is the only thing that varies, so the maths lives in one place rather than in four near-identical actions. Edits the mesh description directly, touching nothing but the UV channel, and emits an EXACT inverse as its rollback. A zero scale component is refused because it has no inverse; an identity transform returns existed=true without rebuilding. Params: assetPath, lodIndex?, channel? (default 0), translate? ({u,v}), scale? ({u,v}), rotate? (degrees), origin? ({u,v}, default 0.5/0.5), flipU?, flipV?, order? (flipScaleRotateTranslate|translateRotateScaleFlip), selection? ({mode: all|island|normal|polygonGroup, islandIndices?, normalDirection?, normalAngleTolerance?, polygonGroups?, materialSlotNames?}), save? (default true), dryRun?", "transform_uvs", (p) => ({ assetPath: p.assetPath, lodIndex: p.lodIndex, channel: p.channel, translate: p.translate, scale: p.scale, rotate: p.rotate, origin: p.origin, flipU: p.flipU, flipV: p.flipV, order: p.order, selection: p.selection, save: p.save, dryRun: p.dryRun })),
+    generate_lightmap_uvs: bp("Apply the lightmap build settings AND run UStaticMesh::Build AND read the result back. Deliberately not a setter: bGenerateLightmapUVs, SrcLightmapIndex, DstLightmapIndex and LightMapCoordinateIndex are plain UPROPERTYs that asset(set_property) already writes, and writing them does NOTHING until the mesh rebuilds. That rebuild is the whole point. Returns the channel the build actually produced with its overlap and island report, and fails loudly when the channel did not appear. StaticMesh only. Rollback restores the settings, not the generated coordinates. Params: assetPath, lodIndex?, enable? (default true), sourceChannel?, destinationChannel?, minLightmapResolution? (default 64), lightmapResolution?, setLightmapCoordinateIndex? (default true), force?, save? (default true), dryRun?, rasterSize?", "generate_lightmap_uvs", (p) => ({ assetPath: p.assetPath, lodIndex: p.lodIndex, enable: p.enable, sourceChannel: p.sourceChannel, destinationChannel: p.destinationChannel, minLightmapResolution: p.minLightmapResolution, lightmapResolution: p.lightmapResolution, setLightmapCoordinateIndex: p.setLightmapCoordinateIndex, force: p.force, save: p.save, dryRun: p.dryRun, rasterSize: p.rasterSize })),
+    export_uv_layout:     bp("Render one UV channel to a PNG under Saved/UVLayouts: white wireframe, one hue per island, red where two triangles share a texel, yellow unit-square border. Returns the file path plus the same channel statistics read_uv_channels reports, so the picture and the numbers describe the same rasterisation. Use it to SEE why a lightmap bake is wrong instead of inferring it from counts. Params: assetPath, lodIndex?, channel? (default 0), outputPath?, imageSize? (default 1024, max 4096), showIslands? (default true), showOverlaps? (default true), showGrid? (default true)", "export_uv_layout", (p) => ({ assetPath: p.assetPath, lodIndex: p.lodIndex, channel: p.channel, outputPath: p.outputPath, imageSize: p.imageSize, showIslands: p.showIslands, showOverlaps: p.showOverlaps, showGrid: p.showGrid })),
+    check_uvs:            bp("One-call UV health report, the same idiom as measure_mesh_geometry. Flags a missing lightmap channel, a LightMapCoordinateIndex that disagrees with the build's DstLightmapIndex, overlap in the lightmap channel over budget, lightmap UVs outside 0..1, empty or degenerate channels and islands, and flipped triangles, each with a severity and the action that fixes it. Out-of-range UVs OUTSIDE the lightmap channel are reported as info rather than a fault, because tiling is legitimate there. Params: assetPath, lodIndex?, requireLightmapChannel? (default true for StaticMesh), maxOverlapFraction? (default 0.001), rasterSize? (default 512)", "check_uvs", (p) => ({ assetPath: p.assetPath, lodIndex: p.lodIndex, requireLightmapChannel: p.requireLightmapChannel, maxOverlapFraction: p.maxOverlapFraction, rasterSize: p.rasterSize })),
+    apply_mesh_simplify:  bp("Reduce a StaticMesh's triangle count while keeping its silhouette, through Geometry Script. Nine strategies because 'simplify' means different things: a target triangleCount or vertexCount, a geometric tolerance (the furthest the surface may drift), an edgeLength, a fast cluster-based edgeLength, a structural collapse of coplanar regions (planar) or of PolyGroup faces (polygroup), and the editor's own reducer (editorTriangleCount, editorVertexCount). NOT reachable through asset(set_property): a StaticMesh's LOD reduction settings build a NEW LOD, they never rewrite LOD 0's source geometry, and no UPROPERTY means 'collapse this mesh to 500 triangles'. Writes a SEPARATE asset by default (outputPath, or '<assetPath>_Simplified'), whose rollback is a complete delete; inPlace=true overwrites the source and reports that its edit has no inverse, with backupPath as the escape. Idempotent: a mesh already at or under the target reports changed=false and is not rewritten. Needs the Geometry Script engine plugin, and without it returns reason='geometry_scripting_unavailable' naming what to enable. Params: assetPath, simplifyMode? (triangleCount|vertexCount|tolerance|edgeLength|clusterEdgeLength|planar|polygroup|editorTriangleCount|editorVertexCount, default triangleCount), triangleCount?, vertexCount?, tolerance?, edgeLength?, angleThreshold?, method? (StandardQEM|VolumePreserving|AttributeAware|AttributeAwareV2), allowSeamCollapse?, preserveVertexPositions?, autoCompact?, outputPath?, inPlace?, backupPath?, lodType?, lodIndex?, onConflict?, copyMaterialsFromSource?, copyCollisionFromSource?, nanite?, recomputeNormals?, recomputeTangents?, removeDegenerates?, save?, dryRun?", "apply_mesh_simplify", (p) => ({ assetPath: p.assetPath ?? p.path, simplifyMode: p.simplifyMode, triangleCount: p.triangleCount, vertexCount: p.vertexCount, tolerance: p.tolerance, edgeLength: p.edgeLength, angleThreshold: p.angleThreshold, method: p.method, allowSeamCollapse: p.allowSeamCollapse, preserveVertexPositions: p.preserveVertexPositions, autoCompact: p.autoCompact, outputPath: p.outputPath, inPlace: p.inPlace, backupPath: p.backupPath, lodType: p.lodType, lodIndex: p.lodIndex, onConflict: p.onConflict, copyMaterialsFromSource: p.copyMaterialsFromSource, copyCollisionFromSource: p.copyCollisionFromSource, nanite: p.nanite, recomputeNormals: p.recomputeNormals, recomputeTangents: p.recomputeTangents, removeDegenerates: p.removeDegenerates, save: p.save, dryRun: p.dryRun })),
+    apply_mesh_remesh:    bp("Rebuild a StaticMesh's triangulation at a uniform or adaptive density. Different from apply_mesh_simplify: simplify only removes triangles, remesh splits AND collapses AND flips edges to reach an even edge length, which is what a mesh needs before deformation, baking, or a convex decomposition that would otherwise follow the original triangulation's bias. Writes a SEPARATE asset by default ('<assetPath>_Remeshed'). Deliberately NOT idempotent and says so in repeatIsIdempotent: remeshing a remeshed mesh keeps moving vertices, so a repeat is a second edit rather than a no-op, which is why the separate-output default matters here more than anywhere else. Needs the Geometry Script engine plugin. Params: assetPath, remeshMode? (uniform|adaptive, default uniform), targetType? (TriangleCount|TargetEdgeLength), targetTriangleCount?, targetEdgeLength?, smoothingType? (Uniform|UVPreserving|Mixed), smoothingRate?, boundaryConstraint? (Fixed|Refine|Free|Ignore), iterations?, discardAttributes?, reprojectToInputMesh?, relativeDensity?, outputPath?, inPlace?, backupPath?, lodType?, lodIndex?, onConflict?, copyMaterialsFromSource?, copyCollisionFromSource?, nanite?, recomputeNormals?, recomputeTangents?, removeDegenerates?, save?, dryRun?", "apply_mesh_remesh", (p) => ({ assetPath: p.assetPath ?? p.path, remeshMode: p.remeshMode, targetType: p.targetType, targetTriangleCount: p.targetTriangleCount, targetEdgeLength: p.targetEdgeLength, smoothingType: p.smoothingType, smoothingRate: p.smoothingRate, boundaryConstraint: p.boundaryConstraint, iterations: p.iterations, discardAttributes: p.discardAttributes, reprojectToInputMesh: p.reprojectToInputMesh, relativeDensity: p.relativeDensity, outputPath: p.outputPath, inPlace: p.inPlace, backupPath: p.backupPath, lodType: p.lodType, lodIndex: p.lodIndex, onConflict: p.onConflict, copyMaterialsFromSource: p.copyMaterialsFromSource, copyCollisionFromSource: p.copyCollisionFromSource, nanite: p.nanite, recomputeNormals: p.recomputeNormals, recomputeTangents: p.recomputeTangents, removeDegenerates: p.removeDegenerates, save: p.save, dryRun: p.dryRun })),
+    apply_mesh_mirror:    bp("Reflect a StaticMesh across a plane, optionally cutting away the far side first and welding the seam. This is the 'model half of it and mirror' workflow, and it is real geometry rather than a negative component scale, which inverts the winding and lights wrong; no UPROPERTY on a StaticMesh mirrors its source geometry. Name the plane with axis=x|y|z through planeOrigin, or axis=custom with an explicit planeNormal. Writes a SEPARATE asset by default ('<assetPath>_Mirrored'). NOT idempotent and says so: mirroring a mirrored mesh doubles it again rather than returning the original. Needs the Geometry Script engine plugin. Params: assetPath, axis? (x|y|z|custom, default x), planeOrigin?, planeNormal?, applyPlaneCut?, flipCutSide?, weldAlongPlane?, outputPath?, inPlace?, backupPath?, lodType?, lodIndex?, onConflict?, copyMaterialsFromSource?, copyCollisionFromSource?, nanite?, recomputeNormals?, recomputeTangents?, removeDegenerates?, save?, dryRun?", "apply_mesh_mirror", (p) => ({ assetPath: p.assetPath ?? p.path, axis: p.axis, planeOrigin: p.planeOrigin, planeNormal: p.planeNormal, applyPlaneCut: p.applyPlaneCut, flipCutSide: p.flipCutSide, weldAlongPlane: p.weldAlongPlane, outputPath: p.outputPath, inPlace: p.inPlace, backupPath: p.backupPath, lodType: p.lodType, lodIndex: p.lodIndex, onConflict: p.onConflict, copyMaterialsFromSource: p.copyMaterialsFromSource, copyCollisionFromSource: p.copyCollisionFromSource, nanite: p.nanite, recomputeNormals: p.recomputeNormals, recomputeTangents: p.recomputeTangents, removeDegenerates: p.removeDegenerates, save: p.save, dryRun: p.dryRun })),
+    apply_mesh_hole_fill: bp("Close every open boundary loop on a StaticMesh so it becomes watertight, which is what a boolean, a voxel operation, a convex decomposition and a physics conversion all require and the most common reason those fail. WELDS FIRST by default: a great many 'holes' are not holes but duplicated vertices along a seam that no fill can close, and running the fill alone on such a mesh reports zero holes filled while the mesh stays open. Genuinely idempotent: a mesh with nothing left to fill reports existed=true and is not rewritten. Reports filledHoles, failedHoleFills, weldedOpenEdges and the before/after open-border-edge counts, so 'watertight now' can be verified rather than assumed. Needs the Geometry Script engine plugin. Params: assetPath, fillMethod? (Automatic|MinimalFill|PolygonTriangulation|TriangleFan|PlanarProjection), weldFirst?, weldTolerance?, removeDegenerateFirst?, deleteIsolatedTriangles?, outputPath?, inPlace?, backupPath?, lodType?, lodIndex?, onConflict?, copyMaterialsFromSource?, copyCollisionFromSource?, nanite?, recomputeNormals?, recomputeTangents?, removeDegenerates?, save?, dryRun?", "apply_mesh_hole_fill", (p) => ({ assetPath: p.assetPath ?? p.path, fillMethod: p.fillMethod, weldFirst: p.weldFirst, weldTolerance: p.weldTolerance, removeDegenerateFirst: p.removeDegenerateFirst, deleteIsolatedTriangles: p.deleteIsolatedTriangles, outputPath: p.outputPath, inPlace: p.inPlace, backupPath: p.backupPath, lodType: p.lodType, lodIndex: p.lodIndex, onConflict: p.onConflict, copyMaterialsFromSource: p.copyMaterialsFromSource, copyCollisionFromSource: p.copyCollisionFromSource, nanite: p.nanite, recomputeNormals: p.recomputeNormals, recomputeTangents: p.recomputeTangents, removeDegenerates: p.removeDegenerates, save: p.save, dryRun: p.dryRun })),
+    generate_mesh_collision: bp("Build simple collision shapes for a StaticMesh from its own geometry, or clear them. Eight methods from axis-aligned boxes to a full convex decomposition. NOT reachable through asset(set_property): UBodySetup AggGeom is a UPROPERTY, but what has to go into it is the OUTPUT of a decomposition solver running over the mesh, and there is no value a caller could supply; the shape count and trace flag stay ordinary property writes and asset(get_mesh_collision) is still the read half. Idempotent: generation from the same mesh with the same options is deterministic, so a repeat reports changed=false without rewriting the asset, compared by a structural signature (shape counts per kind, hull vertex counts, trace flag) rather than byte-for-byte. op='clear' is the remove half and needs no plugin at all. A generation that produces zero shapes is reported as a failure naming apply_mesh_hole_fill, not as a success that quietly left the mesh with no collision. Params: assetPath, op? (generate|clear, default generate), method? (AlignedBoxes|OrientedBoxes|MinimalSpheres|Capsules|ConvexHulls|SweptHulls|MinVolumeShapes|LevelSets), maxConvexHulls?, hullTargetFaceCount?, maxShapeCount?, minThickness?, autoDetectSpheres?, autoDetectBoxes?, autoDetectCapsules?, simplifyHulls?, removeFullyContainedShapes?, decompositionErrorTolerance?, decompositionSearchFactor?, sweptHullAxis? (X|Y|Z|SmallestBoxDimension|SmallestVolume), markAsCustomized?, lodType?, lodIndex?, save?, dryRun?", "generate_mesh_collision", (p) => ({ assetPath: p.assetPath ?? p.path, op: p.op, method: p.method, maxConvexHulls: p.maxConvexHulls, hullTargetFaceCount: p.hullTargetFaceCount, maxShapeCount: p.maxShapeCount, minThickness: p.minThickness, autoDetectSpheres: p.autoDetectSpheres, autoDetectBoxes: p.autoDetectBoxes, autoDetectCapsules: p.autoDetectCapsules, simplifyHulls: p.simplifyHulls, removeFullyContainedShapes: p.removeFullyContainedShapes, decompositionErrorTolerance: p.decompositionErrorTolerance, decompositionSearchFactor: p.decompositionSearchFactor, sweptHullAxis: p.sweptHullAxis, markAsCustomized: p.markAsCustomized, lodType: p.lodType, lodIndex: p.lodIndex, save: p.save, dryRun: p.dryRun })),
+    apply_mesh_fracture:  bp("Cut a StaticMesh with planes and write each resulting piece out as its own StaticMesh asset, ready to be placed, simulated or destroyed individually. Three patterns: slice (parallel cuts along one axis), grid (cuts along all three) and random (seeded planes through the bounds). WHAT THIS IS NOT: it is not Chaos destruction and produces no UGeometryCollection, because every engine entry point for that carries no UFUNCTION and reflection cannot reach it; the result says so in producesGeometryCollection=false rather than leaving it to be discovered. The source asset is never modified, so the rollback is an exact delete of the pieces it wrote. Seeded, therefore repeatable: onConflict='error' (the default) refuses rather than writing over pieces already there. dryRun lists the cut planes and every path it would write. Params: assetPath, pattern? (slice|grid|random, default slice), axis? (x|y|z), pieces?, gridX?, gridY?, gridZ?, planeCount?, seed?, jitter?, gapWidth?, fillHoles?, minPieceTriangles?, outputBasePath?, onConflict?, copyMaterialsFromSource?, nanite?, recomputeNormals?, recomputeTangents?, lodType?, lodIndex?, save?, dryRun?", "apply_mesh_fracture", (p) => ({ assetPath: p.assetPath ?? p.path, pattern: p.pattern, axis: p.axis, pieces: p.pieces, gridX: p.gridX, gridY: p.gridY, gridZ: p.gridZ, planeCount: p.planeCount, seed: p.seed, jitter: p.jitter, gapWidth: p.gapWidth, fillHoles: p.fillHoles, minPieceTriangles: p.minPieceTriangles, outputBasePath: p.outputBasePath, onConflict: p.onConflict, copyMaterialsFromSource: p.copyMaterialsFromSource, nanite: p.nanite, recomputeNormals: p.recomputeNormals, recomputeTangents: p.recomputeTangents, lodType: p.lodType, lodIndex: p.lodIndex, save: p.save, dryRun: p.dryRun })),
+    audit_hygiene:        bp("One read-only sweep answering the questions a project accumulates answers to and never gets asked: what nothing references (unreferenced), what references nothing (brokenReferences), what exists twice (duplicates), what breaks the naming convention (naming), and what renames left behind (redirectors). asset(get_referencers) and asset(get_dependencies) answer the first two for ONE named package; this is the project-wide form, which is the one an agent needs. The unreferenced section carries a caveat to read before acting on it: an asset loaded by name from an INI setting, from C++ with a hardcoded path, or from a soft reference resolved at runtime has no package dependency and appears there while being very much in use, so treat it as candidates to review rather than a delete list. Maps, World Partition external actors and Asset Manager primary assets are already excluded for that reason. Duplicate detection by content matches class, file size and saved package hash, which finds a file copied verbatim but NOT a copy saved under a different name (the name is inside the file); duplicateMethod='name' is what catches an asset imported twice into two folders. Naming rules match on the asset's class name, so WidgetBlueprint and AnimBlueprint carry their own prefixes rather than inheriting Blueprint's, and the effective table comes back in rulesApplied. Counts are always complete; only the listings are capped by maxIssues. Params: directory?, directories?, recursive?, maxAssets?, maxIssues?, checks? (unreferenced|brokenReferences|duplicates|naming|redirectors), classNames?, excludePaths?, keepPaths?, duplicateMethod? (content|name|both), namingRules?, namingRuleMode? (merge|replace), includeWorlds?, ignoreRedirectorReferencers?", "audit_asset_hygiene", (p) => ({ directory: p.directory, directories: p.directories, recursive: p.recursive, maxAssets: p.maxAssets, maxIssues: p.maxIssues, checks: p.checks, classNames: p.classNames, excludePaths: p.excludePaths, keepPaths: p.keepPaths, duplicateMethod: p.duplicateMethod, namingRules: p.namingRules, namingRuleMode: p.namingRuleMode, includeWorlds: p.includeWorlds, ignoreRedirectorReferencers: p.ignoreRedirectorReferencers })),
+    bulk_fix_hygiene:     bp("The batched fix-up for the two audit_hygiene findings a machine can act on without deciding something a person should: a name that breaks the convention (fix='naming') and an asset nothing references (fix='unreferenced'). Same preflight shape as bulk_set_properties: every candidate is validated, every candidate gets a status back including the rejected ones, and a failed preflight aborts before anything is touched unless continueOnError. THREE SAFETY RULES that are not the shape: dryRun DEFAULTS TO TRUE and the dry run names every asset with its exact destination; fix='unreferenced' MOVES assets into quarantineFolder by default rather than deleting them, and that move has an exact inverse this call emits as its rollback; and findings are recomputed here rather than taken from an audit, so an asset that gained a referencer since then is skipped with the referencer named. maxFixes caps the batch far below the audit's scan ceiling. Worlds are refused outright, because moving one without migrating its external-actor packages in the same batch orphans every actor in the level; use asset(rename). fix='redirectors' is refused too and points at asset(fixup_redirectors), which already does it properly. Params: fix (naming|unreferenced), assetPaths?, directory?, directories?, recursive?, maxAssets?, classNames?, excludePaths?, keepPaths?, namingRules?, namingRuleMode?, unreferencedAction? (quarantine|delete), quarantineFolder?, ignoreRedirectorReferencers?, maxFixes?, continueOnError?, save?, dryRun?", "fix_asset_hygiene", (p) => ({ fix: p.fix, assetPaths: p.assetPaths, directory: p.directory, directories: p.directories, recursive: p.recursive, maxAssets: p.maxAssets, classNames: p.classNames, excludePaths: p.excludePaths, keepPaths: p.keepPaths, namingRules: p.namingRules, namingRuleMode: p.namingRuleMode, unreferencedAction: p.unreferencedAction, quarantineFolder: p.quarantineFolder, ignoreRedirectorReferencers: p.ignoreRedirectorReferencers, maxFixes: p.maxFixes, continueOnError: p.continueOnError, save: p.save, dryRun: p.dryRun })),
     mesh_boolean:         { description: "Boolean CSG between two StaticMeshes: union, subtract, intersect, trimInside, trimOutside, newPolyGroupInside, newPolyGroupOutside. The target is the mesh being cut and the tool is what cuts it, each placed by its own optional transform. Writes to a SEPARATE output asset by default (outputPath, or '<targetPath>_<Operation>' when omitted); inPlace=true opts into overwriting the target and is the only destructive form. An existing outputPath is refused unless onConflict='replace'. An empty result is refused and nothing is written unless allowEmptyResult=true, because two meshes that never overlap otherwise report success having deleted everything. Returns triangle and vertex counts for both inputs and the result, plus the written asset's triangles, vertices, LOD count, material slots and bounds, so the operation can be verified rather than trusted. dryRun runs the boolean and reports those counts without writing. Materials and simple collision are copied from the target by default; nanite is inherit (match the target) | enable | disable. Needs the Geometry Script engine plugin: without it the call returns reason='geometry_scripting_unavailable' naming what to enable, rather than failing opaquely. Params: operation, targetPath, toolPath, outputPath?, inPlace?, targetTransform?, toolTransform?, lodType? (MaxAvailable|HiResSourceModel|SourceModel|RenderData), lodIndex?, fillHoles? (default true), simplifyOutput? (default true), simplifyPlanarTolerance? (default 0.01), allowEmptyResult?, recomputeNormals?, recomputeTangents?, removeDegenerates?, copyCollisionFromTarget? (default true), copyMaterialsFromTarget? (default true), nanite?, onConflict? (error|replace), dryRun?, save? (default true) (#916)", bridge: "mesh_boolean", mapParams: (p) => ({ operation: p.operation, targetPath: p.targetPath, toolPath: p.toolPath, outputPath: p.outputPath, inPlace: p.inPlace, targetTransform: p.targetTransform, toolTransform: p.toolTransform, lodType: p.lodType, lodIndex: p.lodIndex, fillHoles: p.fillHoles, simplifyOutput: p.simplifyOutput, simplifyPlanarTolerance: p.simplifyPlanarTolerance, allowEmptyResult: p.allowEmptyResult, recomputeNormals: p.recomputeNormals, recomputeTangents: p.recomputeTangents, removeDegenerates: p.removeDegenerates, copyCollisionFromTarget: p.copyCollisionFromTarget, copyMaterialsFromTarget: p.copyMaterialsFromTarget, nanite: p.nanite, onConflict: p.onConflict, dryRun: p.dryRun, save: p.save }) },
     migrate: {
       description:
@@ -364,7 +413,7 @@ export const assetTool: ToolDef = categoryTool(
         force: p.force,
       }),
     },
-    list_locks:           bp("List all currently-held asset locks with holder session id, acquiredAt, and ttlSecondsRemaining.", "list_locks"),
+    list_locks:           bp("List all currently-held asset locks with holder session id, acquiredAt, and ttlSecondsRemaining. Params: none", "list_locks"),
     unlock_all: {
       description: "Release every lock held by one session in a single call, returning the number released. Defaults to the addressed editor's own session; pass sessionId to clear a different one (for example after a crashed session left assets wedged). Params: sessionId?",
       handler: async (ctx, p) => ctx.bridge.call("release_session_locks", {
@@ -419,7 +468,7 @@ export const assetTool: ToolDef = categoryTool(
     }).optional().describe("create_render_target_2d: linear clear color (default transparent)"),
     generateMips: z.boolean().optional().describe("create_render_target_2d: automatically generate mipmaps (default false)"),
     targetGamma: z.number().min(0).optional().describe("create_render_target_2d: target gamma (default 0 uses engine behavior)"),
-    onConflict: z.string().optional().describe("Asset-creation conflict policy: skip (default) | error | overwrite. bulk_upsert_data_assets uses update (default) | skip | error. mesh_boolean uses error (default) | replace"),
+    onConflict: z.string().optional().describe("Asset-creation conflict policy: skip (default) | error | overwrite. bulk_upsert_data_assets uses update (default) | skip | error. mesh_boolean, apply_mesh_simplify, apply_mesh_remesh, apply_mesh_mirror, apply_mesh_hole_fill and apply_mesh_fracture use error (default) | replace"),
     groups: z.record(z.array(z.string())).optional().describe("set_texture_settings_by_type: { normal?: [...], grayscale?: [...], baseColor?: [...], hdr?: [...] }"),
     meshType: z.string().optional().describe("create_interchange_pipeline: 'skeletal' (default) or 'static'"),
     options: z.record(z.unknown()).optional().describe("create_interchange_pipeline: dotted-path overrides"),
@@ -449,18 +498,24 @@ export const assetTool: ToolDef = categoryTool(
     rows: z.record(z.unknown()).optional().describe("DataTable bulk rows { rowName: {field: value} } for fill_datatable_from_json (#535)"),
     jsonPath: z.string().optional(), jsonString: z.string().optional(),
     csvString: z.string().optional().describe("CurveTable CSV payload for import_curvetable"),
-    format: z.enum([
-      "json", "csv",
-      "R8", "RG8", "RGBA8", "RGBA8_SRGB",
-      "R16F", "RG16F", "RGBA16F", "R32F", "RG32F", "RGBA32F", "RGB10A2",
-    ]).optional().describe("CurveTable import format or create_render_target_2d pixel format"),
-    interpMode: z.enum(["linear", "constant", "cubic", "none"]).optional().describe("CurveTable interpolation mode"),
+    // Strings rather than z.enum. The MCP SDK validates arguments BEFORE the
+    // tool callback runs, so a strict enum makes a typo fail at the transport
+    // with a schema error, and the handler's own message, which names every
+    // valid value, never reaches the caller. Both handlers behind `format` and
+    // the CurveTable interpolation parser reject an unknown value by name.
+    format: z.string().optional().describe("CurveTable import format: json | csv. create_render_target_2d pixel format: R8 | RG8 | RGBA8 | RGBA8_SRGB | R16F | RG16F | RGBA16F | R32F | RG32F | RGBA32F | RGB10A2 (default RGBA8_SRGB)"),
+    interpMode: z.string().optional().describe("CurveTable interpolation mode: linear (default) | constant | cubic | none. cubic requires curveType='rich'"),
+    // Stays a strict enum on purpose: nothing downstream validates it. The
+    // CurveTable handlers compare against "rich" and "simple" and silently keep
+    // the inferred mode for anything else, so relaxing would turn a clean
+    // rejection into a write against the wrong curve type reporting success.
     curveType: z.enum(["simple", "rich"]).optional().describe("CurveTable row type"),
     mode: z.enum(["simple", "rich"]).optional().describe("Alias for curveType"),
     keys: z.array(z.object({
       time: z.number(),
       value: z.number(),
-      interpMode: z.enum(["linear", "constant", "cubic", "none"]).optional(),
+      // String for the reason recorded on the flat interpMode above.
+      interpMode: z.string().optional().describe("Per-key interpolation mode: linear (default) | constant | cubic | none"),
       arriveTangent: z.number().optional(),
       leaveTangent: z.number().optional(),
     })).optional().describe("CurveTable key array"),
@@ -470,7 +525,7 @@ export const assetTool: ToolDef = categoryTool(
     value: z.unknown().optional().describe("Property value for set_property - scalar, object/array, or asset-path string. Goes through MCPJsonProperty (#420/#531)"),
     elements: z.array(z.unknown()).min(1).optional().describe("append_array_elements: one or more values to append after full prevalidation"),
     includeValues: z.boolean().optional().describe("Include property values in read_properties/list_properties/get_properties"),
-    continueOnError: z.boolean().optional().describe("bulk_set_properties / set_mesh_materials_batch: apply the items that passed preflight instead of aborting the whole batch (default false). Rejected items are still reported in items[]"),
+    continueOnError: z.boolean().optional().describe("bulk_set_properties / set_mesh_materials_batch / bulk_fix_hygiene: apply the items that passed preflight instead of aborting the whole batch (default false). Rejected items are still reported in items[]"),
     dryRun: z.boolean().optional().describe("migrate: resolve and report without copying (#760). bulk_upsert_data_assets: run the full preflight and report planned statuses without writing. fixup_redirectors: report the redirectors, referencers and packages it would load and save, and stop there (#908). mesh_boolean: run the boolean and report the result counts without writing an asset"),
     allowProjectWide: z.boolean().optional().describe("fixup_redirectors: permit a path that names a whole content root. Without it such a path is refused, so a targeted fix-up cannot become a project-wide resave (#908)."),
     discardUnsaved: z.boolean().optional().describe("force_reload: reload even though the package has unsaved changes, discarding them (default false) (#820)"),
@@ -480,10 +535,136 @@ export const assetTool: ToolDef = categoryTool(
     expandDepth: z.number().int().min(0).max(5).optional().describe("read_properties: inline owned subobjects to this depth (default 0) (#755)"),
     expandExternal: z.boolean().optional().describe("read_properties: also follow references to other assets (default false) (#755)"),
     maxExpandedObjects: z.number().int().positive().optional().describe("read_properties: cap on expanded objects (default 64) (#755)"),
+    // Stays a strict enum on purpose: the handler tests only for "json" and
+    // treats every other value as text, so nothing rejects a typo. Relaxing it
+    // would silently hand back ExportText for a caller who asked for JSON.
     valueFormat: z.enum(["text", "json"]).optional().describe("Property value format for read_properties/list_properties/get_properties. Default text preserves the existing Unreal ExportText output; json returns structured JSON where supported."),
     settings: z.record(z.unknown()).optional(),
     compressionSettings: z.string().optional().describe("Texture compression: Default, Normalmap, Grayscale, Displacementmap, VectorDisplacementmap, HDR, EditorIcon, Alpha, DistanceFieldFont, HDR_Compressed, BC7"),
     lodGroup: z.string().optional().describe("Texture LOD group: World, WorldNormalMap, Character, UI, Lightmap, Effects, etc."),
+    channel: z.number().optional().describe("UV actions: which UV channel to act on (0-based)"),
+    channels: z.array(z.number()).optional().describe("read_uv_channels: only these channels (omit for every channel)"),
+    channelCount: z.number().optional().describe("set_uv_channel_count: target count when op=set"),
+    fromChannel: z.number().optional().describe("set_uv_channel_count: source channel when op=copy"),
+    toChannel: z.number().optional().describe("set_uv_channel_count: destination channel when op=copy"),
+    count: z.number().optional().describe("set_uv_channel_count: how many channels to add when op=add (default 1)"),
+    rasterSize: z.number().optional().describe("UV reads: raster resolution for the coverage and overlap estimate (default 512). These are approximations, not exact triangle tests"),
+    includeIslands: z.boolean().optional().describe("read_uv_channels: include the per-island breakdown (default true)"),
+    includeOverlap: z.boolean().optional().describe("read_uv_channels: compute the overlapping-area fraction (default true)"),
+    method: z.string().optional().describe("unwrap_uvs: xatlas | patchBuilder | expMap | conformal | spectralConformal | planar | box | cylinder. apply_mesh_simplify: StandardQEM | VolumePreserving | AttributeAware (default) | AttributeAwareV2. generate_mesh_collision: AlignedBoxes | OrientedBoxes | MinimalSpheres | Capsules | ConvexHulls (default) | SweptHulls | MinVolumeShapes | LevelSets"),
+    pack: z.boolean().optional().describe("unwrap_uvs: repack the islands after unwrapping (default true)"),
+    textureResolution: z.number().optional().describe("unwrap_uvs: resolution the packer targets (default 1024)"),
+    maxIterations: z.number().optional().describe("unwrap_uvs: solver iteration cap"),
+    initialPatchCount: z.number().optional().describe("unwrap_uvs: starting patch count for patchBuilder"),
+    islandSource: z.string().optional().describe("unwrap_uvs: UVIslands | PolyGroups"),
+    projectionTransform: z.record(z.unknown()).optional().describe("unwrap_uvs: transform for the planar/box/cylinder projections"),
+    preserveVertexOrder: z.boolean().optional().describe("unwrap_uvs: keep the existing vertex order (default true)"),
+    backupToChannel: z.number().optional().describe("unwrap_uvs: copy the existing UVs here first, which is what makes the rollback lossless"),
+    translate: z.record(z.number()).optional().describe("transform_uvs: UV-space offset {u, v}"),
+    scale: z.record(z.number()).optional().describe("transform_uvs: UV-space scale {u, v}; a zero component is refused because it has no inverse"),
+    rotate: z.number().optional().describe("transform_uvs: rotation in degrees"),
+    origin: z.record(z.number()).optional().describe("transform_uvs: pivot for rotate and scale (default {u:0.5, v:0.5})"),
+    flipU: z.boolean().optional().describe("transform_uvs: mirror across U"),
+    flipV: z.boolean().optional().describe("transform_uvs: mirror across V"),
+    order: z.string().optional().describe("transform_uvs: flipScaleRotateTranslate | translateRotateScaleFlip"),
+    selection: z.record(z.unknown()).optional().describe("transform_uvs: what the transform applies to - {mode: all|island|normal|polygonGroup, islandIndices?, normalDirection?, normalAngleTolerance?, polygonGroups?, materialSlotNames?}"),
+    enable: z.boolean().optional().describe("generate_lightmap_uvs: turn generation on (default) or off"),
+    sourceChannel: z.number().optional().describe("generate_lightmap_uvs: SrcLightmapIndex, the channel the generator reads"),
+    destinationChannel: z.number().optional().describe("generate_lightmap_uvs: DstLightmapIndex, the channel it writes"),
+    minLightmapResolution: z.number().optional().describe("generate_lightmap_uvs: packing resolution floor (default 64)"),
+    lightmapResolution: z.number().optional().describe("generate_lightmap_uvs: the mesh's lightmap resolution"),
+    setLightmapCoordinateIndex: z.boolean().optional().describe("generate_lightmap_uvs: also point LightMapCoordinateIndex at the generated channel (default true)"),
+    imageSize: z.number().optional().describe("export_uv_layout: PNG edge length (default 1024, max 4096)"),
+    showGrid: z.boolean().optional().describe("export_uv_layout: draw the unit-square border"),
+    showIslands: z.boolean().optional().describe("export_uv_layout: colour each island separately"),
+    showOverlaps: z.boolean().optional().describe("export_uv_layout: highlight overlapping texels in red"),
+    requireLightmapChannel: z.boolean().optional().describe("check_uvs: treat a missing lightmap channel as a fault (default true for StaticMesh)"),
+    maxOverlapFraction: z.number().optional().describe("check_uvs: overlap above this fraction of the lightmap channel is a fault (default 0.001)"),
+    // -- Procedural mesh operations (T19) ----------------------------------
+    // Shared by apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill.
+    backupPath: z.string().optional().describe("apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill: copy the source asset here before an inPlace edit. An in-place rewrite has no inverse, so this is the only way to get the original geometry back; the result names the two calls that restore it"),
+    copyMaterialsFromSource: z.boolean().optional().describe("apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill / apply_mesh_fracture: copy the source's material slot list onto the written asset (default true)"),
+    copyCollisionFromSource: z.boolean().optional().describe("apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill: copy the source's simple collision shapes and trace flag onto the written asset (default true). Collision built for the original triangles may not fit the new ones - asset(generate_mesh_collision) rebuilds it"),
+    // apply_mesh_simplify
+    simplifyMode: z.string().optional().describe("apply_mesh_simplify: triangleCount (default) | vertexCount | tolerance | edgeLength | clusterEdgeLength | planar | polygroup | editorTriangleCount | editorVertexCount"),
+    triangleCount: z.number().int().optional().describe("apply_mesh_simplify, simplifyMode=triangleCount or editorTriangleCount: the triangle count to reduce to"),
+    vertexCount: z.number().int().optional().describe("apply_mesh_simplify, simplifyMode=vertexCount or editorVertexCount: the vertex count to reduce to (minimum 4)"),
+    tolerance: z.number().optional().describe("apply_mesh_simplify, simplifyMode=tolerance: the furthest in centimetres the simplified surface may drift from the original"),
+    edgeLength: z.number().optional().describe("apply_mesh_simplify, simplifyMode=edgeLength or clusterEdgeLength: target edge length in centimetres. Not a uniform result - the mesh may keep much longer edges where collapsing them would cost too much error"),
+    angleThreshold: z.number().optional().describe("apply_mesh_simplify, simplifyMode=planar or polygroup: how far from coplanar still counts as coplanar (default 0.001)"),
+    allowSeamCollapse: z.boolean().optional().describe("apply_mesh_simplify: let the simplifier collapse UV, normal and material seams (default true). false preserves the seams and simplifies less"),
+    preserveVertexPositions: z.boolean().optional().describe("apply_mesh_simplify: keep surviving vertices exactly where they are rather than letting the solver move them (default false)"),
+    autoCompact: z.boolean().optional().describe("apply_mesh_simplify: close the gaps the collapse leaves in the vertex and triangle index space (default true)"),
+    // apply_mesh_remesh
+    remeshMode: z.string().optional().describe("apply_mesh_remesh: uniform (even edge lengths everywhere, the default) | adaptive (denser where the surface curves)"),
+    targetType: z.string().optional().describe("apply_mesh_remesh: TriangleCount (default) | TargetEdgeLength - which of the two targets below the remesher aims at"),
+    targetTriangleCount: z.number().int().optional().describe("apply_mesh_remesh, targetType=TriangleCount: approximate triangle count to aim for (default 1000). Approximate on purpose, because it is converted to an edge length"),
+    targetEdgeLength: z.number().optional().describe("apply_mesh_remesh, targetType=TargetEdgeLength: edge length in centimetres to aim for (default 1)"),
+    smoothingType: z.string().optional().describe("apply_mesh_remesh: Uniform (most regular triangles, UVs ignored) | UVPreserving | Mixed (default)"),
+    smoothingRate: z.number().optional().describe("apply_mesh_remesh: 0 to 1, how far vertices move toward their neighbours each pass (default 0.25)"),
+    boundaryConstraint: z.string().optional().describe("apply_mesh_remesh: Fixed | Refine | Free (default) | Ignore - what the remesher may do to open boundary edges"),
+    iterations: z.number().int().optional().describe("apply_mesh_remesh: remeshing passes to run. Omit for the engine default"),
+    discardAttributes: z.boolean().optional().describe("apply_mesh_remesh: throw away UVs, normals and material IDs, which lets the remesher move freely (default false)"),
+    reprojectToInputMesh: z.boolean().optional().describe("apply_mesh_remesh: pull the new vertices back onto the original surface each pass, which is what keeps the shape (default true)"),
+    relativeDensity: z.number().optional().describe("apply_mesh_remesh, remeshMode=adaptive: -2 to 2, bias toward more or fewer triangles in curved regions (default 0)"),
+    // apply_mesh_mirror
+    axis: z.string().optional().describe("apply_mesh_mirror: x (default) | y | z | custom - the mirror plane's normal, through planeOrigin. apply_mesh_fracture with pattern=slice: x | y | z, the axis the parallel cuts run across"),
+    planeOrigin: Vec3.optional().describe("apply_mesh_mirror: a point on the mirror plane (default the mesh origin)"),
+    planeNormal: Vec3.optional().describe("apply_mesh_mirror with axis=custom: the mirror plane's normal. A zero vector is refused because it names no plane"),
+    applyPlaneCut: z.boolean().optional().describe("apply_mesh_mirror: remove the geometry on the far side of the plane before reflecting (default true). false reflects the whole mesh and leaves both halves overlapping"),
+    flipCutSide: z.boolean().optional().describe("apply_mesh_mirror: keep the other side of the plane instead (default false)"),
+    weldAlongPlane: z.boolean().optional().describe("apply_mesh_mirror: weld the two halves together along the plane (default true). false leaves a seam of duplicated vertices"),
+    // apply_mesh_hole_fill
+    fillMethod: z.string().optional().describe("apply_mesh_hole_fill: Automatic (default) | MinimalFill (best for a complex boundary) | PolygonTriangulation | TriangleFan | PlanarProjection (best for a flat one)"),
+    weldFirst: z.boolean().optional().describe("apply_mesh_hole_fill: weld coincident boundary edges before filling (default true). Without it a mesh whose holes are really duplicated seam vertices reports zero holes filled and stays open"),
+    weldTolerance: z.number().optional().describe("apply_mesh_hole_fill: how close two boundary edges must be to weld (default 1e-6)"),
+    removeDegenerateFirst: z.boolean().optional().describe("apply_mesh_hole_fill: drop zero-area triangles before welding and filling (default false)"),
+    deleteIsolatedTriangles: z.boolean().optional().describe("apply_mesh_hole_fill: delete floating disconnected triangles, which produce a hole no fill can close (default true)"),
+    // generate_mesh_collision
+    maxConvexHulls: z.number().int().optional().describe("generate_mesh_collision: how many convex hulls the decomposition may produce (default 1). Above 1 turns a single hull into a real decomposition that follows concavities"),
+    hullTargetFaceCount: z.number().int().optional().describe("generate_mesh_collision: faces to simplify each convex hull down to (default 25)"),
+    maxShapeCount: z.number().int().optional().describe("generate_mesh_collision: cap on the total shapes produced (0, the default, is uncapped)"),
+    minThickness: z.number().optional().describe("generate_mesh_collision: thinnest a generated shape may be, in centimetres (default 1). Raises paper-thin shapes into something the solver can use"),
+    autoDetectSpheres: z.boolean().optional().describe("generate_mesh_collision: replace a hull with a sphere where one fits (default true)"),
+    autoDetectBoxes: z.boolean().optional().describe("generate_mesh_collision: replace a hull with a box where one fits (default true)"),
+    autoDetectCapsules: z.boolean().optional().describe("generate_mesh_collision: replace a hull with a capsule where one fits (default true)"),
+    simplifyHulls: z.boolean().optional().describe("generate_mesh_collision: simplify each convex hull down to hullTargetFaceCount (default true)"),
+    removeFullyContainedShapes: z.boolean().optional().describe("generate_mesh_collision: drop shapes entirely inside another shape (default true)"),
+    decompositionErrorTolerance: z.number().optional().describe("generate_mesh_collision: how much volume error the convex decomposition may accept before splitting further (default 0)"),
+    decompositionSearchFactor: z.number().optional().describe("generate_mesh_collision: how hard the decomposition searches for a better split, 0 to 1 (default 0.5)"),
+    sweptHullAxis: z.string().optional().describe("generate_mesh_collision with method=SweptHulls: X | Y | Z (default) | SmallestBoxDimension | SmallestVolume"),
+    markAsCustomized: z.boolean().optional().describe("generate_mesh_collision: mark the collision as customized so a reimport does not overwrite it (default true)"),
+    // apply_mesh_fracture
+    pattern: z.string().optional().describe("apply_mesh_fracture: slice (parallel cuts along one axis, the default) | grid (cuts along all three) | random (seeded planes through the bounds)"),
+    pieces: z.number().int().optional().describe("apply_mesh_fracture with pattern=slice: how many pieces to cut the mesh into along axis (default 4, minimum 2)"),
+    gridX: z.number().int().optional().describe("apply_mesh_fracture with pattern=grid: pieces along X (default 2)"),
+    gridY: z.number().int().optional().describe("apply_mesh_fracture with pattern=grid: pieces along Y (default 2)"),
+    gridZ: z.number().int().optional().describe("apply_mesh_fracture with pattern=grid: pieces along Z (default 1)"),
+    planeCount: z.number().int().optional().describe("apply_mesh_fracture with pattern=random: how many random planes to cut with (default 3)"),
+    seed: z.number().int().optional().describe("apply_mesh_fracture: random seed for the plane placement and the jitter (default 0). The same seed and parameters produce the same pieces"),
+    jitter: z.number().optional().describe("apply_mesh_fracture with pattern=slice or grid: 0 to 0.45, how far each cut may wander from its even spacing (default 0, perfectly even)"),
+    gapWidth: z.number().optional().describe("apply_mesh_fracture: how far apart the two halves of each cut are pushed, in centimetres (default 0.01). Too small and the pieces stay topologically joined and nothing separates"),
+    minPieceTriangles: z.number().int().optional().describe("apply_mesh_fracture: discard pieces with fewer triangles than this rather than writing an asset for every shard (default 4)"),
+    outputBasePath: z.string().optional().describe("apply_mesh_fracture: the piece assets are written as outputBasePath_00, _01 and so on (default assetPath + '_Piece')"),
+    // -- Asset hygiene (T20) -----------------------------------------------
+    directories: z.array(z.string()).optional().describe("audit_hygiene / bulk_fix_hygiene: content paths to sweep (default /Game). Mount-rooted, such as /Game/Characters, not a path on disk"),
+    excludePaths: z.array(z.string()).optional().describe("audit_hygiene / bulk_fix_hygiene: skip any package whose name starts with one of these prefixes"),
+    keepPaths: z.array(z.string()).optional().describe("audit_hygiene / bulk_fix_hygiene: never report or touch a package whose name starts with one of these prefixes. This is where a folder loaded by name from config belongs"),
+    maxIssues: z.number().int().optional().describe("audit_hygiene: how many findings of each kind to list (default 200). The counts are always complete; only the listings are capped"),
+    checks: z.array(z.string()).optional().describe("audit_hygiene: unreferenced | brokenReferences | duplicates | naming | redirectors. Omit to run all five"),
+    duplicateMethod: z.string().optional().describe("audit_hygiene: content (same class, file size and saved package hash, which finds a verbatim copy but NOT one saved under a different name) | name (same asset name and class in more than one folder) | both (default)"),
+    namingRules: z.array(z.object({
+      class: z.string().min(1),
+      prefix: z.string().optional(),
+      suffix: z.string().optional(),
+    })).optional().describe("audit_hygiene / bulk_fix_hygiene: naming convention entries as [{class, prefix?, suffix?}]. class is the asset class NAME the registry reports (StaticMesh, WidgetBlueprint, NiagaraSystem), not a class path"),
+    namingRuleMode: z.string().optional().describe("audit_hygiene / bulk_fix_hygiene: merge (the caller's namingRules on top of the built-in table, the default) | replace (the caller's rules and nothing else)"),
+    includeWorlds: z.boolean().optional().describe("audit_hygiene: report maps in the unreferenced section too (default false). A map is an entry point and normally has no referencer by design. bulk_fix_hygiene refuses maps whatever this says, because moving one without its external-actor packages orphans every actor in the level"),
+    ignoreRedirectorReferencers: z.boolean().optional().describe("audit_hygiene / bulk_fix_hygiene: do not count a redirector stub as a referencer (default true). A stub is the leftover of a rename rather than a user, and counting it keeps dead assets alive forever"),
+    fix: z.string().optional().describe("bulk_fix_hygiene: naming (rename assets to the convention) | unreferenced (quarantine or delete assets nothing references)"),
+    maxFixes: z.number().int().optional().describe("bulk_fix_hygiene: refuse the whole call if it would touch more than this many assets (default 100). Deliberately far below the audit's scan ceiling"),
+    unreferencedAction: z.string().optional().describe("bulk_fix_hygiene with fix=unreferenced: quarantine (move under quarantineFolder, which this call can undo, and the default) | delete (permanent, no rollback)"),
+    quarantineFolder: z.string().optional().describe("bulk_fix_hygiene with unreferencedAction=quarantine: where the assets are moved to, keeping their folder shape underneath it (default /Game/Quarantine)"),
     sRGB: z.boolean().optional(),
     neverStream: z.boolean().optional(),
     skeletalMeshPath: z.string().optional().describe("read_cloth_data/set_cloth_config: skeletal mesh path (#595)"),
@@ -495,10 +676,10 @@ export const assetTool: ToolDef = categoryTool(
     importMorphTargets: z.boolean().optional().describe("import_skeletal_mesh: import morph targets (default true) (#678)"),
     createPhysicsAsset: z.boolean().optional().describe("import_skeletal_mesh: auto-create a PhysicsAsset (default false) (#678)"),
     replaceExisting: z.boolean().optional().describe("import_skeletal_mesh: replace an existing asset at the destination (default true) (#678)"),
-    assetPaths: z.array(z.string()).optional().describe("Array of asset paths (recenter_pivot batch - first mesh sets reference pivot; also migrate and bulk_read_properties)"),
+    assetPaths: z.array(z.string()).optional().describe("Array of asset paths (recenter_pivot batch - first mesh sets reference pivot; also migrate and bulk_read_properties). bulk_fix_hygiene: the exact assets to act on, which is the safest way to drive it - audit first, then hand back the approved paths"),
     // bulk_read_properties (#909)
     propertyNames: z.array(z.string()).optional().describe("bulk_read_properties: property paths to read off every matched asset; dotted paths walk nested structs (max 32)"),
-    classNames: z.array(z.string()).optional().describe("bulk_read_properties: restrict to these asset classes"),
+    classNames: z.array(z.string()).optional().describe("bulk_read_properties: restrict to these asset classes. audit_hygiene / bulk_fix_hygiene: restrict the sweep to these asset class names"),
     matchSubclasses: z.boolean().optional().describe("bulk_read_properties: also match subclasses of classNames (default true)"),
     where: z.array(z.object({
       field: z.string().describe("Dot path into the row, e.g. props.CullDistance.Max, className or suspect"),
@@ -511,9 +692,8 @@ export const assetTool: ToolDef = categoryTool(
     countBy: z.array(z.string()).optional().describe("bulk_read_properties: dot paths to build value histograms for (max 8 paths, 64 values each)"),
     sampleLimit: z.number().optional().describe("bulk_read_properties: sample asset names per group (default 5, max 25)"),
     countOnly: z.boolean().optional().describe("bulk_read_properties: return aggregates without rows"),
-    limit: z.number().optional().describe("bulk_read_properties: rows per page (default 200, max 2000)"),
     startIndex: z.number().optional().describe("bulk_read_properties: first row index for paging"),
-    maxAssets: z.number().optional().describe("bulk_read_properties: refuse to load more than this many candidates (default 2000, max 20000)"),
+    maxAssets: z.number().optional().describe("bulk_read_properties: refuse to load more than this many candidates (default 2000, max 20000). audit_hygiene / bulk_fix_hygiene: how many assets the sweep walks before it reports scanTruncated (default 20000, max 200000)"),
     renames: z.array(z.record(z.unknown())).optional().describe("Array of rename descriptors for bulk_rename - each {sourcePath, destinationPath} or {assetPath, newName}"),
     socketName: z.string().optional().describe("Socket name"),
     boneName: z.string().optional().describe("Bone name (for skeletal mesh sockets)"),
@@ -521,32 +701,42 @@ export const assetTool: ToolDef = categoryTool(
     relativeRotation: Rotator.optional().describe("Socket relative rotation"),
     relativeScale: Vec3.optional().describe("Socket relative scale"),
     outputPath: z.string().optional().describe("Absolute file path for export (e.g. C:/output/texture.png); also the destination for get_mesh_geometry's dumpToFile (relative paths resolve under the project's Saved/)"),
-    lodIndex: z.number().int().min(0).optional().describe("get_mesh_geometry / measure_mesh_geometry: which LOD to read (default 0). mesh_boolean: which LOD of each input mesh to read (default 0)"),
+    allLods: z.boolean().optional().describe("read_skeletal_mesh_build_settings / set_skeletal_mesh_optimize_for_instancing: target every LOD instead of one; cannot be combined with lodIndex"),
+    enabled: z.boolean().optional().describe("set_skeletal_mesh_optimize_for_instancing: the value to write to bOptimizeForInstancing"),
+    lodIndex: z.number().int().min(0).optional().describe("get_mesh_geometry / measure_mesh_geometry: which LOD to read (default 0). mesh_boolean: which LOD of each input mesh to read (default 0). read_skeletal_mesh_build_settings / set_skeletal_mesh_optimize_for_instancing: which LOD to target (default 0). UV actions: which LOD to act on (default 0)"),
     sectionIndex: z.number().int().min(0).optional().describe("get_mesh_geometry / measure_mesh_geometry: restrict to one render section; omit for every section"),
     uvChannel: z.number().int().min(0).optional().describe("get_mesh_geometry: which UV channel to return (default 0)"),
-    include: z.array(z.enum(["positions", "uvs", "normals", "triangles"])).optional().describe("get_mesh_geometry: which per-vertex arrays to return; omit for all four"),
+    // Strings for the reason recorded on `format` above: the handler names the
+    // four tokens back when it rejects one, and an empty array too.
+    include: z.array(z.string()).optional().describe("get_mesh_geometry: which per-vertex arrays to return: positions | uvs | normals | triangles. Omit for all four"),
     dumpToFile: z.boolean().optional().describe("get_mesh_geometry: write the full geometry JSON to a file instead of returning it inline, which is how a mesh over the inline vertex limit is read"),
     operation: z.string().optional().describe("mesh_boolean: union | subtract | intersect | trimInside | trimOutside | newPolyGroupInside | newPolyGroupOutside"),
     targetPath: z.string().optional().describe("mesh_boolean: the StaticMesh being cut. Its transform, materials, collision and Nanite setting are the ones the result inherits."),
     toolPath: z.string().optional().describe("mesh_boolean: the StaticMesh doing the cutting."),
-    inPlace: z.boolean().optional().describe("mesh_boolean: overwrite targetPath instead of writing a separate output asset. Default false, and the only destructive form; mutually exclusive with outputPath."),
+    inPlace: z.boolean().optional().describe("mesh_boolean: overwrite targetPath instead of writing a separate output asset. apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill: overwrite assetPath instead. Default false, and the only destructive form; mutually exclusive with outputPath, and the only form with no rollback - pass backupPath to keep a copy of the original."),
     targetTransform: z.object({ location: Vec3.optional(), rotation: Rotator.optional(), scale: Vec3.optional() }).optional().describe("mesh_boolean: where the target mesh sits for the boolean. Default identity."),
     toolTransform: z.object({ location: Vec3.optional(), rotation: Rotator.optional(), scale: Vec3.optional() }).optional().describe("mesh_boolean: where the tool mesh sits for the boolean. Default identity."),
-    lodType: z.enum(["MaxAvailable", "HiResSourceModel", "SourceModel", "RenderData"]).optional().describe("mesh_boolean: which mesh data to read from each input. Default MaxAvailable, which ignores lodIndex."),
-    fillHoles: z.boolean().optional().describe("mesh_boolean: close the holes the cut opens (default true)"),
+    // String for the reason recorded on `format` above: every handler reading
+    // lodType rejects an unknown value by listing all four.
+    lodType: z.string().optional().describe("MaxAvailable | HiResSourceModel | SourceModel | RenderData. mesh_boolean: which mesh data to read from each input. apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill / generate_mesh_collision / apply_mesh_fracture: which mesh data to read from the source. Default MaxAvailable, which ignores lodIndex."),
+    fillHoles: z.boolean().optional().describe("mesh_boolean: close the holes the cut opens (default true). apply_mesh_fracture: cap each piece where the plane cut it, so the pieces are solid rather than open shells (default true)"),
     simplifyOutput: z.boolean().optional().describe("mesh_boolean: collapse coplanar triangles the boolean introduced (default true)"),
     simplifyPlanarTolerance: z.number().optional().describe("mesh_boolean: how far from coplanar still counts as coplanar when simplifying (default 0.01)"),
     allowEmptyResult: z.boolean().optional().describe("mesh_boolean: accept a result with no triangles. Default false, so two meshes that never overlap are refused rather than written as an empty asset."),
-    recomputeNormals: z.boolean().optional().describe("mesh_boolean: recompute normals on the written mesh (default false)"),
-    recomputeTangents: z.boolean().optional().describe("mesh_boolean: recompute tangents on the written mesh (default false)"),
-    removeDegenerates: z.boolean().optional().describe("mesh_boolean: drop degenerate triangles when writing back into an existing mesh (default false)"),
+    recomputeNormals: z.boolean().optional().describe("mesh_boolean / apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill / apply_mesh_fracture: recompute normals on the written mesh (default false)"),
+    recomputeTangents: z.boolean().optional().describe("mesh_boolean / apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill / apply_mesh_fracture: recompute tangents on the written mesh (default false)"),
+    removeDegenerates: z.boolean().optional().describe("mesh_boolean / apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill: drop degenerate triangles when writing back into an existing mesh (default false)"),
     copyCollisionFromTarget: z.boolean().optional().describe("mesh_boolean: copy the target's simple collision shapes and collision complexity onto the result (default true)"),
     copyMaterialsFromTarget: z.boolean().optional().describe("mesh_boolean: copy the target's material slot list onto the result (default true)"),
-    nanite: z.enum(["inherit", "enable", "disable"]).optional().describe("mesh_boolean: Nanite on the written mesh. inherit (default) matches the target."),
+    // String for the reason recorded on `format` above: every handler reading
+    // nanite rejects an unknown value by listing all three.
+    nanite: z.string().optional().describe("inherit | enable | disable. mesh_boolean: Nanite on the written mesh, where inherit (default) matches the target. apply_mesh_simplify / apply_mesh_remesh / apply_mesh_mirror / apply_mesh_hole_fill / apply_mesh_fracture: Nanite on the written asset, where inherit matches the source."),
     classFilter: z.string().optional().describe("Restrict search_fts to assets whose class name contains this substring"),
     className: z.string().optional().describe("Class for create_data_asset/create_asset_by_class: loaded class name with or without the C++ A/U/F/E prefix, or a /Script/Module.ClassName path"),
     properties: z.record(z.unknown()).optional().describe("Key/value property overrides for create_data_asset and create_subobject. Keys may be dotted paths into nested structs and subobjects."),
-    outer: z.enum(["asset", "package"]).optional().describe("create_subobject: whether the new subobject is owned by the asset (default, path \"<asset>.<name>\") or sits beside it in the package (path \"<package>.<name>\") (#975)."),
+    // String for the reason recorded on `format` above: the handler rejects an
+    // unknown value by naming both.
+    outer: z.string().optional().describe("create_subobject: asset (default) | package. Whether the new subobject is owned by the asset (default, path \"<asset>.<name>\") or sits beside it in the package (path \"<package>.<name>\") (#975)."),
     packages: z.array(z.string()).optional().describe("Package paths for get_referencers / get_dependencies"),
     hard: z.boolean().optional().describe("get_dependencies: include hard dependencies (default true)"),
     soft: z.boolean().optional().describe("get_dependencies: include soft dependencies (default true)"),
@@ -566,7 +756,7 @@ export const assetTool: ToolDef = categoryTool(
       slotIndex: z.number().int().optional(),
     })).min(1).max(500).optional().describe("set_mesh_materials_batch entries: [{assetPath, materialPath, slotName? | slotIndex?}] (max 500). slotName is preferred for imported kits because slot indices are not stable across reimports"),
     path: z.string().optional().describe("Content path (e.g. /Game/Foo) - used by diagnose_registry, create_folder"),
-    op: z.string().optional().describe("edit_user_defined_enum op: add_value | rename_value | remove_value. edit_user_defined_struct op: add_field | rename_field | set_field_type | remove_field"),
+    op: z.string().optional().describe("edit_user_defined_enum op: add_value | rename_value | remove_value. edit_user_defined_struct op: add_field | rename_field | set_field_type | remove_field. generate_mesh_collision op: generate (default) | clear"),
     values: z.array(z.string()).optional().describe("create_user_defined_enum: initial value display names"),
     displayName: z.string().optional().describe("edit_user_defined_enum: display text for the enumerator"),
     index: z.number().optional().describe("edit_user_defined_enum: enumerator index for rename/remove"),
@@ -580,7 +770,17 @@ export const assetTool: ToolDef = categoryTool(
     reconcile: z.boolean().optional().describe("diagnose_registry: force synchronous rescan (evicts pending-kill ghosts)"),
     bHasNavigationData: z.boolean().optional().describe("Toggle nav data generation for set_mesh_nav"),
     clearNavCollision: z.boolean().optional().describe("Remove NavCollision from mesh for set_mesh_nav"),
-    offset: z.number().optional().describe("list: index of the first match to return, for paging large folders (#790)"),
+    // Still declared, and still forwarded by `list`, so the handler can refuse
+    // it by name. Undeclare it and the MCP layer strips it instead, and a
+    // caller paging with the old parameter reads page one every time and is
+    // told nothing.
+    offset: z.number().optional().describe("list: REFUSED. The row offset (#790) was replaced by cursor paging, because a row number cannot report that the folder changed underneath it. Use cursor + limit."),
+    // The shared cursor and limit, declared once for every paged action in this
+    // category: list, search, search_fts, list_textures, and bulk_read_properties
+    // for its own rows-per-page. Undeclared keys are stripped, so an action that
+    // documents `cursor` without this would return an unpaged first page and
+    // call it a success.
+    ...PAGINATION_SCHEMA,
     force: z.boolean().optional().describe("delete / delete_batch: take the force-delete path, which destroys an asset even when other packages reference it and auto-closes any open asset editors (#278). Defaults to false, which checks the Asset Registry for referencers first and refuses when it finds any (#976). delete_folder: also delete assets contained in the folder. save: write even if the package is not marked dirty (#768)."),
     otherPath: z.string().optional().describe("diff: the asset to compare assetPath against"),
     // lock / unlock / unlock_all all default this to the server process's own

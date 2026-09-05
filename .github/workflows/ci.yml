@@ -175,7 +175,7 @@ jobs:
       - name: Validate release inputs
         # Single required pre-publish input: a draft release tagged vX.Y.Z
         # whose body begins with YAML frontmatter containing a `headline:`
-        # array. The script enforces format (1-6 items, each 3-60 chars,
+        # array. The script enforces format (1-6 items, each 3-30 chars,
         # restricted character set, no sentence punctuation) and fails
         # publish before npm if anything is off.
         #

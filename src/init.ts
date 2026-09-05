@@ -6,6 +6,7 @@ import yaml from "js-yaml";
 import { dumpYaml } from "./yaml-dump.js";
 import { ProjectContext } from "./project.js";
 import { deploy } from "./deployer.js";
+import { inspectInstall, installWarning } from "./install-check.js";
 import { installSkills, uninstallSkills } from "./skills.js";
 import { warn as logWarn } from "./log.js";
 import { BOLD, CYAN, DIM, GREEN, RED, RESET, fail, info, ok, warn } from "./ui/ansi.js";
@@ -379,6 +380,18 @@ async function init() {
     wrote.push({ what: "enabled plugins", where: project.projectPath! });
   } else {
     ok("Required plugins already enabled");
+  }
+
+  // 5b. The bridge is C++, and copying its source in does not make it exist.
+  // Without this, init ended on "Setup complete!" for a machine with no
+  // compiler, and the failure surfaced much later as an Unreal modal saying
+  // modules were missing, which an agent driving the session cannot see (T17).
+  try {
+    const report = inspectInstall(project.projectPath!);
+    const blocker = installWarning(report);
+    if (blocker) warn(blocker);
+  } catch (e) {
+    logWarn("init", "install check skipped", e);
   }
 
   // ue-mcp.yml is written at the end of init() once all decisions

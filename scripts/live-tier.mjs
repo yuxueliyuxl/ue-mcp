@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * The live test tier (#817, plan items 1.10 and 7.3).
  *

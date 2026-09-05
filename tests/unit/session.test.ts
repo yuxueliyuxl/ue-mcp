@@ -220,6 +220,69 @@ describe("SessionRegistry", () => {
     expect(() => registry.resolve("Alpha")).toThrowError(/No editor session named 'Alpha'/);
   });
 
+  /**
+   * D9: `editor` is advertised as an enum of session NAMES, and rekey renames a
+   * session without the count changing. Nothing fired, so every tool schema
+   * went on naming the session the caller just renamed away from and a client
+   * honouring tools/list_changed was never told.
+   */
+  it("reports a change when a rename moves the addressable name", () => {
+    const alpha = makeProject("Alpha");
+    const beta = makeProject("Beta");
+    const registry = new SessionRegistry();
+    const session = registry.register({ projectPath: alpha });
+    registry.register({ projectPath: makeProject("Gamma") });
+
+    const changes: number[] = [];
+    registry.onCountChanged = (n) => changes.push(n);
+
+    session.project.setProject(beta);
+    registry.rekey(session);
+
+    expect(session.name).toBe("Beta");
+    expect(changes).toEqual([2]);
+  });
+
+  it("says nothing when a re-file leaves the name alone", () => {
+    const alpha = makeProject("Alpha");
+    const registry = new SessionRegistry();
+    const session = registry.register({ projectPath: alpha, name: "Alpha" });
+
+    const changes: number[] = [];
+    registry.onCountChanged = (n) => changes.push(n);
+    // Same project, so nothing moves at all.
+    registry.rekey(session);
+    expect(changes).toEqual([]);
+  });
+
+  /**
+   * S2: register() and rekey() note the shared-port record from bridge.port as
+   * it stands BEFORE any lockfile is read, and connect() moves the port
+   * afterwards. So the record list_editors reports was computed from
+   * pre-connect values and never refreshed.
+   */
+  it("recomputes the shared-port record from the ports actually in use", () => {
+    const registry = new SessionRegistry();
+    const a = registry.register({ projectPath: makeProject("Alpha") });
+    const b = registry.register({ projectPath: makeProject("Beta") });
+
+    // Two derived ports: nothing shared at registration.
+    expect(a.portSharedWith).toEqual([]);
+    expect(b.portSharedWith).toEqual([]);
+
+    // What connect() does when a lockfile names the port the editor bound.
+    b.bridge.port = a.bridge.port;
+    registry.refreshSharedPorts();
+    expect(a.portSharedWith).toEqual(["Beta"]);
+    expect(b.portSharedWith).toEqual(["Alpha"]);
+
+    // And a clash that has since resolved stops being reported.
+    b.bridge.port = a.bridge.port + 1;
+    registry.refreshSharedPorts();
+    expect(a.portSharedWith).toEqual([]);
+    expect(b.portSharedWith).toEqual([]);
+  });
+
   it("refuses to re-file a session onto a project another session already holds", () => {
     const alpha = makeProject("Alpha");
     const beta = makeProject("Beta");
