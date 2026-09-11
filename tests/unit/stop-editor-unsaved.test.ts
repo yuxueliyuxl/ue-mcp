@@ -281,7 +281,8 @@ describe("stop_editor never presses a button and never arms one", () => {
     const result = await stopEditor(makeProject(bridge.port));
 
     expect(result.success).toBe(true);
-    expect(bridge.methods()).toEqual(["list_dialogs", "request_editor_shutdown"]);
+    // The quit and nothing else: the gate decides the dialog question.
+    expect(bridge.methods()).toEqual(["request_editor_shutdown"]);
   });
 
   it("arms no dialog policy and presses nothing when a dialog is already blocking", async () => {
@@ -319,7 +320,14 @@ describe("stop_editor refuses rather than discarding unsaved work", () => {
     expect(result.message).not.toContain("discardUnsaved");
   });
 
-  it("sends no quit at all, so no save prompt is raised and nothing hangs", async () => {
+  it("sends the quit, so the EDITOR raises its own save prompt", async () => {
+    // The point of the change this pins: the editor's Save Content prompt is
+    // the question, and it carries the user's three real answers. Refusing
+    // before the quit meant Unreal never raised it, and the server put its own
+    // refusal there instead - one that told the caller to run save_dirty and
+    // write the unsaved work with nobody asked.
+    //
+    // requireClean is what suppressed the prompt, so it must be false.
     const bridge = await startFakeBridge((method) => {
       if (method === "list_dialogs") return NO_DIALOGS;
       if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
@@ -331,12 +339,15 @@ describe("stop_editor refuses rather than discarding unsaved work", () => {
 
     // The dirty check, which refuses inside the engine without scheduling a
     // close, and nothing after it.
-    expect(bridge.methods()).toEqual(["list_dialogs", "request_editor_shutdown"]);
-    expect(bridge.calls[1].params.requireClean).toBe(true);
+    expect(bridge.methods()).toEqual(["request_editor_shutdown"]);
+    expect(bridge.calls[0].params.requireClean).toBe(false);
   });
 
   it("refuses when the plugin build cannot say what is dirty, rather than guessing clean", async () => {
-    const bridge = await startFakeBridge(() => null);
+    // Answers the dialog question, answers nothing else: this case is about
+    // an unknown DIRTY state, and a bridge that answers nothing at all is the
+    // separate unknown-dialog-state refusal.
+    const bridge = await startFakeBridge((method) => (method === "list_dialogs" ? NO_DIALOGS : null));
     openBridges.push(bridge);
 
     const result = await stopEditor(makeProject(bridge.port));
@@ -348,11 +359,12 @@ describe("stop_editor refuses rather than discarding unsaved work", () => {
   });
 
   it("refuses on the dirty list from an older plugin build too", async () => {
-    const bridge = await startFakeBridge((method) =>
-      method === "list_dirty_packages"
+    const bridge = await startFakeBridge((method) => {
+      if (method === "list_dialogs") return NO_DIALOGS;
+      return method === "list_dirty_packages"
         ? { success: true, content: [{ package: "/Game/Blueprints/BP_Door" }], maps: [] }
-        : null,
-    );
+        : null;
+    });
     openBridges.push(bridge);
 
     const result = await stopEditor(makeProject(bridge.port));
@@ -364,74 +376,12 @@ describe("stop_editor refuses rather than discarding unsaved work", () => {
   });
 });
 
+
 describe("stop_editor reports a blocking dialog in full", () => {
-  it("returns immediately with the exact title, the whole message and every button", async () => {
-    const bridge = await startFakeBridge((method) =>
-      method === "list_dialogs" ? SAVE_CONTENT_DIALOG : { success: true },
-    );
-    openBridges.push(bridge);
-
-    // No capability, so the mode is defer: the dialog is reported for
-    // recognition, and the calls that press it are not part of that.
-    const result = await stopEditor(makeProject(bridge.port), { elicit: makeGate(false).fn });
-
-    expect(result.success).toBe(false);
-    expect(result.refusedReason).toBe("blocking-dialog");
-    expect(result.blockingDialog?.title).toBe("Save Content");
-    // The WHOLE message, every line of it.
-    expect(result.blockingDialog?.message).toBe(SAVE_CONTENT_MESSAGE);
-    for (const line of SAVE_CONTENT_MESSAGE.split("\n")) {
-      expect(result.message).toContain(line);
-    }
-    // Every button, in the dialog's own order, so the window can be identified.
-    expect(result.blockingDialog?.buttons).toEqual(["Save Selected", "Don't Save", "Cancel"]);
-    for (const label of ["Save Selected", "Don't Save", "Cancel"]) {
-      expect(result.message).toContain(label);
-    }
-    // No button is recommended.
-    expect(result.message.toLowerCase()).not.toContain("recommend");
-  });
-
-  it("reports it for recognition in defer: nothing that presses anything, anywhere in the payload", async () => {
-    const bridge = await startFakeBridge((method) =>
-      method === "list_dialogs" ? SAVE_CONTENT_DIALOG : { success: true },
-    );
-    openBridges.push(bridge);
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: makeGate(false).fn });
-
-    expect(result.dialogMode).toBe("defer");
-    // Not in the prose, and not in the structured half either: `choices` keeps
-    // the labels and drops respondWith, so there is nothing to copy and run.
-    expect(result.message).not.toContain("respond_to_dialog");
-    expect(JSON.stringify(result.blockingDialog)).not.toContain("respond_to_dialog");
-    expect(result.blockingDialog?.choices.map((c) => c.buttonLabel)).toEqual([
-      "Save Selected",
-      "Don't Save",
-      "Cancel",
-    ]);
-    for (const choice of result.blockingDialog?.choices ?? []) {
-      expect(choice.respondWith).toBeUndefined();
-    }
-  });
-
-  it("keeps every press call in auto, where answering it is the agent's job", async () => {
-    process.env.UE_MCP_DIALOG_MODE = "auto";
-    const bridge = await startFakeBridge((method) =>
-      method === "list_dialogs" ? SAVE_CONTENT_DIALOG : { success: true },
-    );
-    openBridges.push(bridge);
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: makeGate(false).fn });
-
-    expect(result.dialogMode).toBe("auto");
-    expect(result.message).toContain("editor(action='respond_to_dialog', buttonLabel='Save Selected')");
-    expect(result.message).toContain("editor(action='respond_to_dialog', buttonLabel=\"Don't Save\")");
-    expect(result.message).toContain("editor(action='respond_to_dialog', buttonLabel='Cancel')");
-    expect(result.blockingDialog?.choices.every((c) => typeof c.respondWith === "string")).toBe(true);
-  });
-
-  it("does not send the quit while a dialog is up", async () => {
+  it("does not probe for a dialog of its own before quitting", async () => {
+    // The quit is withheld by the GATE, not here: see dialog-gate-wiring.test.ts,
+    // "refuses stop_editor, and the quit never reaches the editor". This pins
+    // only that no second copy of that decision survives in stopEditor.
     const bridge = await startFakeBridge((method) =>
       method === "list_dialogs" ? SAVE_CONTENT_DIALOG : { success: true },
     );
@@ -439,164 +389,8 @@ describe("stop_editor reports a blocking dialog in full", () => {
 
     await stopEditor(makeProject(bridge.port));
 
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-  });
-});
-
-describe("stop_editor puts a blocking dialog to the user through elicitation", () => {
-  it("offers the dialog's own buttons and presses only the one chosen", async () => {
-    let asked: ElicitParams | null = null;
-    let dialogUp = true;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return dialogUp ? SAVE_CONTENT_DIALOG : NO_DIALOGS;
-      if (method === "respond_to_dialog") {
-        dialogUp = false;
-        return { success: true, clickedButton: "Save Selected" };
-      }
-      if (method === "request_editor_shutdown") {
-        setTimeout(() => bridge.goQuiet(), 50);
-        return { success: true, scheduled: true, dirtyContentPackages: [], dirtyMapPackages: [] };
-      }
-      return { success: true };
-    });
-    openBridges.push(bridge);
-
-    const elicit = async (params: ElicitParams): Promise<ElicitResult> => {
-      asked = params;
-      return { action: "accept", content: { button: "Save Selected" } };
-    };
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit });
-
-    // The prompt carries the full question and the dialog's real buttons.
-    expect(asked!.message).toContain("Save Content");
-    expect(asked!.message).toContain(SAVE_CONTENT_MESSAGE);
-    expect(asked!.requestedSchema.properties.button).toMatchObject({
-      enum: ["Save Selected", "Don't Save", "Cancel", "Leave the dialog open"],
-    });
-
-    // Exactly the button the user picked, and only because they picked it.
-    const pressed = bridge.calls.filter((c) => c.method === "respond_to_dialog");
-    expect(pressed).toHaveLength(1);
-    expect(pressed[0].params.buttonLabel).toBe("Save Selected");
-    expect(bridge.methods()).not.toContain("set_dialog_policy");
-    expect(result.dialogAnsweredByUser).toBe("Save Selected");
-    expect(result.success).toBe(true);
-  });
-
-  /**
-   * D8: the button was sent and the editor never said what it did with it.
-   *
-   * callBridgeOnce returns the same `silent` reply for an 8s timeout and for a
-   * socket error, and both happen AFTER the frame is on the wire. The stop path
-   * read that as "nothing was pressed", so answeredByUser stayed undefined and
-   * the unsaved-work refusal printed "Nothing was sent to the editor, so no
-   * save prompt is open and the editor is exactly as it was" - after the user
-   * picked Save All and packages may already have been written to disk.
-   *
-   * The repo's rule is that a dialog is never answered on the user's behalf and
-   * that what happened to it is reported exactly. "We do not know" is a report;
-   * "nothing happened" is a claim, and it was the wrong one.
-   */
-  it("does not claim the editor is untouched when the press went out unanswered", async () => {
-    let dialogUp = true;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return dialogUp ? SAVE_CONTENT_DIALOG : NO_DIALOGS;
-      if (method === "respond_to_dialog") {
-        // The press arrived. The editor then went away without answering.
-        dialogUp = false;
-        return DROP_SOCKET;
-      }
-      if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
-      return { success: true };
-    });
-    openBridges.push(bridge);
-
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Save Selected" } }));
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    // The frame really did go out.
-    const pressed = bridge.calls.filter((c) => c.method === "respond_to_dialog");
-    expect(pressed).toHaveLength(1);
-    expect(pressed[0].params.buttonLabel).toBe("Save Selected");
-
-    expect(result.refusedReason).toBe("unsaved-work");
-    // Not reported as answered: nothing acknowledged the press.
-    expect(result.dialogAnsweredByUser).toBeUndefined();
-    // And not reported as silence either.
-    expect(result.dialogPressUnconfirmed).toBe("Save Selected");
-    expect(result.message).not.toContain("Nothing was sent to the editor");
-    expect(result.message).toContain("was sent to the editor and it did not answer");
-    expect(result.message).toContain("Save Selected");
-  });
-
-  /**
-   * The other half of the same distinction: the editor DID answer and said it
-   * pressed nothing (an unregistered method on an older plugin build, or a
-   * handler that refused). Nothing happened to the dialog, so "nothing was
-   * sent" is the honest report and must survive.
-   */
-  it("still reports silence when the editor answers that it pressed nothing", async () => {
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return SAVE_CONTENT_DIALOG;
-      if (method === "respond_to_dialog") return null; // JSON-RPC error: unknown method
-      if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
-      return { success: true };
-    });
-    openBridges.push(bridge);
-
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Save Selected" } }));
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(result.dialogAnsweredByUser).toBeUndefined();
-    expect(result.dialogPressUnconfirmed).toBeUndefined();
-    expect(result.refusedReason).toBe("blocking-dialog");
-  });
-
-  it("presses nothing when the user declines, and reports the dialog instead", async () => {
-    const bridge = await startFakeBridge((method) =>
-      method === "list_dialogs" ? SAVE_CONTENT_DIALOG : { success: true },
-    );
-    openBridges.push(bridge);
-
-    const result = await stopEditor(makeProject(bridge.port), {
-      elicit: async () => ({ action: "decline" }),
-    });
-
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-    expect(result.refusedReason).toBe("blocking-dialog");
-    expect(result.dialogAnsweredByUser).toBeUndefined();
-  });
-
-  it("presses nothing when the user chooses to leave the dialog open", async () => {
-    const bridge = await startFakeBridge((method) =>
-      method === "list_dialogs" ? SAVE_CONTENT_DIALOG : { success: true },
-    );
-    openBridges.push(bridge);
-
-    const result = await stopEditor(makeProject(bridge.port), {
-      elicit: async () => ({ action: "accept", content: { button: "Leave the dialog open" } }),
-    });
-
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-    expect(result.refusedReason).toBe("blocking-dialog");
-  });
-
-  it("presses nothing when the client has no elicitation UI", async () => {
-    const bridge = await startFakeBridge((method) =>
-      method === "list_dialogs" ? SAVE_CONTENT_DIALOG : { success: true },
-    );
-    openBridges.push(bridge);
-
-    const result = await stopEditor(makeProject(bridge.port), {
-      elicit: async () => {
-        throw new Error("client did not advertise the elicitation capability");
-      },
-    });
-
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-    expect(result.refusedReason).toBe("blocking-dialog");
-    expect(result.message).toContain("Save Content");
+    // No probe before the quit.
+    expect(bridge.methods()[0]).toBe("request_editor_shutdown");
   });
 });
 
@@ -706,147 +500,6 @@ describe("dialog handling mode resolution", () => {
   });
 });
 
-describe("stop_editor honours the dialog handling mode", () => {
-  /** A bridge with the Save Content modal up, and every call it was sent. */
-  const withBlockingDialog = async (): Promise<FakeBridge> => {
-    const bridge = await startFakeBridge((method) =>
-      method === "list_dialogs" ? SAVE_CONTENT_DIALOG : { success: true },
-    );
-    openBridges.push(bridge);
-    return bridge;
-  };
-
-  it("interactive is the default with elicitation, and presses only the chosen button", async () => {
-    let dialogUp = true;
-    let asked = 0;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return dialogUp ? SAVE_CONTENT_DIALOG : NO_DIALOGS;
-      if (method === "respond_to_dialog") {
-        dialogUp = false;
-        return { success: true, clickedButton: "Cancel" };
-      }
-      if (method === "request_editor_shutdown") {
-        setTimeout(() => bridge.goQuiet(), 50);
-        return { success: true, scheduled: true, dirtyContentPackages: [], dirtyMapPackages: [] };
-      }
-      return { success: true };
-    });
-    openBridges.push(bridge);
-
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Cancel" } }));
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 5 });
-
-    asked = gate.asked();
-    expect(asked).toBe(1);
-    expect(result.dialogMode).toBe("interactive");
-    expect(result.dialogModeSource).toContain("default");
-    const pressed = bridge.calls.filter((c) => c.method === "respond_to_dialog");
-    expect(pressed).toHaveLength(1);
-    expect(pressed[0].params.buttonLabel).toBe("Cancel");
-  });
-
-  it("defers by default for a client that advertised no elicitation, though the server still has a gate", async () => {
-    const bridge = await withBlockingDialog();
-    // Exactly what production hands over: a function that is always present,
-    // for a client that advertised nothing.
-    const gate = makeGate(false);
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn });
-
-    expect(gate.asked()).toBe(0);
-    expect(result.dialogMode).toBe("defer");
-    expect(result.dialogModeSource).toContain("did not advertise elicitation");
-    expect(result.message).toContain("Dialog handling mode: defer");
-    // Quoted whole, so the person knows what they are looking at in the editor.
-    expect(result.message).toContain("Save Content");
-    expect(result.message).toContain(SAVE_CONTENT_MESSAGE);
-    expect(result.message).toContain("Unreal Editor window");
-    for (const forbidden of BUTTON_PRESSING_METHODS) {
-      expect(bridge.methods()).not.toContain(forbidden);
-    }
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-  });
-
-  it("defer presses nothing and elicits nothing even when the client could be asked", async () => {
-    process.env.UE_MCP_DIALOG_MODE = "defer";
-    const bridge = await withBlockingDialog();
-    let asked = 0;
-
-    const result = await stopEditor(makeProject(bridge.port), {
-      elicit: async () => {
-        asked++;
-        return { action: "accept", content: { button: "Don't Save" } };
-      },
-    });
-
-    expect(asked).toBe(0);
-    expect(result.dialogMode).toBe("defer");
-    expect(result.dialogModeSource).toBe("UE_MCP_DIALOG_MODE=defer");
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-  });
-
-  it("auto presses nothing server-side and hands the whole dialog to the agent", async () => {
-    process.env.UE_MCP_DIALOG_MODE = "auto";
-    const bridge = await withBlockingDialog();
-    let asked = 0;
-
-    const result = await stopEditor(makeProject(bridge.port), {
-      elicit: async () => {
-        asked++;
-        return { action: "accept", content: { button: "Don't Save" } };
-      },
-    });
-
-    // Nothing pressed, nothing elicited: in auto mode the agent decides, and
-    // deciding is a separate respond_to_dialog call it has to make itself.
-    expect(asked).toBe(0);
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-    for (const forbidden of BUTTON_PRESSING_METHODS) {
-      expect(bridge.methods()).not.toContain(forbidden);
-    }
-    expect(result.dialogMode).toBe("auto");
-    expect(result.dialogModeSource).toBe("UE_MCP_DIALOG_MODE=auto");
-    expect(result.blockingDialog?.buttons).toEqual(["Save Selected", "Don't Save", "Cancel"]);
-    // Every button, with the exact call that presses it.
-    expect(result.message).toContain("editor(action='respond_to_dialog', buttonLabel='Save Selected')");
-    expect(result.message).toContain("editor(action='respond_to_dialog', buttonLabel=\"Don't Save\")");
-    expect(result.message).toContain("editor(action='respond_to_dialog', buttonLabel='Cancel')");
-  });
-
-  it("interactive without an elicitation channel blocks rather than deciding anyway", async () => {
-    process.env.UE_MCP_DIALOG_MODE = "interactive";
-    const bridge = await withBlockingDialog();
-    const gate = makeGate(false);
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn });
-
-    expect(gate.asked()).toBe(0);
-    expect(result.dialogMode).toBe("interactive");
-    expect(result.refusedReason).toBe("blocking-dialog");
-    expect(result.message).toContain("did not advertise that capability");
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-  });
-
-  it("takes the per-project stored preference over the default", async () => {
-    const bridge = await withBlockingDialog();
-    const projectDir = makeProject(bridge.port);
-    setDialogMode("auto", projectDir);
-
-    let asked = 0;
-    const result = await stopEditor(projectDir, {
-      elicit: async () => {
-        asked++;
-        return { action: "accept", content: { button: "Don't Save" } };
-      },
-    });
-
-    expect(asked).toBe(0);
-    expect(result.dialogMode).toBe("auto");
-    expect(result.dialogModeSource).toContain("dialog.mode in");
-    expect(bridge.methods()).toEqual(["list_dialogs"]);
-  });
-});
-
 /**
  * Whether the user can be asked is a property of the CONNECTED client.
  *
@@ -898,399 +551,6 @@ describe("a stored mode is read the way the env value is", () => {
 });
 
 /**
- * The dialog that comes up BEHIND the quit.
- *
- * This is the only other place the server can reach a button, so it is the only
- * other place that can get this wrong. It presses only what the user picked,
- * and whatever happens afterwards the result has to describe what this call
- * actually did: a report that says no dialog was up and that nothing here
- * presses a button, seconds after pressing one, is the failure this branch
- * exists to prevent.
- */
-describe("a dialog raised behind the quit", () => {
-  /**
-   * A bridge that is clean until the quit goes out and then raises the Save
-   * Content modal, with the port staying up throughout.
-   */
-  const lateDialogBridge = async (opts: { quitOnAnswer: boolean }): Promise<FakeBridge> => {
-    let quitSent = false;
-    let dialogUp = false;
-    let bridge: FakeBridge;
-    bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") {
-        return dialogUp ? SAVE_CONTENT_DIALOG : NO_DIALOGS;
-      }
-      if (method === "request_editor_shutdown") {
-        quitSent = true;
-        dialogUp = true;
-        return { success: true, scheduled: true, dirtyContentPackages: [], dirtyMapPackages: [] };
-      }
-      if (method === "respond_to_dialog") {
-        dialogUp = false;
-        if (opts.quitOnAnswer) setTimeout(() => bridge.goQuiet(), 10);
-        return { success: true, clickedButton: "Save Selected" };
-      }
-      void quitSent;
-      return { success: true };
-    });
-    openBridges.push(bridge);
-    return bridge;
-  };
-
-  it("presses only the user's pick, and says so even when the editor still does not close", async () => {
-    const bridge = await lateDialogBridge({ quitOnAnswer: false });
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Save Selected" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(gate.asked()).toBe(1);
-    const pressed = bridge.calls.filter((c) => c.method === "respond_to_dialog");
-    expect(pressed).toHaveLength(1);
-    expect(pressed[0].params.buttonLabel).toBe("Save Selected");
-    expect(bridge.methods()).not.toContain("set_dialog_policy");
-
-    // The dialog is gone by the time this returns, and the account of it is not.
-    expect(result.success).toBe(false);
-    expect(result.dialogAnsweredByUser).toBe("Save Selected");
-    expect(result.dialogMode).toBe("interactive");
-    expect(result.dialogModeSource).toBeTruthy();
-    // The sentence that used to deny the press that had just happened.
-    expect(result.message).not.toContain("nothing here presses a button for you");
-    expect(result.message).not.toContain("no dialog was up when the quit went out");
-    expect(result.message).toContain('You answered its dialog with "Save Selected"');
-  });
-
-  /**
-   * The report is written from an engine snapshot read BEFORE the elicitation,
-   * so once the user answers, that snapshot still holds the dialog they just
-   * dismissed. Rendering it produced one message that said all three of these
-   * at once: "nothing was sent to it and nothing was answered for you", a
-   * respond_to_dialog call for each of the gone dialog's buttons, and "you
-   * answered its dialog with X and no dialog is up now".
-   *
-   * Every other test in this file runs against the whole-file readEngineState
-   * mock, whose `snapshot: null` sends blockedStopDetail straight to
-   * `state.summary` and makes the modal branch unreachable. This one supplies a
-   * real snapshot, so the branch renders.
-   */
-  it("does not quote the dialog the user just answered, nor hand back its buttons", async () => {
-    let dialogUp = false;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return dialogUp ? SAVE_CONTENT_DIALOG : NO_DIALOGS;
-      if (method === "request_editor_shutdown") {
-        dialogUp = true;
-        return { success: true, scheduled: true, dirtyContentPackages: [], dirtyMapPackages: [] };
-      }
-      if (method === "respond_to_dialog") {
-        dialogUp = false;
-        return { success: true, clickedButton: "Save Selected" };
-      }
-      return { success: true };
-    });
-    openBridges.push(bridge);
-
-    // The snapshot tells the same story the bridge does: the modal is in it
-    // while it is up, and gone the moment the button is pressed.
-    const readEngineState = vi.mocked(observer.readEngineState);
-    const stubbed = readEngineState.getMockImplementation();
-    readEngineState.mockImplementation(async () => ({
-      running: true,
-      processes: [],
-      log: { logPath: null, secondsSinceWrite: null, phase: "unknown", blocking: false, lastLine: null, tail: [], errors: [], warnings: [] },
-      snapshot: dialogUp
-        ? { modal: { title: "Save Content", message: SAVE_CONTENT_MESSAGE, buttons: ["Save Selected", "Don't Save", "Cancel"] } }
-        : { modal: null },
-      dialogs: [],
-      processProbeFailed: false,
-      runningEvidence: "bridge-snapshot" as const,
-      snapshotSource: "bridge" as const,
-      summary: "The editor is still running and its bridge is answering.",
-      blocked: dialogUp,
-    }));
-
-    let result;
-    try {
-      const gate = makeGate(true, () => ({ action: "accept", content: { button: "Save Selected" } }));
-      result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-    } finally {
-      if (stubbed) readEngineState.mockImplementation(stubbed);
-    }
-
-    expect(result.success).toBe(false);
-    expect(result.dialogAnsweredByUser).toBe("Save Selected");
-    // What the call did, said once.
-    expect(result.message).toContain('You answered its dialog with "Save Selected"');
-    // The three false claims, none of which may survive a press.
-    expect(result.message).not.toContain("nothing was answered for you");
-    expect(result.message).not.toContain("A modal dialog is blocking the editor");
-    expect(result.message).not.toContain("respond_to_dialog");
-    // And nothing of the answered dialog is offered back as still pressable.
-    expect(result.message).not.toContain("Buttons, in the order the dialog lays them out");
-    expect(result.blockingDialog).toBeUndefined();
-  });
-
-  it("reports the quit as successful when the answer releases it", async () => {
-    const bridge = await lateDialogBridge({ quitOnAnswer: true });
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Save Selected" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(result.success).toBe(true);
-    expect(result.dialogAnsweredByUser).toBe("Save Selected");
-    expect(result.dialogMode).toBe("interactive");
-    expect(result.message).toContain("Save Selected");
-  });
-
-  it("presses nothing and asks nothing in auto, and hands the dialog back instead", async () => {
-    process.env.UE_MCP_DIALOG_MODE = "auto";
-    const bridge = await lateDialogBridge({ quitOnAnswer: false });
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Don't Save" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(gate.asked()).toBe(0);
-    expect(bridge.methods()).not.toContain("respond_to_dialog");
-    expect(result.dialogMode).toBe("auto");
-    expect(result.refusedReason).toBe("blocking-dialog");
-    expect(result.blockingDialog?.title).toBe("Save Content");
-    expect(result.dialogAnsweredByUser).toBeUndefined();
-  });
-
-  it("presses nothing and asks nothing in defer", async () => {
-    process.env.UE_MCP_DIALOG_MODE = "defer";
-    const bridge = await lateDialogBridge({ quitOnAnswer: false });
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Don't Save" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(gate.asked()).toBe(0);
-    expect(bridge.methods()).not.toContain("respond_to_dialog");
-    expect(result.dialogMode).toBe("defer");
-    expect(result.message).toContain("Unreal Editor window");
-    // The late dialog follows the same rule as the early one: recognition only.
-    expect(result.message).not.toContain("respond_to_dialog");
-    expect(JSON.stringify(result.blockingDialog)).not.toContain("respond_to_dialog");
-  });
-});
-
-/**
- * Every result of a stop that met a dialog carries the mode, whatever the call
- * went on to do. The doc promises that, and the paths after the dialog are
- * where it used to be dropped: they run only once a dialog has been answered
- * and cleared, which is exactly when a caller wants to know which mode was in
- * force.
- */
-describe("the mode travels with every result that met a dialog", () => {
-  it("is on the unsaved-work refusal that follows an answered dialog", async () => {
-    let dialogUp = true;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return dialogUp ? SAVE_CONTENT_DIALOG : NO_DIALOGS;
-      if (method === "respond_to_dialog") {
-        dialogUp = false;
-        return { success: true, clickedButton: "Cancel" };
-      }
-      if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
-      return { success: true };
-    });
-    openBridges.push(bridge);
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Cancel" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(result.refusedReason).toBe("unsaved-work");
-    expect(result.dialogMode).toBe("interactive");
-    expect(result.dialogModeSource).toBeTruthy();
-    expect(result.dialogAnsweredByUser).toBe("Cancel");
-  });
-
-  it("is on the unknown-dirty-state refusal that follows an answered dialog", async () => {
-    let dialogUp = true;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return dialogUp ? SAVE_CONTENT_DIALOG : NO_DIALOGS;
-      if (method === "respond_to_dialog") {
-        dialogUp = false;
-        return { success: true, clickedButton: "Cancel" };
-      }
-      return null;
-    });
-    openBridges.push(bridge);
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Cancel" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(result.refusedReason).toBe("unknown-dirty-state");
-    expect(result.dialogMode).toBe("interactive");
-    expect(result.dialogAnsweredByUser).toBe("Cancel");
-  });
-
-  it("is absent when no dialog was ever in the way", async () => {
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return NO_DIALOGS;
-      if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
-      return { success: true };
-    });
-    openBridges.push(bridge);
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: makeGate(true).fn });
-
-    expect(result.refusedReason).toBe("unsaved-work");
-    expect(result.dialogMode).toBeUndefined();
-    expect(result.dialogModeSource).toBeUndefined();
-  });
-});
-
-/**
- * What the prose says has to match what the call did.
- *
- * Carrying the fields is half of it. The other half is that no sentence in the
- * same payload denies the thing the fields record: a stop that pressed a button
- * the user chose cannot also say the editor is exactly as it was, that nothing
- * was answered, or that the editor was never asked to quit.
- */
-describe("no result denies the press it just made", () => {
-  /** A bridge with a dialog up that answers, then refuses on dirty packages. */
-  const answerThenDirty = async (): Promise<FakeBridge> => {
-    let dialogUp = true;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return dialogUp ? SAVE_CONTENT_DIALOG : NO_DIALOGS;
-      if (method === "respond_to_dialog") {
-        dialogUp = false;
-        return { success: true, clickedButton: "Save Selected" };
-      }
-      if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
-      return { success: true };
-    });
-    openBridges.push(bridge);
-    return bridge;
-  };
-
-  it("does not claim the editor is untouched after the user's button was pressed", async () => {
-    const bridge = await answerThenDirty();
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Save Selected" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(result.refusedReason).toBe("unsaved-work");
-    expect(result.dialogAnsweredByUser).toBe("Save Selected");
-    // The sentence that was false: "Save Selected" may have written packages.
-    expect(result.message).not.toContain("the editor is exactly as it was");
-    expect(result.message).not.toContain("Nothing was sent to the editor");
-    expect(result.message).toContain('You answered its dialog with "Save Selected"');
-    // Still names every dirty package and offers no way to discard them.
-    expect(result.message).toContain("/Game/Materials/M_Rock");
-    expect(result.message).not.toContain("discardUnsaved");
-  });
-
-  it("keeps the untouched sentence when no dialog was ever answered", async () => {
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return NO_DIALOGS;
-      if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
-      return { success: true };
-    });
-    openBridges.push(bridge);
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: makeGate(true).fn });
-
-    expect(result.dialogAnsweredByUser).toBeUndefined();
-    expect(result.message).toContain("the editor is exactly as it was");
-  });
-
-  it("describes a dialog that came up behind the one the user answered, before the quit", async () => {
-    const second = {
-      success: true,
-      count: 1,
-      dialogs: [
-        {
-          title: "Discard Changes",
-          message: "There are unsaved changes in the level.",
-          messageTruncated: false,
-          buttons: ["Discard", "Keep"],
-          choices: [
-            { buttonLabel: "Discard", respondWith: "editor(action='respond_to_dialog', buttonLabel='Discard')" },
-            { buttonLabel: "Keep", respondWith: "editor(action='respond_to_dialog', buttonLabel='Keep')" },
-          ],
-          policyMatched: false,
-        },
-      ],
-    };
-    let answered = false;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") return answered ? second : SAVE_CONTENT_DIALOG;
-      if (method === "respond_to_dialog") {
-        answered = true;
-        return { success: true, clickedButton: "Cancel" };
-      }
-      return { success: true };
-    });
-    openBridges.push(bridge);
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Cancel" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(result.blockingDialog?.title).toBe("Discard Changes");
-    expect(result.dialogAnsweredByUser).toBe("Cancel");
-    // The lead line used to say nothing had been answered, in the same payload
-    // that names the button that was pressed.
-    expect(result.message).not.toContain("nothing was answered for you");
-    expect(result.message).toContain('You answered "Cancel" and this one came up behind it');
-    // Before the quit, so this one is still true here.
-    expect(result.message).toContain("The editor was not asked to quit");
-  });
-
-  it("describes a successor to a dialog answered AFTER the quit went out", async () => {
-    const second = {
-      success: true,
-      count: 1,
-      dialogs: [
-        {
-          title: "Discard Changes",
-          message: "There are unsaved changes in the level.",
-          messageTruncated: false,
-          buttons: ["Discard", "Keep"],
-          choices: [
-            { buttonLabel: "Discard", respondWith: "editor(action='respond_to_dialog', buttonLabel='Discard')" },
-            { buttonLabel: "Keep", respondWith: "editor(action='respond_to_dialog', buttonLabel='Keep')" },
-          ],
-          policyMatched: false,
-        },
-      ],
-    };
-    let quitSent = false;
-    let answered = false;
-    const bridge = await startFakeBridge((method) => {
-      if (method === "list_dialogs") {
-        if (!quitSent) return NO_DIALOGS;
-        return answered ? second : SAVE_CONTENT_DIALOG;
-      }
-      if (method === "request_editor_shutdown") {
-        quitSent = true;
-        return { success: true, scheduled: true, dirtyContentPackages: [], dirtyMapPackages: [] };
-      }
-      if (method === "respond_to_dialog") {
-        answered = true;
-        return { success: true, clickedButton: "Save Selected" };
-      }
-      return { success: true };
-    });
-    openBridges.push(bridge);
-    const gate = makeGate(true, () => ({ action: "accept", content: { button: "Save Selected" } }));
-
-    const result = await stopEditor(makeProject(bridge.port), { elicit: gate.fn, confirmPollMs: 2 });
-
-    expect(result.blockingDialog?.title).toBe("Discard Changes");
-    expect(result.dialogAnsweredByUser).toBe("Save Selected");
-    expect(result.dialogMode).toBe("interactive");
-    // Three sentences that were all false at once on this path.
-    expect(result.message).not.toContain("nothing was answered for you");
-    expect(result.message).not.toContain("The editor was not asked to quit");
-    expect(result.message).not.toContain("nothing here presses a button for you");
-    // What is true: the quit went out first, and this dialog came after it.
-    expect(result.message).toContain("The quit went out before this dialog appeared");
-    expect(result.message).toContain('You answered "Save Selected" and this one came up behind it');
-  });
-});
-
-/**
  * A corrupt preferences file must not take an editor action down with it.
  *
  * Nothing in the editor lifecycle read user state until the dialog mode did, so
@@ -1318,9 +578,11 @@ describe("a state.json that parses to something that is not a state object", () 
     const projectDir = makeProject(bridge.port);
     fs.writeFileSync(process.env.UE_MCP_USER_STATE!, "null");
 
-    const result = await stopEditor(projectDir, { elicit: makeGate(false).fn });
+    // The point is that a malformed state file does not throw. What the stop
+    // then decides is the ordinary path, not this case.
+    const result = await stopEditor(projectDir);
 
-    expect(result.refusedReason).toBe("blocking-dialog");
-    expect(result.dialogMode).toBe("defer");
+    expect(result.success).toBe(false);
+    expect(typeof result.message).toBe("string");
   });
 });

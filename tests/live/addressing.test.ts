@@ -9,7 +9,7 @@
  * throwaway project whose editor is not running, and every assertion about
  * "beyond one editor" is made with a real editor on one side of it.
  *
- * What that buys over the engine-free tier: these run through the shipped
+ * What that buys over the engine-free tests: these run through the shipped
  * entry point rather than through the routing functions directly, so a refusal
  * that is never wired in, a union that advertises what dispatch cannot serve,
  * or an attribution block that never reaches the client all fail here.
@@ -66,7 +66,7 @@ describe("two sessions, one of them a live editor", () => {
     const stopped = body.editors.find((e) => e.name === SECOND)!;
     expect(liveEditor.port).toBe(target.port);
     expect(stopped.connected).toBe(false);
-    // Two sessions on one port cannot be told apart, so a live tier that
+    // Two sessions on one port cannot be told apart, so a live test run that
     // silently collapsed onto one would prove nothing about routing.
     expect(stopped.port).not.toBe(liveEditor.port);
   }, 120_000);

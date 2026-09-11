@@ -196,6 +196,7 @@ public class UE_MCP_Bridge : ModuleRules
 				"Sequencer",
 				"Settings",
 				"SkeletalMeshEditor",
+				"SkeletalMeshDescription",
 				"Slate",
 				"SlateCore",
 				"StateTreeModule",
@@ -223,6 +224,17 @@ public class UE_MCP_Bridge : ModuleRules
 			}
 		);
 
+		// UE 5.4 keeps StructUtils - FInstancedStruct, FStructView, the property
+		// bag - in its own experimental plugin module; 5.5 folded all of it into
+		// CoreUObject. Chooser and StateTreeModule bring its headers along as
+		// public dependencies, so the code compiles on 5.4 without this, and
+		// then fails to link: the symbols live in the module itself. Linked
+		// explicitly below 5.5, where the module no longer exists to link.
+		if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion < 5)
+		{
+			PrivateDependencyModuleNames.Add("StructUtils");
+		}
+
 		// LiveCoding is Windows-only (Developer/Windows/LiveCoding)
 		if (Target.Platform == UnrealTargetPlatform.Win64)
 		{
@@ -235,8 +247,13 @@ public class UE_MCP_Bridge : ModuleRules
 		// import/cache API, guarding those code paths with WITH_FAB_PLUGIN. When
 		// absent, the Fab handlers still register and fall back to console-command
 		// paths (login/sync/clear) or return a clean "not available" error.
-		bool bFabPluginPresent = System.IO.Directory.Exists(
-			System.IO.Path.Combine(EngineDirectory, "Plugins", "Fab"));
+		// Test for the header this module actually includes, not just the
+		// plugin directory: 5.4 ships a Fab plugin whose public surface is
+		// FabModule.h alone, with no Importers/ or Utilities/ headers, so a
+		// directory check turns WITH_FAB_PLUGIN on and the compile then fails
+		// on the missing include.
+		bool bFabPluginPresent = System.IO.File.Exists(System.IO.Path.Combine(
+			EngineDirectory, "Plugins", "Fab", "Source", "Fab", "Public", "Importers", "GenericAssetImporter.h"));
 		if (bFabPluginPresent && Target.bBuildEditor)
 		{
 			PrivateDependencyModuleNames.Add("Fab");
@@ -261,3 +278,5 @@ public class UE_MCP_Bridge : ModuleRules
 // Private/Tests/BehaviorTreeNodeTests.cpp.
 // Round 4: Private/Handlers/GameplayHandlers_BTAuthoring.cpp and
 // Private/Tests/BehaviorTreeAuthoringTests.cpp.
+// Live post-process AnimBP handler automation coverage added.
+// Private/Tests/AnimationSkeletonCreateTests.cpp.

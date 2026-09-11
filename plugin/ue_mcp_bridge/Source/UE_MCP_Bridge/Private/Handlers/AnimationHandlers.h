@@ -19,6 +19,9 @@ private:
 	// change and writes only on commit, so the lifecycle is explicit the way
 	// begin/apply/bake_control_rig_edit already is.
 	static TSharedPtr<FJsonValue> BeginSkeletonEdit(const TSharedPtr<FJsonObject>& Params);
+	// Creates a real USkeleton through USkeletonFactory and therefore assigns it
+	// to the source mesh as the engine's Create Skeleton asset flow does.
+	static TSharedPtr<FJsonValue> CreateSkeleton(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> EditSkeletonBones(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CommitSkeletonEdit(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CancelSkeletonEdit(const TSharedPtr<FJsonObject>& Params);
@@ -124,6 +127,7 @@ private:
 	// edits live in a LevelSequence until explicitly baked to a new AnimSequence.
 	static TSharedPtr<FJsonValue> BeginControlRigEdit(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadControlRigEdit(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> CaptureControlRigPose(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ApplyControlRigEdits(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> BakeControlRigEdit(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AnalyzeAnimation(const TSharedPtr<FJsonObject>& Params);
@@ -190,6 +194,9 @@ private:
 	static TSharedPtr<FJsonValue> ListBones(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RebindLeaderPose(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> PreviewAnimation(const TSharedPtr<FJsonObject>& Params);
+	// Live-only post-process AnimBP override. This deliberately targets a
+	// spawned/placed component, never a mesh or component-template asset.
+	static TSharedPtr<FJsonValue> SetLivePostProcessAnimBlueprint(const TSharedPtr<FJsonObject>& Params);
 
 	// Animation authoring depth, in AnimationHandlers_Depth.cpp. The removal
 	// half of the surface plus the two things that could not be authored at

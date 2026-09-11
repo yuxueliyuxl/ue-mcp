@@ -45,6 +45,7 @@
 #include "Widgets/SWindow.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SCheckBox.h"
 
 // Static member definitions
 TArray<FDialogHandlers::FDialogPolicy> FDialogHandlers::Policies;
@@ -599,7 +600,66 @@ TSharedPtr<FJsonValue> FDialogHandlers::GetDialogPolicy(const TSharedPtr<FJsonOb
 	return MCPResult(Result);
 }
 
-TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FString& OutMessage, TArray<FModalButton>& OutButtons)
+// A NAMED namespace: this module is a unity build, so an anonymous one here
+// would merge with whatever other .cpp shares the blob.
+namespace MCPDialogWindows
+{
+	/**
+	 * Every window the editor is holding the user with, gathered recursively.
+	 *
+	 * A REGULAR window that is either on the modal stack or parented to another
+	 * window is something the editor put up and is waiting on. Menus, tooltips
+	 * and notifications are not regular windows, so they are not mistaken for
+	 * questions.
+	 *
+	 * Visibility is deliberately NOT consulted. A window that is up but undrawn,
+	 * or drawn behind the editor, still holds whatever raised it, and "the user
+	 * cannot see it" is the worst possible reason to let a quit through.
+	 */
+	static void Gather(const TArray<TSharedRef<SWindow>>& Roots, TArray<TSharedPtr<SWindow>>& Out)
+	{
+		for (const TSharedRef<SWindow>& Window : Roots)
+		{
+			const bool bBlocks = Window->IsRegularWindow()
+				&& (Window->IsModalWindow() || Window->GetParentWindow().IsValid());
+			if (bBlocks)
+			{
+				Out.AddUnique(TSharedPtr<SWindow>(Window));
+			}
+			Gather(Window->GetChildWindows(), Out);
+		}
+	}
+
+	/**
+	 * The window blocking the editor, by every route it can be blocked.
+	 *
+	 * GetActiveModalWindow leads, because a window on the modal stack is one
+	 * Slate itself calls blocking. It is NOT the whole answer and never was: it
+	 * reports only what was pushed with AddModalWindow, so a dialog raised any
+	 * other way came back as no dialog at all. Every layer above then read that
+	 * as "the screen is clear" and sent a quit at an editor sitting on a save
+	 * prompt, while the same editor had the window on screen. One narrow
+	 * detector was the whole system's eyes, and absence of evidence from it was
+	 * being reported as evidence of absence.
+	 */
+	static TSharedPtr<SWindow> FindBlocking()
+	{
+		if (!FSlateApplication::IsInitialized())
+		{
+			return nullptr;
+		}
+		FSlateApplication& Slate = FSlateApplication::Get();
+		TArray<TSharedPtr<SWindow>> Found;
+		if (TSharedPtr<SWindow> Modal = Slate.GetActiveModalWindow())
+		{
+			Found.AddUnique(Modal);
+		}
+		Gather(Slate.GetInteractiveTopLevelWindows(), Found);
+		return Found.Num() > 0 ? Found[0] : nullptr;
+	}
+}
+
+TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FString& OutMessage, TArray<FModalButton>& OutButtons, TArray<FModalItem>* OutItems)
 {
 	OutTitle.Empty();
 	OutMessage.Empty();
@@ -610,7 +670,7 @@ TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FStri
 		return nullptr;
 	}
 
-	TSharedPtr<SWindow> ActiveModal = FSlateApplication::Get().GetActiveModalWindow();
+	TSharedPtr<SWindow> ActiveModal = MCPDialogWindows::FindBlocking();
 	if (!ActiveModal.IsValid())
 	{
 		return nullptr;
@@ -629,7 +689,23 @@ TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FStri
 			if (!Text.IsEmpty())
 			{
 				TextContents.Add(Text);
+				// The walk is depth first and Slate lays a row out as its
+				// checkbox then its cells, so text after a checkbox belongs to
+				// that checkbox until the next one starts a new row. That is
+				// what pairs "L_MoverPawnTest" with the box that saves it.
+				if (OutItems && OutItems->Num() > 0)
+				{
+					OutItems->Last().Cells.Add(Text);
+				}
 			}
+		}
+
+		if (OutItems && Widget->GetType() == TEXT("SCheckBox"))
+		{
+			FModalItem Item;
+			Item.Box = StaticCastSharedRef<SCheckBox>(Widget);
+			Item.bChecked = Item.Box->IsChecked();
+			OutItems->Add(Item);
 		}
 
 		if (Widget->GetType() == TEXT("SButton"))
@@ -707,7 +783,8 @@ TSharedPtr<FJsonValue> FDialogHandlers::ListDialogs(const TSharedPtr<FJsonObject
 	FString Title;
 	FString Message;
 	TArray<FModalButton> Buttons;
-	if (CollectActiveModal(Title, Message, Buttons).IsValid())
+	TArray<FModalItem> Items;
+	if (CollectActiveModal(Title, Message, Buttons, &Items).IsValid())
 	{
 		TSharedPtr<FJsonObject> DialogObj = MakeShared<FJsonObject>();
 		DialogObj->SetStringField(TEXT("title"), Title);
@@ -743,6 +820,29 @@ TSharedPtr<FJsonValue> FDialogHandlers::ListDialogs(const TSharedPtr<FJsonObject
 			Choice->SetStringField(TEXT("respondWith"), RespondWith);
 			ChoicesJsonArray.Add(MakeShared<FJsonValueObject>(Choice));
 		}
+		// The per-item choices, when the dialog offers any. "Save Selected"
+		// means nothing without them: the button is the same either way and the
+		// ticks decide what it does.
+		TArray<TSharedPtr<FJsonValue>> ItemsJsonArray;
+		for (int32 ItemIndex = 0; ItemIndex < Items.Num(); ++ItemIndex)
+		{
+			const FModalItem& Item = Items[ItemIndex];
+			TSharedPtr<FJsonObject> ItemObj = MakeShared<FJsonObject>();
+			ItemObj->SetNumberField(TEXT("index"), ItemIndex);
+			ItemObj->SetBoolField(TEXT("checked"), Item.bChecked);
+			// The first cell is the row's label. A header row's "select all" box
+			// owns the column headings instead, which is still reported: a caller
+			// that ticks it is asking for exactly what that box does.
+			ItemObj->SetStringField(TEXT("label"), Item.Cells.Num() > 0 ? Item.Cells[0] : FString());
+			TArray<TSharedPtr<FJsonValue>> CellsJson;
+			for (const FString& Cell : Item.Cells)
+			{
+				CellsJson.Add(MakeShared<FJsonValueString>(Cell));
+			}
+			ItemObj->SetArrayField(TEXT("cells"), CellsJson);
+			ItemsJsonArray.Add(MakeShared<FJsonValueObject>(ItemObj));
+		}
+		DialogObj->SetArrayField(TEXT("items"), ItemsJsonArray);
 		DialogObj->SetArrayField(TEXT("buttons"), ButtonsJsonArray);
 		DialogObj->SetArrayField(TEXT("choices"), ChoicesJsonArray);
 		if (ChoicesJsonArray.Num() == 0)
@@ -801,7 +901,8 @@ TSharedPtr<FJsonValue> FDialogHandlers::RespondToDialog(const TSharedPtr<FJsonOb
 	FString Title;
 	FString Message;
 	TArray<FModalButton> Buttons;
-	TSharedPtr<SWindow> ActiveModal = CollectActiveModal(Title, Message, Buttons);
+	TArray<FModalItem> Items;
+	TSharedPtr<SWindow> ActiveModal = CollectActiveModal(Title, Message, Buttons, &Items);
 	if (!ActiveModal.IsValid())
 	{
 		// Still a failure: nothing was pressed on this call, and a caller
@@ -840,6 +941,53 @@ TSharedPtr<FJsonValue> FDialogHandlers::RespondToDialog(const TSharedPtr<FJsonOb
 	}
 
 	auto Result = MCPSuccess();
+
+	// The per-item ticks go on BEFORE the button, in this one call.
+	//
+	// Setting them through a separate call would leave a window where the
+	// selection is in place and nothing has pressed anything, and a modal is
+	// exactly the state where a caller cannot be relied on to come back. So a
+	// caller says what to tick and which button to press together, and the two
+	// either both happen or neither does.
+	//
+	// ToggleCheckedState, not SetIsChecked: the dialog tracks its selection
+	// through the checkbox's own delegate, so writing the visual state without
+	// firing it would tick the box on screen and save the wrong packages.
+	const TArray<TSharedPtr<FJsonValue>>* RequestedItems = nullptr;
+	if (Params.IsValid() && Params->TryGetArrayField(TEXT("items"), RequestedItems) && RequestedItems)
+	{
+		TArray<TSharedPtr<FJsonValue>> AppliedJson;
+		for (const TSharedPtr<FJsonValue>& Entry : *RequestedItems)
+		{
+			const TSharedPtr<FJsonObject>* ItemObj = nullptr;
+			if (!Entry.IsValid() || !Entry->TryGetObject(ItemObj) || !ItemObj)
+			{
+				continue;
+			}
+			int32 Index = INDEX_NONE;
+			bool bWanted = false;
+			if (!(*ItemObj)->TryGetNumberField(TEXT("index"), Index)
+				|| !(*ItemObj)->TryGetBoolField(TEXT("checked"), bWanted))
+			{
+				continue;
+			}
+			if (!Items.IsValidIndex(Index) || !Items[Index].Box.IsValid())
+			{
+				return MCPError(FString::Printf(
+					TEXT("This dialog has %d tickable item(s), so item %d cannot be set. Read them with list_dialogs."),
+					Items.Num(), Index));
+			}
+			if (Items[Index].bChecked != bWanted)
+			{
+				Items[Index].Box->ToggleCheckedState();
+			}
+			TSharedPtr<FJsonObject> Applied = MakeShared<FJsonObject>();
+			Applied->SetNumberField(TEXT("index"), Index);
+			Applied->SetBoolField(TEXT("checked"), bWanted);
+			AppliedJson.Add(MakeShared<FJsonValueObject>(Applied));
+		}
+		Result->SetArrayField(TEXT("itemsApplied"), AppliedJson);
+	}
 
 	if (TargetIndex >= 0 && TargetIndex < Buttons.Num())
 	{

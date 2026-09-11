@@ -10,7 +10,7 @@
 #include "UObject/UnrealType.h"
 #include "UObject/PropertyPortFlags.h"
 #include "UObject/SoftObjectPtr.h"
-#include "StructUtils/InstancedStruct.h"
+#include "MCPEngineCompat.h"
 #include "GameplayTagContainer.h"
 #include "GameplayTagsManager.h"
 #include "Engine/Blueprint.h"
@@ -1008,8 +1008,10 @@ namespace MCPJsonProperty
 				// `int32 Foo[3]`, is ONE FProperty with ArrayDim == 3 rather than
 				// an FArrayProperty. Without this branch every indexed write to
 				// one landed on element 0, or was refused as "not an array",
-				// which is how RecastNavMesh's three navmesh generation tiers
-				// became unreachable: only the Low tier could be read or written
+				// lint-prose-allow: tier  RecastNavMesh's own name for its three generation tiers
+	// which is how RecastNavMesh's three navmesh generation tiers
+				// lint-prose-allow: tier  RecastNavMesh's own name for its three generation tiers
+	// became unreachable: only the Low tier could be read or written
 				// while the engine generated from Default and High.
 				else if (Prop->ArrayDim > 1)
 				{

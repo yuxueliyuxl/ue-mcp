@@ -117,6 +117,8 @@ private:
 	// the Asset Registry before any package is loaded. Defined in
 	// BlueprintHandlers_Search.cpp.
 	static TSharedPtr<FJsonValue> SearchCallSites(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SearchNodes(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GetConnections(const TSharedPtr<FJsonObject>& Params);
 
 	// #419: SetCapsuleSize on CapsuleComponent BP templates (UFUNCTION setter
 	// path; raw property writes leave the visualizer stale)
@@ -140,6 +142,7 @@ private:
 	static TSharedPtr<FJsonValue> AddCustomEvent(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateMacro(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteMacro(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> DeleteGraph(const TSharedPtr<FJsonObject>& Params);
 
 	// V14 user-type authoring. Defined in BlueprintHandlers_UserTypes.cpp.
 	// Creation and the coarse entry CRUD stay in the asset category; these are

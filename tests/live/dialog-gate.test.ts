@@ -3,7 +3,7 @@
  *
  * The modal is raised the way a user hits it in practice: a dirty map plus a
  * shutdown request. "Cancel" on that prompt aborts the shutdown, so the editor
- * is still there for the rest of the tier.
+ * is still there for the rest of the suite.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { LiveServer, resultJson } from "./server.js";
@@ -173,8 +173,11 @@ describe("the mode governs an ordinary call, not just the lifecycle actions", ()
       expect(refused.choices).toBeUndefined();
       expect(refused.error).toContain("Unreal Editor window");
     } finally {
-      await deferred.call("editor", { action: "respond_to_dialog", buttonLabel: "Cancel" });
-      await waitForDialogs("none");
+      // The cleanup cannot go through `deferred`: defer is precisely the mode
+      // that withholds the press, so asking it to cancel leaves the modal
+      // standing and the editor mid-quit for every test after this one. The
+      // auto-mode server presses for real.
+      await clearModal();
       await deferred.close();
     }
   }, 240_000);

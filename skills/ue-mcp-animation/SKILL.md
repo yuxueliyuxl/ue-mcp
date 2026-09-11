@@ -11,6 +11,30 @@ properties of the selected rig. Discover them again for every unfamiliar rig;
 never paste values from another rig or negate a left-side Euler pose to make a
 right-side pose.
 
+## Focused skeletal mesh weighting
+
+Use the existing skeleton-edit actions for bone creation, removal, reparenting,
+and reference-pose changes. For a small, explicit skin-weight correction:
+
+1. Call `asset(action="list_skeleton_bones", assetPath=<mesh>,
+   includeTransforms=false)` and use the returned names exactly.
+2. Call `asset(action="read_skeletal_mesh_skin_weights", assetPath=<mesh>,
+   lodIndex=0, vertexIndices=[...])`. Keep each read to the selected source
+   vertex IDs; the action caps a call at 256 vertices.
+3. Call `asset(action="set_skeletal_mesh_skin_weights", assetPath=<mesh>,
+   lodIndex=0, edits=[{vertexIndex, influences:[{boneName, weight}]}])` with the
+   complete replacement influence set for every selected vertex. Inspect the
+   returned `before` and `after`: Unreal normalizes and prunes the list, and
+   stores source weights as uint16 values. The render buffer may quantize again
+   to 8-bit unless the LOD enables high-precision skin weights.
+4. Open the rebuilt mesh with `editor(action="open_asset", assetPath=<mesh>)`
+   and capture the asset editor at the reference pose and useful preview poses.
+   Re-read the same selected vertices before moving on.
+
+The weight setter edits one existing source LOD and profile, saves only when a
+selected value changed, and leaves all unlisted vertices, LODs, and profiles
+alone. It does not infer bones, fit a mesh, or auto-rig a character.
+
 ## Required loop
 
 1. Call `project(action="get_status")`; verify the intended project and editor.
@@ -74,7 +98,11 @@ right-side pose.
    transactionally reads back the driver and stabilizers. A driven bone/socket
    returns `verification=bake_and_analyze_required`; bake, analyze every
    constrained frame, and reject the output if its residual misses the motion's
-   acceptance tolerance. FK contacts whose translation is ignored by skeleton
+   acceptance tolerance. To follow a moving source bone/socket, set
+   `targetReference`; omit `target` to preserve the first-frame relative
+   transform, or provide `target` as an explicit transform in the reference's
+   space. This is the generic two-hand/hand-to-prop relationship primitive. FK
+   contacts whose translation is ignored by skeleton
    retargeting use a local rotation-chain solve and report
    `solver=fk_rotation_chain`; that path requires a driven bone and does not
    accept stabilizers. Position-only locks leave the driven control orientation

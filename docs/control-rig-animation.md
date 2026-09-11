@@ -17,7 +17,7 @@ so `ue-mcp init` can install them with the other bundled workflow skills.
 
 | Capability | Engine support |
 |------------|----------------|
-| `begin_control_rig_edit`, `read_control_rig_edit`, `apply_control_rig_edits`, `bake_control_rig_edit` | UE 5.8 only; older engines return `unsupported_engine_version` and do not fall back to raw bone tracks |
+| `begin_control_rig_edit`, `read_control_rig_edit`, `capture_control_rig_pose`, `apply_control_rig_edits`, `bake_control_rig_edit` | UE 5.8 only; older engines return `unsupported_engine_version` and do not fall back to raw bone tracks |
 | `analyze_animation` | Cross-version; it uses the native animation APIs available in the engine against which the bridge was compiled |
 | `configure_ik_rig`, `configure_ik_retargeter`, and `contact_lock` inside `apply_control_rig_edits` | UE 5.8 only; older engines return `unsupported_engine_version` |
 | Legacy IK Rig and IK Retargeter create/read actions | See each action in the [tool reference](tool-reference.md); their older-engine support is unchanged |
@@ -181,6 +181,50 @@ Never write a control with `animatable=false`. Use `set_bool`, `set_float`, or
 `set_int` for scalar controls. For an enum, pass an exact integer listed in
 `enumOptions`; do not infer it from the option's position or label.
 
+### Capture and propagate an accepted viewport pose
+
+`read_control_rig_edit` evaluates Sequencer, so do not use it after an unkeyed
+viewport adjustment that must be preserved. Keep the edit sequence focused and
+use this order instead:
+
+```text
+baseline = animation(action="capture_control_rig_pose", sequencePath=<session>,
+                     bindingTag=<tag>, controlNames=[...]).snapshot
+
+# Adjust the visible Control Rig shapes in the viewport without scrubbing.
+
+accepted = animation(action="capture_control_rig_pose", sequencePath=<session>,
+                     bindingTag=<tag>, controlNames=[...]).snapshot
+
+animation(action="apply_control_rig_edits", sequencePath=<session>, bindingTag=<tag>,
+  operations=[{op:"propagate_pose", baseline:<baseline>, accepted:<accepted>,
+    controls:[
+      {control:"finger_ctrl", mode:"fixed", donorFrames:[0, 1, 2]},
+      {control:"wrist_ctrl", mode:"local_delta", donorFrames:[0, 1, 2]}
+    ]}])
+
+animation(action="bake_control_rig_edit", sequencePath=<session>, bindingTag=<tag>,
+          outputAssetPath=<new-animation>)
+```
+
+Pass the same full editable `controlNames` set to both captures; the default
+selected-only capture is for single-selection work, not a multi-finger edit.
+Store both snapshots unchanged in the caller and compute the changed-control
+list before applying. Pass only those changed controls. `fixed` copies each accepted
+changed channel to the listed original donor keys. `local_delta` applies the
+captured local change at each donor key while retaining its motion. The native
+handler rejects mismatched sessions, rig instances, frames, control sets,
+types, non-finite values, unchanged requested controls, and moved playheads.
+Selection is recorded as provenance metadata; it may change while editing. The
+explicit propagation control list decides what gets keyed. The handler reads
+every keyed result before saving the edit sequence.
+
+Before handoff, verify the actual finger control shapes are visible and
+selectable in the viewport and that selecting one displays the rotation gizmo.
+Track or outliner presence alone is insufficient. A hidden host skeletal-mesh
+component also hides Control Rig shapes. For a driver overlay, disable its
+rendering passes instead of setting the host component's `bVisible` false.
+
 ### 4. Solve anatomy in component space
 
 Define observable targets before changing controls. For an arm gesture, solve
@@ -293,7 +337,8 @@ global/component anatomical targets before baking.
 ### Contact constraints
 
 Use `contact_lock` when a known Control Rig driver must hold a control, bone, or
-socket at a fixed mesh-component-space transform across an inclusive interval:
+socket at a fixed or moving mesh-component-space transform across an inclusive
+interval. A fixed target looks like this:
 
 ```json
 {
@@ -321,6 +366,30 @@ measures the bone/socket offset from the driver, and solves dense
 component-space driver keys. Smooth edge weights blend into and out of the
 lock, and at least one frame must remain fully constrained.
 
+To follow a moving source-animation bone or socket, pass `targetReference`.
+Omit `target` to capture and preserve the subject's relative position and, when
+the driver exposes rotation, orientation at the first constrained frame:
+
+```json
+{
+  "op": "contact_lock",
+  "control": "<follower_ik_driver>",
+  "drivenReference": "<follower_bone_or_socket>",
+  "targetReference": "<moving_bone_or_socket>",
+  "startFrame": 12,
+  "endFrame": 38,
+  "blendInFrames": 4,
+  "blendOutFrames": 4
+}
+```
+
+This is the narrow primitive for a second hand following the first, a hand
+following a moving prop socket, or another relationship already present in the
+source motion. Supply `target` as well to author an explicit transform relative
+to `targetReference`; its translation and optional rotation are interpreted in
+the reference's space. The result reports `targetMode=captured_relative` or
+`explicit_relative`.
+
 FK bones commonly use skeleton translation retargeting, which discards their
 authored translation keys during AnimSequence playback. For an FK
 `drivenReference` contact on such a bone, the bridge instead resolves the
@@ -337,10 +406,11 @@ The apply call transactionally reads back the driver and stabilizer keys. With
 `drivenReference`, `contactQa.verification` is
 `bake_and_analyze_required`: the composed layered bone/socket result is not
 claimed before export. Bake to a new AnimSequence, run `analyze_animation` on
-every constrained frame, and compare the driven reference with the target. If
-it exceeds the motion's acceptance tolerance, reject that output and revise the
-driver, stabilizers, or rig mapping. Without `drivenReference`, the driver
-itself is constrained and its residual is checked during apply.
+every constrained frame, and compare the driven reference with the fixed or
+moving target. If it exceeds the motion's acceptance tolerance, reject that
+output and revise the driver, stabilizers, or rig mapping. Without
+`drivenReference`, the driver itself is constrained and its residual is checked
+during apply.
 
 This is deliberately a generic contact primitive, not a foot-specific macro.
 It works for hands on props, planted feet, held tools, mechanical linkages, and

@@ -6,6 +6,7 @@ import type { ToolContext } from "../../src/types.js";
 const workflowActions = [
   "begin_control_rig_edit",
   "read_control_rig_edit",
+  "capture_control_rig_pose",
   "apply_control_rig_edits",
   "bake_control_rig_edit",
 ] as const;
@@ -184,6 +185,9 @@ describe("animation Control Rig edit workflow", () => {
     expect(source).toContain('SetStringField(TEXT("solver"), TEXT("fk_rotation_chain"))');
     expect(source).toContain("UAnimPoseExtensions::GetAnimPoseAtTime(");
     expect(source).toContain("SourceSection->MapTimeToAnimation(");
+    expect(source).toContain("ControlRigSequencerComposeContactTarget(");
+    expect(source).toContain('Operation->HasField(TEXT("targetReference"))');
+    expect(source).toContain('TEXT("targetMode")');
     expect(source).toContain("GetRelativeTransformReverse(");
     expect(source).toContain("CellCount > ControlRigSequencerMaxFrames");
     expect(source).toContain("contact_constraint_tolerance_exceeded");
@@ -342,6 +346,16 @@ describe("animation Control Rig edit workflow", () => {
         rotationToleranceDegrees: 0.5,
       },
       {
+        op: "contact_lock",
+        control: "hand_l_ik_ctrl",
+        drivenReference: "hand_l",
+        targetReference: "hand_r",
+        startFrame: 4,
+        endFrame: 18,
+        blendInFrames: 2,
+        blendOutFrames: 3,
+      },
+      {
         op: "set_bool",
         control: "arm_r_fk_ik_switch",
         frames: [0, 12, 30],
@@ -371,6 +385,9 @@ describe("animation Control Rig edit workflow", () => {
     expect(operations.safeParse([{ op: "offset", control: "root_ctrl", startFrame: 10, endFrame: 2, translationCm: { x: 1, y: 0, z: 0 } }]).success).toBe(false);
     expect(operations.safeParse([{ op: "offset", control: "root_ctrl", startFrame: 0, endFrame: 2 }]).success).toBe(false);
     const contactTarget = { translation: { x: 0, y: 0, z: 0 } };
+    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4 }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "contact_lock", control: "hand_l_ik", startFrame: 0, endFrame: 4, targetReference: "hand_r" }]).success).toBe(true);
+    expect(operations.safeParse([{ op: "contact_lock", control: "hand_l_ik", startFrame: 0, endFrame: 4, targetReference: "hand_r", target: contactTarget }]).success).toBe(true);
     expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 10, endFrame: 2, target: contactTarget }]).success).toBe(false);
     expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: contactTarget, blendInFrames: 3, blendOutFrames: 2 }]).success).toBe(false);
     expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: contactTarget, stabilizeControls: ["pole", "POLE"] }]).success).toBe(false);
@@ -410,6 +427,66 @@ describe("animation Control Rig edit workflow", () => {
     expect(animationTool.schema.rigMode.safeParse("python").success).toBe(true);
     expect(animationTool.schema.rigMode.description).toContain("fk");
     expect(animationTool.schema.rigMode.description).toContain("asset");
+  });
+
+  it("validates fail-closed live pose propagation snapshots", () => {
+    const snapshot = {
+      captureVersion: 1 as const,
+      sequencePath: "/Game/MCP/LS_Wave_Edit",
+      bindingTag: "mcp.manny.wave",
+      bindingGuid: "A-B-C-D",
+      trackPath: "/Game/MCP/LS_Wave_Edit.Track",
+      sectionPath: "/Game/MCP/LS_Wave_Edit.Section",
+      controlRigClass: "/Game/Rigs/CR_Manny.CR_Manny_C",
+      controlRigObjectPath: "/Game/MCP/LS_Wave_Edit.RigInstance",
+      controlRigObjectId: 42,
+      currentFrame: 12,
+      currentSubFrame: 0,
+      selectedControls: ["finger_ctrl", "wrist_ctrl"],
+      controls: [{
+        control: "finger_ctrl",
+        controlType: "Rotator",
+        valueType: "transform" as const,
+        transform: {
+          translation: { x: 0, y: 0, z: 0 },
+          rotationQuaternion: { x: 0, y: 0, z: 0, w: 1 },
+          scale: { x: 1, y: 1, z: 1 },
+        },
+      }],
+    };
+    const operation = {
+      op: "propagate_pose",
+      baseline: snapshot,
+      accepted: {
+        ...snapshot,
+        controls: [{
+          ...snapshot.controls[0],
+          transform: {
+            ...snapshot.controls[0].transform,
+            rotationQuaternion: { x: 0, y: 0, z: 0.258819, w: 0.965926 },
+          },
+        }],
+      },
+      controls: [{ control: "finger_ctrl", mode: "fixed", donorFrames: [0, 12, 24] }],
+    };
+    expect(animationTool.schema.operations.safeParse([operation]).success).toBe(true);
+    expect(animationTool.schema.operations.safeParse([{ ...operation, baseline: { ...snapshot, currentFrame: Number.NaN } }]).success).toBe(false);
+    expect(animationTool.schema.operations.safeParse([{ ...operation, accepted: { ...operation.accepted, bindingGuid: "other" } }]).success).toBe(true);
+    expect(animationTool.schema.operations.safeParse([{ ...operation, controls: [{ ...operation.controls[0], donorFrames: [12, 12] }] }]).success).toBe(false);
+    expect(animationTool.schema.operations.safeParse([{ ...operation, controls: [operation.controls[0], operation.controls[0]] }]).success).toBe(false);
+
+    const source = readFileSync(
+      new URL(
+        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    expect(source).toContain("Baseline.ControlRigObjectId != Session.ControlRig->GetUniqueID()");
+    expect(source).toContain("BaselineValue->ValueType != ExpectedValueType");
+    expect(source).toContain("Snapshot selection is provenance metadata");
+    expect(source).not.toContain("Baseline.SelectedControls != Accepted.SelectedControls");
+    expect(source).toContain("ControlRigSequencerReadLocalControlValues(Session, Control, Write.Frames, Write.Before)");
   });
 
   it("maps begin/read/apply/bake parameters exactly to the native contracts", async () => {
@@ -460,6 +537,19 @@ describe("animation Control Rig edit workflow", () => {
       controlNames: ["hand_r_ctrl", "foot_l_ctrl"],
       frames: [0, 12, 30],
       space: "global",
+    }, undefined);
+
+    await animationTool.handler(ctx, {
+      action: "capture_control_rig_pose",
+      sequencePath: "/Game/MCP/LS_Wave_Edit",
+      bindingTag: "mcp.manny.wave",
+      controlNames: ["hand_r_ctrl", "foot_l_ctrl"],
+      frames: [999],
+    });
+    expect(call).toHaveBeenLastCalledWith("capture_control_rig_pose", {
+      sequencePath: "/Game/MCP/LS_Wave_Edit",
+      bindingTag: "mcp.manny.wave",
+      controlNames: ["hand_r_ctrl", "foot_l_ctrl"],
     }, undefined);
 
     const operations = [{

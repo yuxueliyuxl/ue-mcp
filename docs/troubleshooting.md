@@ -317,6 +317,57 @@ widget(action="remove_widget", assetPath="/Game/UI/WBP_ComputerTaskbar", widgetN
 
 The widget is already gone, so the call reports `alreadyDeleted: true`, drops the dead entries, and saves. `prunedGuidEntries` in the result says how many it removed; `0` means the map was already clean and nothing was written.
 
+## A Call Node Came Back With No Title and No Pins
+
+**Symptom:** `blueprint(add_node)` reports `created: true`, but the node it made has the title `None`, carries no pins, and cannot be wired to anything.
+
+That is an unbound stub: the node class was created, but no `UFunction` was attached to it, so there is nothing for it to call and nothing to draw pins from. The report is `created: true` because a node genuinely was added - the binding is the part that failed, and it used to fail silently.
+
+The case this used to happen in is a function the Blueprint declares itself:
+
+```
+blueprint(action="create_function", assetPath="/Game/BP_Thing", functionName="ComputeAimOffset")
+blueprint(action="add_node", assetPath="/Game/BP_Thing", graphName="EventGraph",
+          nodeClass="K2Node_CallFunction", nodeParams={"functionName": "ComputeAimOffset"})
+```
+
+The resolver looked at an explicit target class, the parent class, the common Kismet libraries, the Blueprint's component classes, and every loaded class - but not at the Blueprint itself. A function declared on a Blueprint lives on its generated class, and on the skeleton class from the moment it is declared, and both are searched now, so the sequence above binds without needing a compile in between.
+
+If you still get a stub, the function name is the thing to check first. `blueprint(action="list_functions", assetPath=...)` reports what the Blueprint actually declares, and for a C++ `UFUNCTION` on a class the Blueprint does not own, naming it explicitly is the reliable form:
+
+```
+nodeParams={"functionName": "MyFunction", "className": "/Script/MyModule.MyClass"}
+```
+
+## Reimport Says It Worked but Read the Old File
+
+**Symptom:** `asset(action="reimport", assetPath=..., filePath=...)` reports success, and the asset still has the contents of the file it was originally imported from.
+
+`filePath` repoints an asset at a new source before rebuilding it, which only works if the asset has somewhere to record that path. When it did not, the path used to be dropped and the reimport re-read the original file - reporting success either way, so there was nothing to notice.
+
+That case is refused now. When a reimport does repoint an asset, the response says so:
+
+```
+sourceFileUpdated: true
+sourceFile: C:/path/to/the/new/file.png
+```
+
+`sourceFileUpdated: false` means the asset was rebuilt from the source it already had, which is what you want when you pass no `filePath` at all.
+
+## Reimport Made the Editor Stop Responding
+
+**Symptom:** a call to `asset(action="reimport")` times out, and so does every call after it.
+
+Reimport rebuilds an asset from the file it was imported from, so it only applies to imported assets. Asked to reimport something authored in the editor - a Blueprint, a material, a data asset - Unreal's reimport manager does not return, and because it blocks the game thread the whole bridge stops answering rather than just that one call.
+
+The bridge now checks whether anything can reimport the asset before handing it over, so this comes back immediately:
+
+```
+Nothing can reimport a Blueprint: '/Game/BP_Thing' has no registered reimport handler.
+```
+
+If you hit the hang on an older build, the editor has to be restarted; nothing over the bridge can recover a blocked game thread.
+
 ## Search Not Finding Assets
 
 If `asset(action="search")` misses assets in plugin directories:

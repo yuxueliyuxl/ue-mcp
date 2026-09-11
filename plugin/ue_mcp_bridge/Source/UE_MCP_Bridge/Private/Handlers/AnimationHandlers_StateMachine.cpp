@@ -40,6 +40,7 @@
 #include "Rig/Solvers/IKRigFullBodyIK.h"
 #include "Retargeter/IKRetargetChainMapping.h"
 #include "Retargeter/IKRetargetOps.h"
+#include "JsonObjectConverter.h"
 #include "Retargeter/IKRetargetProcessor.h"
 #endif
 #include "PoseSearch/PoseSearchDatabase.h"
@@ -51,7 +52,7 @@
 #include "Animation/AnimSequenceBase.h"
 #include "Animation/BlendSpace.h"
 #include "Animation/Skeleton.h"
-#include "StructUtils/InstancedStruct.h"
+#include "MCPEngineCompat.h"
 #include "UObject/Package.h"
 #include "Misc/PackageName.h"
 #include "Runtime/Launch/Resources/Version.h"
@@ -65,7 +66,11 @@
 #include "Dom/JsonValue.h"
 
 
-#define UE_MCP_HAS_POSESEARCH_DATABASE_ASSET_API (ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4))
+// UPoseSearchDatabase's GetNumAnimationAssets / GetDatabaseAnimationAsset pair
+// is 5.5 and newer. 5.4 exposes the clip list as the AnimationAssets array of
+// FInstancedStruct with GetAnimationAssetBase, which is what the #else arms
+// below are written against.
+#define UE_MCP_HAS_POSESEARCH_DATABASE_ASSET_API (ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5))
 
 #if UE_MCP_HAS_5_8_API
 static TSharedPtr<FJsonObject> AnimationVectorToJson(const FVector& Value)
@@ -1545,6 +1550,31 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateIKRig(const TSharedPtr<FJsonObj
 
 // ─── #93  read_ik_rig ───────────────────────────────────────────────
 
+// The IK rig's retarget root bone, whatever the accessor is called.
+//
+// 5.4 spells it GetRetargetRoot(); later engines renamed the same accessor over
+// the same FName to GetPelvis(). Which engine did the rename is not something
+// this file has to know: the first overload drops out of the overload set when
+// GetPelvis does not exist, and the second when GetRetargetRoot does not, so
+// whichever the engine has is the one that gets called.
+template <typename RigType>
+static auto MCPIKRigRetargetRootBoneImpl(const RigType* Rig, int) -> decltype(Rig->GetPelvis())
+{
+	return Rig->GetPelvis();
+}
+
+template <typename RigType>
+static auto MCPIKRigRetargetRootBoneImpl(const RigType* Rig, long) -> decltype(Rig->GetRetargetRoot())
+{
+	return Rig->GetRetargetRoot();
+}
+
+template <typename RigType>
+static FName MCPIKRigRetargetRootBone(const RigType* Rig)
+{
+	return Rig ? MCPIKRigRetargetRootBoneImpl(Rig, 0) : NAME_None;
+}
+
 TSharedPtr<FJsonValue> FAnimationHandlers::ReadIKRig(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
@@ -1605,7 +1635,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadIKRig(const TSharedPtr<FJsonObjec
 	// moves the whole character. Omitting them meant a caller inspecting a rig
 	// could not tell whether the root was set at all, and had to open the
 	// editor to find out.
-	Result->SetStringField(TEXT("retargetRoot"), IKRig->GetPelvis().ToString());
+	Result->SetStringField(TEXT("retargetRoot"), MCPIKRigRetargetRootBone(IKRig).ToString());
 	if (RigSkeleton.BoneNames.Num() > 0)
 	{
 		Result->SetStringField(TEXT("rootBone"), RigSkeleton.BoneNames[0].ToString());
@@ -2039,6 +2069,27 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadIKRetargeter(const TSharedPtr<FJs
 			}
 		}
 		OpObj->SetArrayField(TEXT("chainMappings"), OpMappings);
+
+		// #1000: the settings struct is what decides what an op does - the root
+		// motion source, the pelvis alphas, the per-chain FK modes - and this
+		// readout reported everything about an op except that. It is reflected,
+		// so it serialises whole and a later engine adding a field needs no
+		// change here.
+		if (const FIKRetargetOpBase* const Op = OpStruct ? OpStruct->GetPtr<FIKRetargetOpBase>() : nullptr)
+		{
+			if (const UScriptStruct* const SettingsType = Op->GetSettingsType())
+			{
+				OpObj->SetStringField(TEXT("settingsType"), SettingsType->GetPathName());
+				if (const FIKRetargetOpSettingsBase* const Settings = Op->GetSettingsConst())
+				{
+					const TSharedRef<FJsonObject> SettingsJson = MakeShared<FJsonObject>();
+					if (FJsonObjectConverter::UStructToJsonObject(SettingsType, Settings, SettingsJson, 0, 0))
+					{
+						OpObj->SetObjectField(TEXT("settings"), SettingsJson);
+					}
+				}
+			}
+		}
 		RetargetOps.Add(MakeShared<FJsonValueObject>(OpObj));
 	}
 	Result->SetArrayField(TEXT("retargetOps"), RetargetOps);
@@ -2410,7 +2461,8 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BuildPoseSearchIndex(const TSharedPtr
 	const ERequestAsyncBuildFlag Flag = bWait
 		? (ERequestAsyncBuildFlag::NewRequest | ERequestAsyncBuildFlag::WaitForCompletion)
 		: ERequestAsyncBuildFlag::NewRequest;
-#if UE_MCP_HAS_POSESEARCH_DATABASE_ASSET_API
+	// RequestAsyncBuildIndex returns EAsyncBuildIndexResult on 5.4 through 5.8
+	// alike; only the clip-list accessors moved, and they are gated separately.
 	const EAsyncBuildIndexResult Result = FAsyncPoseSearchDatabasesManagement::RequestAsyncBuildIndex(Database, Flag);
 
 	FString ResultStr;
@@ -2421,10 +2473,6 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BuildPoseSearchIndex(const TSharedPtr
 		case EAsyncBuildIndexResult::InProgress: ResultStr = TEXT("InProgress"); bSuccess = true; break;
 		case EAsyncBuildIndexResult::Failed:     ResultStr = TEXT("Failed"); break;
 	}
-#else
-	const bool bSuccess = FAsyncPoseSearchDatabasesManagement::RequestAsyncBuildIndex(Database, Flag);
-	const FString ResultStr = bSuccess ? TEXT("Success") : TEXT("Failed");
-#endif
 
 	UEditorAssetLibrary::SaveLoadedAsset(Database);
 

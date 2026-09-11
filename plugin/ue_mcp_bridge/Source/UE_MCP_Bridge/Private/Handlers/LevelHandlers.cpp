@@ -687,7 +687,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::GetActorDetails(const TSharedPtr<FJsonObj
 
 	// LabelOrName, not label alone: a caller often has an internal name rather
 	// than a label, because a PIE-spawned actor has no label worth guessing.
-	// The label tier is still exhausted first and the name tier refuses on
+	// The label pass is still exhausted first and the name pass refuses on
 	// ambiguity, so accepting the name cannot reintroduce a silent pick (#983).
 	FMCPActorSelector ActorSel;
 	ActorSel.Match = EMCPActorMatch::LabelOrName;
@@ -769,7 +769,9 @@ TSharedPtr<FJsonValue> FLevelHandlers::GetActorDetails(const TSharedPtr<FJsonObj
 			//
 			// This is a general serialization bug, not a navmesh one. It was
 			// noticed on RecastNavMesh's NavMeshResolutionParams, a three-element
+			// lint-prose-allow: tier  RecastNavMesh's own name for its three generation tiers
 			// fixed array holding the Low, Default and High generation tiers, and
+			// lint-prose-allow: tier  RecastNavMesh's own name for its three generation tiers
 			// reporting only the Low tier as if it were the whole property sent a
 			// user tuning cell sizes against numbers Recast was not using. Any
 			// fixed array on any class had the same problem.
@@ -819,7 +821,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::GetComponentTree(const TSharedPtr<FJsonOb
 
 	// LabelOrName, not label alone: a caller often has an internal name rather
 	// than a label, because a PIE-spawned actor has no label worth guessing.
-	// The label tier is still exhausted first and the name tier refuses on
+	// The label pass is still exhausted first and the name pass refuses on
 	// ambiguity, so accepting the name cannot reintroduce a silent pick (#983).
 	FMCPActorSelector ActorSel;
 	ActorSel.Match = EMCPActorMatch::LabelOrName;
@@ -1221,7 +1223,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::MoveActor(const TSharedPtr<FJsonObject>& 
 
 	// LabelOrName, not label alone: a caller often has an internal name rather
 	// than a label, because a PIE-spawned actor has no label worth guessing.
-	// The label tier is still exhausted first and the name tier refuses on
+	// The label pass is still exhausted first and the name pass refuses on
 	// ambiguity, so accepting the name cannot reintroduce a silent pick (#983).
 	FMCPActorSelector ActorSel;
 	ActorSel.Match = EMCPActorMatch::LabelOrName;
@@ -3059,6 +3061,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetActorProperty(const TSharedPtr<FJsonOb
 	// #927: the leaf element of a C-style fixed array, `int32 Foo[3]`. That is
 	// ONE FProperty with ArrayDim == 3, so without an index the write lands on
 	// element 0 and the other elements are unreachable. The read side has the
+	// lint-prose-allow: tier  RecastNavMesh's own name for its three generation tiers
 	// mirror of this bug; a read that shows three tiers and a write that can
 	// only reach the first is not a usable pair.
 	int32 LeafArrayIndex = 0;
@@ -3326,7 +3329,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::ReadActorMotion(const TSharedPtr<FJsonObj
 	// #983: the same list spelled as object paths, which is what a caller
 	// reaches for when several actors share a label. These are kept apart from
 	// the label list and resolved by MCPFindActorByPath rather than folded into
-	// the label token tier, so the export-text form and a case difference both
+	// the label token pass, so the export-text form and a case difference both
 	// resolve here exactly as they do everywhere else.
 	TArray<FString> Paths;
 	FString SinglePath;
@@ -3778,7 +3781,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetNaniteSettings(const TSharedPtr<FJsonO
 	const bool bEnabled = OptionalBool(Params, TEXT("enabled"), true);
 	// Use the accessor pair (GetNaniteSettings/SetNaniteSettings) - direct
 	// member access to NaniteSettings is deprecated in 5.7+.
-	FMeshNaniteSettings Settings = Mesh->GetNaniteSettings();
+	FMeshNaniteSettings Settings = MCPGetNaniteSettings(Mesh);
 	const bool bPreviousEnabled = Settings.bEnabled != 0;
 	const int32 PreviousPositionPrecision = Settings.PositionPrecision;
 	Settings.bEnabled = bEnabled;
@@ -3804,7 +3807,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetNaniteSettings(const TSharedPtr<FJsonO
 		// said unchanged:true and saved:false, leaving the asset dirty with
 		// nothing written and nothing to save.
 		Mesh->Modify();
-		Mesh->SetNaniteSettings(Settings);
+		MCPSetNaniteSettings(Mesh, Settings);
 
 		// Force a rebuild so the Nanite data is generated immediately rather
 		// than on next cook. Build() is the editor's explicit rebuild entry point.
@@ -3813,8 +3816,8 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetNaniteSettings(const TSharedPtr<FJsonO
 		bSaved = SaveAssetPackage(Mesh);
 	}
 
-	const bool bNowEnabled = Mesh->GetNaniteSettings().bEnabled != 0;
-	const int32 NowPositionPrecision = Mesh->GetNaniteSettings().PositionPrecision;
+	const bool bNowEnabled = MCPGetNaniteSettings(Mesh).bEnabled != 0;
+	const int32 NowPositionPrecision = MCPGetNaniteSettings(Mesh).PositionPrecision;
 
 	auto Result = MCPSuccess();
 	if (bSettingsChanged) MCPSetUpdated(Result); else Result->SetBoolField(TEXT("updated"), false);
@@ -3869,7 +3872,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::GetNaniteInfo(const TSharedPtr<FJsonObjec
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("meshPath"), AssetPath)) return Err;
 	REQUIRE_ASSET(UStaticMesh, Mesh, AssetPath);
 
-	const FMeshNaniteSettings& Settings = Mesh->GetNaniteSettings();
+	const FMeshNaniteSettings Settings = MCPGetNaniteSettings(Mesh);
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("assetPath"), Mesh->GetPathName());
 	Result->SetBoolField(TEXT("naniteEnabled"), Settings.bEnabled != 0);
@@ -5376,7 +5379,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetStreamingSublevelProperties(const TSha
 		// FindStreamingByName also matches on the base filename, and
 		// /Game/A/Sub and /Game/B/Sub both answer to "Sub", so replaying the
 		// token could write this sub-level's old flags onto a different one.
-		// The package name is the tier that resolver checks first and the only
+		// The package name is the pass that resolver checks first and the only
 		// one that is unique.
 		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 		Payload->SetStringField(TEXT("levelName"), SL->GetWorldAssetPackageName());

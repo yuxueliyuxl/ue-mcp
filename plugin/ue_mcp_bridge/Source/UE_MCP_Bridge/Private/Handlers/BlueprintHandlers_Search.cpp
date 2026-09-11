@@ -41,6 +41,9 @@
 #include "EdGraph/EdGraphNode.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_CallParentFunction.h"
+#include "K2Node_Variable.h"
+#include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
 #include "EdGraphSchema_K2.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -214,6 +217,443 @@ namespace
 			}
 		}
 	}
+}
+
+// #998 + #1015: find nodes anywhere in one Blueprint.
+//
+// Two reports asked for the same walk with different predicates. #998 wanted
+// every node whose title carries one of a set of terms, across every authored
+// graph including collapsed ones. #1015 wanted every get and set of a named
+// variable, which is the variable analogue of search_call_sites. Neither was
+// reachable: read_graph and epic_find_nodes take one named graph at a time and
+// do not descend into a collapsed subgraph, list_graphs names graphs without
+// looking inside them, and search_call_sites only matches function calls. So
+// both ended up walking ubergraph_pages, function_graphs, macro_graphs and
+// delegate_signature_graphs by hand in Python.
+//
+// One action rather than two, because the difference between them is which
+// predicate runs per node, and a caller wanting "every get of bIsAiming, and
+// anything titled Sprint" should not have to make two passes over the same
+// hundred graphs to get it.
+// #996 gap 2: read the edges of a Blueprint graph, addressed by node GUID.
+//
+// read_graph reports each pin as connected true or false and never says to
+// what, and read_graph_summary carries exec edges but no data edges. So there
+// was no way to answer "what feeds this pin", which is what verifying or
+// re-targeting wiring needs. The workaround was to read the graph through
+// Python and rebuild the edge list by hand.
+//
+// Every edge is reported from its OUTPUT side, once. Walking both sides would
+// report each edge twice and leave the caller to dedupe something it cannot
+// see the identity of, and an edge has a direction anyway: data flows out of
+// a source pin into a target pin, and exec runs from a then to an execute.
+//
+// Nodes are named by GUID as well as title, because title is exactly what the
+// report says is ambiguous: a graph with five "float * float" nodes cannot be
+// rewired by title, and a GUID survives a recompile.
+TSharedPtr<FJsonValue> FBlueprintHandlers::GetConnections(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	UBlueprint* const Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+
+	// One graph when named, every graph otherwise: an audit of "what is wired
+	// to what" across a Blueprint is as reasonable a question as one graph.
+	FString Requested = OptionalString(Params, TEXT("graphSelector"), TEXT(""));
+	if (Requested.IsEmpty()) Requested = OptionalString(Params, TEXT("graphName"), TEXT(""));
+
+	FString Kind = OptionalString(Params, TEXT("kind"), TEXT("all")).ToLower();
+	if (Kind.IsEmpty()) Kind = TEXT("all");
+	if (Kind != TEXT("all") && Kind != TEXT("exec") && Kind != TEXT("data"))
+	{
+		return MCPError(FString::Printf(
+			TEXT("'kind' must be exec, data or all, got '%s'"), *Kind));
+	}
+	const bool bWantExec = Kind != TEXT("data");
+	const bool bWantData = Kind != TEXT("exec");
+
+	const bool bIncludeNestedGraphs = OptionalBool(Params, TEXT("includeNestedGraphs"), true);
+
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("get_blueprint_connections|asset=%s|graph=%s|kind=%s|nested=%d"),
+				*Blueprint->GetPathName(), *Requested, *Kind, bIncludeNestedGraphs ? 1 : 0),
+			DefaultCallSiteLimit, MaxCallSiteLimit, Page))
+	{
+		return Err;
+	}
+
+	TArray<UEdGraph*> AllGraphs;
+	Blueprint->GetAllGraphs(AllGraphs);
+	TMap<FString, int32> NameCounts;
+	CountGraphNames(AllGraphs, NameCounts);
+	TMap<FString, int32> SeenCounts;
+
+	TArray<MCPPagination::FPageRow> Edges;
+	int32 GraphsScanned = 0;
+	int32 NodesScanned = 0;
+	int32 NameMatches = 0;
+	bool bTruncated = false;
+
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (bTruncated) break;
+		if (!Graph) continue;
+
+		const FString GraphName = Graph->GetName();
+		const int32 DuplicateIndex = SeenCounts.FindOrAdd(GraphName)++;
+		const FString Selector = MakeGraphSelector(GraphName, DuplicateIndex, NameCounts.FindRef(GraphName));
+		const bool bNested = Graph->GetOuter() != Blueprint;
+		if (bNested && !bIncludeNestedGraphs) continue;
+		if (!Requested.IsEmpty())
+		{
+			const bool bSelectorHit = Selector.Equals(Requested, ESearchCase::IgnoreCase);
+			const bool bNameHit = GraphName.Equals(Requested, ESearchCase::IgnoreCase);
+			if (!bSelectorHit && !bNameHit) continue;
+			if (bNameHit && !bSelectorHit) ++NameMatches;
+		}
+
+		++GraphsScanned;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			++NodesScanned;
+			for (const UEdGraphPin* Pin : Node->Pins)
+			{
+				// Output side only, so each edge is reported once and carries the
+				// direction it actually has.
+				if (!Pin || Pin->Direction != EGPD_Output) continue;
+				const bool bExec = Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
+				if (bExec ? !bWantExec : !bWantData) continue;
+
+				for (const UEdGraphPin* Linked : Pin->LinkedTo)
+				{
+					if (!Linked) continue;
+					const UEdGraphNode* const Target = Linked->GetOwningNodeUnchecked();
+					if (!Target) continue;
+
+					TSharedPtr<FJsonObject> Edge = MakeShared<FJsonObject>();
+					Edge->SetStringField(TEXT("kind"), bExec ? TEXT("exec") : TEXT("data"));
+					Edge->SetStringField(TEXT("graphName"), GraphName);
+					Edge->SetStringField(TEXT("graphSelector"), Selector);
+					Edge->SetBoolField(TEXT("nestedGraph"), bNested);
+					Edge->SetStringField(TEXT("fromNodeId"), Node->NodeGuid.ToString());
+					Edge->SetStringField(TEXT("fromNodeTitle"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+					Edge->SetStringField(TEXT("fromNodeClass"), Node->GetClass()->GetName());
+					Edge->SetStringField(TEXT("fromPin"), Pin->PinName.ToString());
+					Edge->SetStringField(TEXT("toNodeId"), Target->NodeGuid.ToString());
+					Edge->SetStringField(TEXT("toNodeTitle"), Target->GetNodeTitle(ENodeTitleType::ListView).ToString());
+					Edge->SetStringField(TEXT("toNodeClass"), Target->GetClass()->GetName());
+					Edge->SetStringField(TEXT("toPin"), Linked->PinName.ToString());
+					if (!bExec)
+					{
+						// The pin type is what tells a caller whether a re-target is even
+						// legal, and it is the thing a title cannot carry.
+						Edge->SetStringField(TEXT("pinCategory"), Pin->PinType.PinCategory.ToString());
+						if (!Pin->PinType.PinSubCategory.IsNone())
+						{
+							Edge->SetStringField(TEXT("pinSubCategory"), Pin->PinType.PinSubCategory.ToString());
+						}
+					}
+
+					// A pin pair inside one graph is the edge's identity, and both
+					// halves survive a recompile where a row index does not.
+					const FString RowId = FString::Printf(TEXT("%s|%s.%s|%s.%s"),
+						*Selector,
+						*Node->NodeGuid.ToString(), *Pin->PinName.ToString(),
+						*Target->NodeGuid.ToString(), *Linked->PinName.ToString());
+					Edges.Add({ RowId, MakeShared<FJsonValueObject>(Edge) });
+					if (Edges.Num() >= MaxCollectedHits)
+					{
+						bTruncated = true;
+						break;
+					}
+				}
+				if (bTruncated) break;
+			}
+			if (bTruncated) break;
+		}
+	}
+
+	if (!Requested.IsEmpty() && GraphsScanned == 0)
+	{
+		return MCPError(FString::Printf(
+			TEXT("no graph named '%s' in %s; blueprint(list_graphs) reports the names and selectors it has"),
+			*Requested, *Blueprint->GetPathName()));
+	}
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("assetPath"), Blueprint->GetPathName());
+	if (!Requested.IsEmpty()) Result->SetStringField(TEXT("graph"), Requested);
+	Result->SetStringField(TEXT("kind"), Kind);
+	Result->SetBoolField(TEXT("includeNestedGraphs"), bIncludeNestedGraphs);
+	if (NameMatches > 1)
+	{
+		// Reading is not destructive, so this reports rather than refuses - but
+		// a caller feeding these edges back into a write needs to know the name
+		// it gave covered more than one graph.
+		Result->SetBoolField(TEXT("ambiguousGraphName"), true);
+		Result->SetNumberField(TEXT("graphsMatchingName"), NameMatches);
+	}
+
+	TSharedPtr<FJsonObject> Stats = MakeShared<FJsonObject>();
+	Stats->SetNumberField(TEXT("graphsInBlueprint"), AllGraphs.Num());
+	Stats->SetNumberField(TEXT("graphsScanned"), GraphsScanned);
+	Stats->SetNumberField(TEXT("nodesScanned"), NodesScanned);
+	Result->SetObjectField(TEXT("stats"), Stats);
+	if (bTruncated)
+	{
+		Result->SetBoolField(TEXT("truncatedAtMaxEdges"), true);
+		Result->SetNumberField(TEXT("maxEdges"), MaxCollectedHits);
+	}
+
+	MCPPagination::EmitPage(Page, Edges, TEXT("connections"), Result, !bTruncated);
+	return MCPResult(Result);
+}
+
+TSharedPtr<FJsonValue> FBlueprintHandlers::SearchNodes(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("blueprintPath"), AssetPath)) return Err;
+
+	// LoadBlueprint resolves a World path to its level script too, which is the
+	// same alias read/list_graphs/read_graph already accept.
+	UBlueprint* const Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint) return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+
+	auto ReadLowerStrings = [&](const TCHAR* Field, TArray<FString>& OutRaw, TSet<FString>& OutLower)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (!Params->TryGetArrayField(Field, Arr) || !Arr) return;
+		for (const TSharedPtr<FJsonValue>& Value : *Arr)
+		{
+			FString S;
+			if (!Value.IsValid() || !Value->TryGetString(S)) continue;
+			S.TrimStartAndEndInline();
+			if (S.IsEmpty() || OutLower.Contains(S.ToLower())) continue;
+			OutRaw.Add(S);
+			OutLower.Add(S.ToLower());
+		}
+	};
+
+	TArray<FString> Titles;      TSet<FString> TitlesLower;
+	TArray<FString> NodeClasses; TSet<FString> NodeClassesLower;
+	ReadLowerStrings(TEXT("titles"), Titles, TitlesLower);
+	ReadLowerStrings(TEXT("nodeClasses"), NodeClasses, NodeClassesLower);
+
+	const FString VariableName = OptionalString(Params, TEXT("variableName"), TEXT(""));
+	FString VariableAccess = OptionalString(Params, TEXT("variableAccess"), TEXT("any")).ToLower();
+	if (VariableAccess.IsEmpty()) VariableAccess = TEXT("any");
+	if (VariableAccess != TEXT("any") && VariableAccess != TEXT("get") && VariableAccess != TEXT("set"))
+	{
+		return MCPError(FString::Printf(
+			TEXT("'variableAccess' must be get, set or any, got '%s'"), *VariableAccess));
+	}
+
+	// A filterless call would walk every node in the Blueprint and hand back
+	// all of them, which is read_graph with extra steps and a response nobody
+	// sized for. Refusing names the three ways to narrow it rather than
+	// returning a truncated dump that looks like a search result.
+	if (Titles.Num() == 0 && NodeClasses.Num() == 0 && VariableName.IsEmpty())
+	{
+		return MCPError(TEXT(
+			"Name what to look for: 'titles' (substrings matched against the node title), "
+			"'nodeClasses' (exact node class names such as K2Node_VariableGet), or "
+			"'variableName' (a member the node reads or writes)."));
+	}
+
+	const bool bIncludeNestedGraphs = OptionalBool(Params, TEXT("includeNestedGraphs"), true);
+	// Transient and generated graphs are compiler artifacts. They are off by
+	// default because a caller auditing what a person authored does not want
+	// them, and the Python this replaces filtered them out by hand every time.
+	const bool bAuthoredOnly = OptionalBool(Params, TEXT("authoredOnly"), true);
+
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(
+				TEXT("search_blueprint_nodes|asset=%s|titles=%s|classes=%s|var=%s|access=%s|nested=%d|authored=%d"),
+				*Blueprint->GetPathName(),
+				*FString::Join(Titles, TEXT(",")),
+				*FString::Join(NodeClasses, TEXT(",")),
+				*VariableName,
+				*VariableAccess,
+				bIncludeNestedGraphs ? 1 : 0,
+				bAuthoredOnly ? 1 : 0),
+			DefaultCallSiteLimit, MaxCallSiteLimit, Page))
+	{
+		return Err;
+	}
+
+	TArray<UEdGraph*> AllGraphs;
+	Blueprint->GetAllGraphs(AllGraphs);
+	// Selectors are computed over EVERY graph even when nested graphs are being
+	// skipped, so a reported selector always means what list_graphs says it
+	// means rather than shifting with this call's filters.
+	TMap<FString, int32> NameCounts;
+	CountGraphNames(AllGraphs, NameCounts);
+	TMap<FString, int32> SeenCounts;
+
+	TArray<MCPPagination::FPageRow> Hits;
+	int32 GraphsScanned = 0;
+	int32 NodesScanned = 0;
+	int32 GraphsSkippedAsNested = 0;
+	int32 GraphsSkippedAsGenerated = 0;
+	bool bTruncatedAtMaxHits = false;
+
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (bTruncatedAtMaxHits) break;
+		if (!Graph) continue;
+
+		const FString GraphName = Graph->GetName();
+		const int32 DuplicateIndex = SeenCounts.FindOrAdd(GraphName)++;
+		const FString Selector = MakeGraphSelector(GraphName, DuplicateIndex, NameCounts.FindRef(GraphName));
+
+		// A top-level graph is owned by the Blueprint. Collapsed graphs, state
+		// machine graphs and transition graphs hang off a node or a parent graph
+		// instead, which is what "nested" means here and what #1015 reported as
+		// invisible.
+		const bool bNested = Graph->GetOuter() != Blueprint;
+		if (bNested && !bIncludeNestedGraphs)
+		{
+			++GraphsSkippedAsNested;
+			continue;
+		}
+		if (bAuthoredOnly && (Graph->HasAnyFlags(RF_Transient) || Graph->GetPackage() == GetTransientPackage()))
+		{
+			++GraphsSkippedAsGenerated;
+			continue;
+		}
+
+		++GraphsScanned;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			++NodesScanned;
+			if (bAuthoredOnly && Node->HasAnyFlags(RF_Transient)) continue;
+
+			const FString NodeTitle = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+			const FString NodeClass = Node->GetClass()->GetName();
+
+			// A variable node carries the member it references whether or not the
+			// property still resolves, which is the case an audit hunting a renamed
+			// variable cares about most.
+			const UK2Node_Variable* const VariableNode = Cast<UK2Node_Variable>(Node);
+			FString MemberName;
+			FString Access;
+			if (VariableNode)
+			{
+				MemberName = VariableNode->VariableReference.GetMemberName().ToString();
+				if (Node->IsA<UK2Node_VariableSet>()) Access = TEXT("set");
+				else if (Node->IsA<UK2Node_VariableGet>()) Access = TEXT("get");
+			}
+
+			// Any named filter matching is a hit. They are alternatives rather than
+			// a conjunction: a caller naming both a title and a variable is asking
+			// for one pass over the graphs, not for nodes that satisfy both.
+			bool bMatched = false;
+			FString MatchedOn;
+
+			if (!VariableName.IsEmpty() && !MemberName.IsEmpty()
+				&& MemberName.Equals(VariableName, ESearchCase::IgnoreCase)
+				&& (VariableAccess == TEXT("any") || VariableAccess == Access))
+			{
+				bMatched = true;
+				MatchedOn = TEXT("variable");
+			}
+			if (!bMatched && NodeClassesLower.Num() > 0 && NodeClassesLower.Contains(NodeClass.ToLower()))
+			{
+				bMatched = true;
+				MatchedOn = TEXT("nodeClass");
+			}
+			if (!bMatched && TitlesLower.Num() > 0)
+			{
+				const FString TitleLower = NodeTitle.ToLower();
+				for (const FString& Term : TitlesLower)
+				{
+					if (TitleLower.Contains(Term))
+					{
+						bMatched = true;
+						MatchedOn = TEXT("title");
+						break;
+					}
+				}
+			}
+			if (!bMatched) continue;
+
+			TSharedPtr<FJsonObject> HitObj = MakeShared<FJsonObject>();
+			HitObj->SetStringField(TEXT("graphName"), GraphName);
+			HitObj->SetStringField(TEXT("graphSelector"), Selector);
+			HitObj->SetStringField(TEXT("graphObjectPath"), Graph->GetPathName());
+			HitObj->SetBoolField(TEXT("nestedGraph"), bNested);
+			HitObj->SetStringField(TEXT("nodeId"), Node->NodeGuid.ToString());
+			HitObj->SetStringField(TEXT("nodeTitle"), NodeTitle);
+			HitObj->SetStringField(TEXT("nodeClass"), NodeClass);
+			HitObj->SetStringField(TEXT("matchedOn"), MatchedOn);
+			HitObj->SetNumberField(TEXT("posX"), Node->NodePosX);
+			HitObj->SetNumberField(TEXT("posY"), Node->NodePosY);
+			if (VariableNode)
+			{
+				HitObj->SetStringField(TEXT("memberName"), MemberName);
+				if (!Access.IsEmpty()) HitObj->SetStringField(TEXT("access"), Access);
+				if (UClass* const Owner = VariableNode->VariableReference.GetMemberParentClass())
+				{
+					HitObj->SetStringField(TEXT("memberParentClass"), Owner->GetName());
+					HitObj->SetStringField(TEXT("memberParentClassPath"), Owner->GetPathName());
+				}
+				HitObj->SetBoolField(TEXT("selfContext"), VariableNode->VariableReference.IsSelfContext());
+			}
+
+			// Same anchor shape as search_call_sites: the graph selector that
+			// separates two graphs of one name, and the node GUID, which survives a
+			// recompile where a row index does not.
+			const FString RowId = FString::Printf(TEXT("%s|%s|%s"),
+				*Blueprint->GetPathName(), *Selector, *Node->NodeGuid.ToString());
+			Hits.Add({ RowId, MakeShared<FJsonValueObject>(HitObj) });
+			if (Hits.Num() >= MaxCollectedHits)
+			{
+				bTruncatedAtMaxHits = true;
+				break;
+			}
+		}
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("assetPath"), Blueprint->GetPathName());
+	Result->SetBoolField(TEXT("levelScript"), Blueprint->IsA<ULevelScriptBlueprint>());
+	TArray<TSharedPtr<FJsonValue>> TitlesJson, ClassesJson;
+	for (const FString& S : Titles) TitlesJson.Add(MakeShared<FJsonValueString>(S));
+	for (const FString& S : NodeClasses) ClassesJson.Add(MakeShared<FJsonValueString>(S));
+	if (TitlesJson.Num() > 0) Result->SetArrayField(TEXT("titles"), TitlesJson);
+	if (ClassesJson.Num() > 0) Result->SetArrayField(TEXT("nodeClasses"), ClassesJson);
+	if (!VariableName.IsEmpty())
+	{
+		Result->SetStringField(TEXT("variableName"), VariableName);
+		Result->SetStringField(TEXT("variableAccess"), VariableAccess);
+	}
+	Result->SetBoolField(TEXT("includeNestedGraphs"), bIncludeNestedGraphs);
+	Result->SetBoolField(TEXT("authoredOnly"), bAuthoredOnly);
+
+	// What was walked and what was passed over, so an empty result can be told
+	// apart from a filter that skipped the graph the node was in.
+	TSharedPtr<FJsonObject> Stats = MakeShared<FJsonObject>();
+	Stats->SetNumberField(TEXT("graphsInBlueprint"), AllGraphs.Num());
+	Stats->SetNumberField(TEXT("graphsScanned"), GraphsScanned);
+	Stats->SetNumberField(TEXT("graphsSkippedAsNested"), GraphsSkippedAsNested);
+	Stats->SetNumberField(TEXT("graphsSkippedAsGenerated"), GraphsSkippedAsGenerated);
+	Stats->SetNumberField(TEXT("nodesScanned"), NodesScanned);
+	Result->SetObjectField(TEXT("stats"), Stats);
+	if (bTruncatedAtMaxHits)
+	{
+		Result->SetBoolField(TEXT("truncatedAtMaxHits"), true);
+		Result->SetNumberField(TEXT("maxHits"), MaxCollectedHits);
+	}
+
+	MCPPagination::EmitPage(Page, Hits, TEXT("nodes"), Result, !bTruncatedAtMaxHits);
+	return MCPResult(Result);
 }
 
 TSharedPtr<FJsonValue> FBlueprintHandlers::SearchCallSites(const TSharedPtr<FJsonObject>& Params)

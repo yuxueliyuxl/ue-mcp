@@ -14,6 +14,8 @@
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
 #include "Components/SceneComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
 #include "EditorAssetLibrary.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -24,7 +26,7 @@
 
 #include <type_traits>
 
-// Engine API tiers. One macro per supported minor version, so a gate reads the
+// Engine API version gates. One macro per supported minor version, so a gate reads the
 // same everywhere and nobody writes a second scheme. The supported range is
 // UE 5.4 through 5.8; 5.4 is the floor, which is why UE_MCP_HAS_5_4_API is
 // true for every engine the plugin builds against and exists only so a gate
@@ -37,7 +39,7 @@
 // UPCGEditorGraphNodeBase, UIKRetargeterController::AssignIKRigToAllOps, etc.
 #define UE_MCP_HAS_5_5_API ((ENGINE_MAJOR_VERSION > 5) || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5))
 
-// True on UE 5.6+ (and any future 6.x). The tier between 5.5 and 5.7, kept so
+// True on UE 5.6+ (and any future 6.x). The gate between 5.5 and 5.7, kept so
 // an API that arrived in 5.6 is gated by name rather than by an open-coded
 // ENGINE_MINOR_VERSION test.
 #define UE_MCP_HAS_5_6_API ((ENGINE_MAJOR_VERSION > 5) || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6))
@@ -55,6 +57,56 @@
 // (added in 5.8; the status module carries its own copy of this macro because
 // it must not depend on this one).
 #define UE_MCP_HAS_5_8_API ((ENGINE_MAJOR_VERSION > 5) || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8))
+
+// ── Engine API shims ─────────────────────────────────────────────────────────
+//
+// Where an engine API was renamed or wrapped between 5.4 and 5.8, the shim goes
+// here rather than in a handler, so two handlers cannot end up with two
+// spellings of the same rule. Headers that moved live in MCPEngineCompat.h.
+
+/** UStaticMesh Nanite settings. 5.5 added the accessor pair; 5.4 has only the
+ *  member, which 5.7 in turn deprecated direct access to. */
+inline FMeshNaniteSettings MCPGetNaniteSettings(const UStaticMesh* Mesh)
+{
+	if (!Mesh) return FMeshNaniteSettings();
+#if UE_MCP_HAS_5_5_API
+	return Mesh->GetNaniteSettings();
+#else
+	return Mesh->NaniteSettings;
+#endif
+}
+
+/** Counterpart to MCPGetNaniteSettings. The caller still owns Modify(). */
+inline void MCPSetNaniteSettings(UStaticMesh* Mesh, const FMeshNaniteSettings& InSettings)
+{
+	if (!Mesh) return;
+#if UE_MCP_HAS_5_5_API
+	Mesh->SetNaniteSettings(InSettings);
+#else
+	Mesh->NaniteSettings = InSettings;
+#endif
+}
+
+/** Per-component Nanite opt-outs. 5.5 wrapped the bitfields in accessors. */
+inline bool MCPIsDisallowNanite(const UStaticMeshComponent* Component)
+{
+	if (!Component) return false;
+#if UE_MCP_HAS_5_5_API
+	return Component->IsDisallowNanite();
+#else
+	return Component->bDisallowNanite != 0;
+#endif
+}
+
+inline bool MCPIsForceDisableNanite(const UStaticMeshComponent* Component)
+{
+	if (!Component) return false;
+#if UE_MCP_HAS_5_5_API
+	return Component->IsForceDisableNanite();
+#else
+	return Component->bForceDisableNanite != 0;
+#endif
+}
 
 // ── Quick result builders ────────────────────────────────────────────────────
 
@@ -582,10 +634,10 @@ inline AActor* MCPFindActorByPath(UWorld* World, const FString& Path)
  *  is the same on every run rather than whatever the actor iterator happened
  *  to produce that time.
  *
- *  The tiers do not blend: a token that is one actor's label and another
+ *  The passes do not blend: a token that is one actor's label and another
  *  actor's internal name resolves to the label match alone, because the label
  *  is what the outliner shows and what a caller types. Name and path answer
- *  only when the label tier found nothing (#806). */
+ *  only when the label pass found nothing (#806). */
 inline void MCPCollectActorsByToken(
 	UWorld* World,
 	const FString& Token,
@@ -614,7 +666,7 @@ inline void MCPCollectActorsByToken(
 	});
 }
 
-/** Which tier of MCPCollectActorsByToken produced a match, for the message. */
+/** Which pass of MCPCollectActorsByToken produced a match, for the message. */
 inline const TCHAR* MCPDescribeActorMatchTier(const FString& Token, AActor* Match)
 {
 	if (Match && Match->GetActorLabel() == Token) return TEXT("editor label");
@@ -1405,6 +1457,20 @@ namespace MCPClassResolve
 				{
 					Add(Trimmed + TEXT("_C"));
 				}
+
+				// A /Script path names a module, and modules move between them:
+				// UPhysicalMaterial is /Script/PhysicsCore.PhysicalMaterial, not
+				// /Script/Engine.PhysicalMaterial, which is the spelling older
+				// documentation uses and the one this resolver's own "not found"
+				// text recommends. The leaf name is added LAST, so an exact path
+				// still wins and this is only reached when no spelling of the
+				// path matched anything at all.
+				if (PackagePart.StartsWith(TEXT("/Script/")))
+				{
+					Add(ObjectPart);
+					const FString StrippedLeaf = StripPrefix(ObjectPart);
+					if (StrippedLeaf != ObjectPart) Add(StrippedLeaf);
+				}
 			}
 			else
 			{
@@ -1829,6 +1895,7 @@ inline TSharedPtr<FJsonValue> MCPAssetLoadError(const FString& AssetPath, const 
  *  gets element 0 and nothing else, and the value reads as a plain scalar.
  *
  *  That is how #927 hid two thirds of RecastNavMesh's NavMeshResolutionParams:
+ *  lint-prose-allow: tier  RecastNavMesh's own name for its three generation tiers
  *  the Low tier was reported as if it were the whole property while the engine
  *  was generating from Default and High, so a navmesh diagnosis was performed
  *  against numbers the engine was not using.
