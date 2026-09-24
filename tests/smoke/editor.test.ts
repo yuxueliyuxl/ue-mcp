@@ -148,6 +148,32 @@ describe("editor - open_asset safety (#17)", () => {
   });
 });
 
+describe("editor - open asset editors (#1112)", () => {
+  it("get_open_asset_editors answers whether or not anything is open", async () => {
+    const r = await callBridge(bridge, "get_open_asset_editors");
+    expect(r.ok, r.error).toBe(true);
+    const result = r.result as Record<string, unknown>;
+    expect(result.success).toBe(true);
+    // "Nothing is open" is an answer, so the shape never depends on the layout.
+    expect(Array.isArray(result.editors)).toBe(true);
+    expect(typeof result.count).toBe("number");
+    expect(typeof result.editorApplicationFocused).toBe("boolean");
+    expect(typeof result.focusNote).toBe("string");
+  });
+
+  it("reports an asset it was told to open", async () => {
+    const opened = await callBridge(bridge, "open_asset", { assetPath: "/Engine/BasicShapes/Cube" });
+    expect(opened.ok, opened.error).toBe(true);
+    if ((opened.result as Record<string, unknown>)?.success !== true) return;
+
+    const r = await callBridge(bridge, "get_open_asset_editors");
+    expect(r.ok, r.error).toBe(true);
+    const result = r.result as Record<string, unknown>;
+    const editors = result.editors as Array<Record<string, unknown>>;
+    expect(editors.some((e) => e.assetName === "Cube")).toBe(true);
+  });
+});
+
 describe("editor - live object access (#802)", () => {
   it("find_object resolves an exact path", async () => {
     const r = await callBridge(bridge, "find_object", { objectPath: "/Engine/BasicShapes/Cube.Cube" });

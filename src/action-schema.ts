@@ -21,6 +21,7 @@
  * and a unit test gates the whole surface on it.
  */
 import { z } from "zod";
+import { ROUTING_PARAM_NAMES } from "./routing-params.js";
 import type { ActionEffectSource, ActionSpec, ToolDef } from "./types.js";
 import type { ActionClass } from "./action-class.js";
 
@@ -695,8 +696,11 @@ export function forwardedParams(spec: ActionSpec): string[] {
 
 /** Routing instructions the dispatcher consumes and strips before a handler
  *  ever sees them. They are real wire parameters, so they are reported, but
- *  they are never counted as drift against an action's own documentation. */
-const ROUTING_PARAMS: ReadonlySet<string> = new Set(["action", "timeoutMs", "select", "omit", "editor", "toEditor"]);
+ *  they are never counted as drift against an action's own documentation.
+ *
+ *  Also the set a generated surface must never declare, so
+ *  scripts/generate-epic-actions.mjs imports it rather than keeping a copy. */
+export const ROUTING_PARAMS: ReadonlySet<string> = new Set(ROUTING_PARAM_NAMES);
 
 /** Build the full schema for one action of one tool. */
 export function actionSchema(tool: ToolDef, action: string): ActionSchema {

@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { handlerTaskClass } from "../../src/flow/task-factory.js";
+import { buildFlowRegistry } from "../../src/flow/registry.js";
+import { buildMicroGateway } from "../../src/lean-context.js";
+import { categoryTool } from "../../src/types.js";
 import { guardFor, forgetGuard, type BlockingDialog } from "../../src/dialog-guard.js";
 import type { EditorSession } from "../../src/session.js";
 import type { FlowContext } from "../../src/flow/context.js";
@@ -84,27 +87,31 @@ describe("a modal appearing mid-flow stops the steps after it", () => {
     }
   });
 
+  // A micro step names tools.call; the registry creates the target task, so the
+  // guard judges respond_to_dialog, never the wrapper. Judging "tools.call"
+  // refused the one call that clears a dialog.
+  const viaGateway = async (mode: "auto" | "interactive") => {
+    const session = armed(true, mode);
+    sessions.push(session);
+    const fn = vi.fn(async () => ({ ok: true }));
+    const editor = categoryTool("editor", "Editor", {
+      respond_to_dialog: { kind: "handler", effect: "mutate", handler: fn },
+    });
+    const registry = buildFlowRegistry([buildMicroGateway([editor]), editor]);
+    const task = await registry.create("tools.call", { session } as unknown as FlowContext, {
+      category: "editor", method: "respond_to_dialog", args: {},
+    });
+    return { result: (await task.run()) as unknown as Record<string, unknown>, fn };
+  };
+
   it("unwraps the micro gateway instead of judging the wrapper", async () => {
-    // The gateway arrives as one task carrying the real category and method in
-    // its options. Asking the allowlist about "tools.call" refused
-    // respond_to_dialog, so micro mode could never escape a dialog.
-    const { result, fn } = await run(
-      "tools.call",
-      true,
-      { category: "editor", method: "respond_to_dialog" },
-      "auto",
-    );
+    const { result, fn } = await viaGateway("auto");
     expect(result.success).toBe(true);
     expect(fn).toHaveBeenCalledTimes(1);
   });
 
   it("unwraps the gateway when refusing it too, so the wrapper is not a way past the mode", async () => {
-    const { result, fn } = await run(
-      "tools.call",
-      true,
-      { category: "editor", method: "respond_to_dialog" },
-      "interactive",
-    );
+    const { result, fn } = await viaGateway("interactive");
     expect(result.success).toBe(false);
     expect(fn).not.toHaveBeenCalled();
   });

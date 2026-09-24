@@ -367,6 +367,21 @@ Being on this list is not an exemption from saying so. Each of these owes the ca
 
 `level.load` used to be on this list and is not any more: it captures the level that was open and emits the `load_level` call that returns to it.
 
+## Input mapping persistence
+
+`gameplay(add_imc_mapping)`, `remove_imc_mapping`, `set_imc_mapping_key`,
+`set_imc_mapping_action`, and `set_mapping_modifiers` save their Input Mapping
+Context by default. The `asset(add_input_mapping)` and `remove_input_mapping`
+aliases accept the same optional `save` boolean. `save=false` keeps the edit in
+memory; inspect `saved`, `persisted`, `packageDirty`, and `persistError` before
+relying on it. With `save=true`, a read-only, protected, or unmounted context is
+refused before anything changes (`reason: package_not_writable`). A save that
+still fails reports failure even though the in-memory edit succeeded. An
+unchanged call with `save=true` saves pending edits, including edits from an
+earlier `save=false` call, and skips the write when nothing is pending. Rollback
+preserves the original call's `save` choice, so undoing a deferred edit does not
+save other pending edits.
+
 ## Where the conversion stands
 
 The numbers move every time anyone touches a handler, so the live answer is the audit rather than a table here:

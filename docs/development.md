@@ -41,6 +41,8 @@ npm run build          # UE C++ plugin build (requires editor closed)
 
 `npx tsc` emits the TypeScript server into `dist/`. `npm run build` is the C++ plugin build that runs Unreal's build tool against the test project and requires the editor to be closed first.
 
+For mesh edge connectivity, use `FMeshDescription::GetEdgeConnectedTriangleIDs`, as UV island inspection does. It returns an array view without copying triangle IDs; `GetEdgeConnectedTriangles` is deprecated.
+
 The build script only ever builds the `ue_mcpEditor` target against the bundled `tests/ue_mcp/ue_mcp.uproject`, and it refuses to start if that resolves anywhere else. It also passes `-NoEngineChanges`, so Unreal itself aborts the build and prints the offending file list if the build would overwrite a file that already exists under the engine tree. That is what keeps a test build from invalidating the outputs of a shared source engine you use for other work.
 
 Engine selection order is `UE_MCP_TEST_ENGINE_ROOT`, then `UE_BUILD_TOOL_PATH`, then the default install locations. A pinned root that has no build tool is an error rather than a silent fallback to an engine you did not ask for.
@@ -144,6 +146,16 @@ npm run test:unit
 ```
 
 These also run in CI on every PR.
+
+### Volume placement regression
+
+`npm run test:automation -- --filter UE.MCP.Level.PlaceVolume` checks that
+`level(place_actor)` initializes native volume brushes with a 200 cm cube,
+preserves requested location, rotation and scale, and leaves existing custom
+brushes and ordinary actor placement unchanged. It checks polygon geometry,
+bounds and collision body setup in a disposable editor world, then restores
+the original editor world. Run it through the automation harness against
+`tests/ue_mcp/ue_mcp.uproject` after deploying and rebuilding the plugin.
 
 ### Smoke Tests
 
@@ -266,6 +278,12 @@ export const myfeatureTool: ToolDef = categoryTool(
 
 2. Register it in `src/index.ts`.
 
+Category handlers that invoke another action in their own category must route
+that call through the active `ToolDef.handler` from `ctx.getToolGraph()`. That
+keeps session-injected actions and the shared timeout, path repair, parameter
+folding, and result projection pipeline. Use the exported base tool only when
+the context has no registry graph accessor, such as a direct unit invocation.
+
 ### C++ Side
 
 1. Create handler files in `plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/`
@@ -274,6 +292,8 @@ export const myfeatureTool: ToolDef = categoryTool(
 
 ## C++ Plugin Development
 
+Native USTRUCTs are registered without the leading `F`: `FTableRowBase` is the `UScriptStruct` named `TableRowBase`, path `/Script/Engine.TableRowBase`. `MCPResolveScriptStruct` in `HandlerUtils.h` is the shared lookup for `reflection(reflect_struct)` and `asset(create_datatable)`. It tries the literal spelling first, then strips one leading `F` from the name, including the leaf of a `/Script/Module.FName` path. Only `reflect_struct` also tries adding one `F`. A short name shared by more than one loaded struct is an error that lists the qualified `/Script/Module.Name` candidates, never an arbitrary pick. Shared header, not a file-local copy: see "File-local helpers and the unity build" below.
+
 The plugin source lives in `plugin/ue_mcp_bridge/`. When you modify C++ handler code:
 
 1. Edit the source in `plugin/ue_mcp_bridge/`
@@ -281,6 +301,24 @@ The plugin source lives in `plugin/ue_mcp_bridge/`. When you modify C++ handler 
 3. In the editor, use **Live Coding** (Ctrl+Alt+F11) or `editor(action="hot_reload")` to reload
 
 For a full editor restart: `editor(action="restart_editor")`
+
+### JSON object range loops
+
+Iterate `FJsonObject::Values` with `const auto&` and convert the key to `FString` inside the body if needed. UE 5.8 changed the key type, so an explicit `TPair<FString, TSharedPtr<FJsonValue>>` loop variable trips Clang's `-Wrange-loop-construct`, an error on Linux. `tests/unit/json-object-range-loops.test.ts` enforces this.
+
+### Blueprint graph node flags
+
+Construct persisted Blueprint and animation graph nodes with `RF_Transactional`.
+`UEdGraph::AddNode` does not set this flag. Without it, opening the asset runs a
+transactional repair that dirties the Blueprint and requests another save.
+Use `NewObject<TNode>(Graph, NAME_None, RF_Transactional)`, or
+`NewObject<UEdGraphNode>(Graph, NodeClass, NAME_None, RF_Transactional)` when the
+class is resolved at runtime. The flag makes node edits eligible for editor
+transactions; it does not wrap bridge calls in undo transactions.
+
+The native filter `UE.MCP.Blueprint.TransactionalNodes` exercises all five
+Blueprint construction paths and representative animation handlers, then saves,
+evicts and reloads temporary assets before checking the editor's repair step.
 
 ### File-local helpers and the unity build
 

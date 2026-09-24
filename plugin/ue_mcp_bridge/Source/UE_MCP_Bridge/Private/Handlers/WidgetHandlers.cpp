@@ -133,24 +133,19 @@ static FString NormalizeWidgetBlueprintObjectPath(const FString& InAssetPath)
 	return Path;
 }
 
-/**
- * Accept a candidate only if it is a WidgetBlueprint the editor still consults.
- *
- * RF_NewerVersionExists is the flag a package reload leaves on the object it
- * replaced. Handing one of those back is exactly the failure #972 describes
- * after asset(force_reload): every write lands on a corpse, the real asset
- * never changes, and nothing reports an error. IsValid covers null and garbage.
- */
+/** A WidgetBlueprint the editor still consults. Liveness is
+ *  MCPIsLiveAssetObject's answer; what is widget-specific is the cast and
+ *  mapping a generated-class path back to its blueprint. */
 static UWidgetBlueprint* AsLiveWidgetBlueprint(UObject* Candidate, FString& OutFoundClass)
 {
-	if (!IsValid(Candidate)) return nullptr;
-	if (Candidate->HasAnyFlags(RF_NewerVersionExists)) return nullptr;
+	if (!MCPIsLiveAssetObject(Candidate)) return nullptr;
 
 	if (UWidgetBlueprint* AsBlueprint = Cast<UWidgetBlueprint>(Candidate))
 	{
 		return AsBlueprint;
 	}
-	// A caller who passed the generated class path gets the blueprint behind it.
+	// A UClass reaches here only from a caller that resolved one directly; the
+	// _C spelling is normalized away before the lookup.
 	if (UClass* AsClass = Cast<UClass>(Candidate))
 	{
 		if (UWidgetBlueprint* Generated = Cast<UWidgetBlueprint>(AsClass->ClassGeneratedBy))
@@ -160,24 +155,6 @@ static UWidgetBlueprint* AsLiveWidgetBlueprint(UObject* Candidate, FString& OutF
 	}
 	OutFoundClass = Candidate->GetClass()->GetName();
 	return nullptr;
-}
-
-/** True when the AssetRegistry or the filesystem says the asset is really there. */
-static bool WidgetBlueprintAssetExists(const FString& ObjectPath, const FString& PackageName)
-{
-	if (!PackageName.IsEmpty() && FPackageName::DoesPackageExist(PackageName))
-	{
-		return true;
-	}
-	// An asset created this session and not yet saved has no file, so the
-	// registry is the only witness. Never load anything to answer this.
-	if (FAssetRegistryModule* ARM =
-		FModuleManager::GetModulePtr<FAssetRegistryModule>(TEXT("AssetRegistry")))
-	{
-		const FAssetData Data = ARM->Get().GetAssetByObjectPath(FSoftObjectPath(ObjectPath));
-		if (Data.IsValid()) return true;
-	}
-	return false;
 }
 
 FWidgetBlueprintResolve ResolveWidgetBlueprint(const FString& AssetPath)
@@ -190,58 +167,16 @@ FWidgetBlueprintResolve ResolveWidgetBlueprint(const FString& AssetPath)
 		return Out;
 	}
 
-	const FString PackageName = FPackageName::ObjectPathToPackageName(Out.ObjectPath);
-	Out.bAssetExists = WidgetBlueprintAssetExists(Out.ObjectPath, PackageName);
+	Out.bAssetExists = MCPAssetExistsWithoutLoading(MCPAssetPathForms(Out.ObjectPath));
 
-	// Step 1. The object hash, first and cheapest. An asset already in memory
-	// answers here without the AssetRegistry round trip UEditorAssetLibrary
-	// makes, which is the step that was intermittently returning null.
+	// One ladder, the one every asset action uses. Each of its steps resolves
+	// the same path, so a step that finds the wrong type is the answer and
+	// continuing past it would only find the same object again.
 	if (UWidgetBlueprint* Live =
-		AsLiveWidgetBlueprint(FindObject<UObject>(nullptr, *Out.ObjectPath), Out.FoundClass))
+		AsLiveWidgetBlueprint(MCPLoadAssetObject(Out.ObjectPath), Out.FoundClass))
 	{
 		Out.Blueprint = Live;
 		return Out;
-	}
-
-	// Step 2. The historical path. Kept because it understands more path
-	// spellings than the object hash does and it is what every other handler
-	// in this plugin uses.
-	if (UWidgetBlueprint* Live =
-		AsLiveWidgetBlueprint(UEditorAssetLibrary::LoadAsset(AssetPath), Out.FoundClass))
-	{
-		Out.Blueprint = Live;
-		return Out;
-	}
-
-	// Step 3. Load the object directly, bypassing the registry entirely. Only
-	// worth attempting when something really is there: StaticLoadObject on a
-	// path with no package behind it can force a blocking package search.
-	if (Out.bAssetExists)
-	{
-		if (UWidgetBlueprint* Live =
-			AsLiveWidgetBlueprint(LoadObject<UObject>(nullptr, *Out.ObjectPath), Out.FoundClass))
-		{
-			Out.Blueprint = Live;
-			return Out;
-		}
-
-		// Step 4. "Failed to find object 'Object /Game/x/WBP_Foo.WBP_Foo'" in
-		// the log means the package resolved but the object lookup inside it
-		// did not. Load the package explicitly and look again.
-		if (!PackageName.IsEmpty())
-		{
-			if (UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None))
-			{
-				Package->FullyLoad();
-				const FString ObjectName = FPackageName::ObjectPathToObjectName(Out.ObjectPath);
-				if (UWidgetBlueprint* Live =
-					AsLiveWidgetBlueprint(FindObject<UObject>(Package, *ObjectName), Out.FoundClass))
-				{
-					Out.Blueprint = Live;
-					return Out;
-				}
-			}
-		}
 	}
 
 	if (!Out.FoundClass.IsEmpty())
@@ -273,18 +208,24 @@ TSharedPtr<FJsonValue> WidgetBlueprintResolveError(
 	case EWidgetBlueprintResolveFailure::Unresolvable:
 		// The distinction the caller needs: the asset is there, so retrying or
 		// reloading the bridge is the move. Renaming or re-creating it is not.
+		//
+		// #1065: and if play is running, say so first. A WidgetBlueprint that
+		// was present and valid failed here for no reason but PIE, and the
+		// message named a stale handle, which sent the debugging somewhere
+		// else entirely. The engine logs the real reason where a bridge caller
+		// never sees it.
 		return MCPError(FString::Printf(
 			TEXT("'%s' exists but could not be resolved to a live WidgetBlueprint on this call. ")
 			TEXT("The object handle went stale (a package reload or a GC pass replaced it), the asset is not missing. ")
-			TEXT("Retry the call; if it keeps failing, editor(action=\"reload_bridge\") clears it."),
-			*AssetPath));
+			TEXT("Retry the call; if it keeps failing, editor(action=\"reload_bridge\") clears it.%s"),
+			*AssetPath, *MCPPlayInEditorLoadNote()));
 
 	case EWidgetBlueprintResolveFailure::NotFound:
 	default:
 		return MCPError(FString::Printf(
 			TEXT("No asset exists at '%s'. Nothing of that name is in the AssetRegistry and no package of that name is on disk. ")
-			TEXT("Check the path with widget(action=\"list\") or asset(action=\"search\")."),
-			*AssetPath));
+			TEXT("Check the path with widget(action=\"list\") or asset(action=\"search\").%s"),
+			*AssetPath, *MCPPlayInEditorLoadNote()));
 	}
 }
 

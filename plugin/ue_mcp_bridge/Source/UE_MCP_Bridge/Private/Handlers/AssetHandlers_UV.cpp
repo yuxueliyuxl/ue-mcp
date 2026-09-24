@@ -681,7 +681,7 @@ void MCPUvBuildIslands(
 	int32 SeamEdges = 0;
 	for (const FEdgeID EdgeID : Desc.Edges().GetElementIDs())
 	{
-		const TArray<FTriangleID> Connected = Desc.GetEdgeConnectedTriangles(EdgeID);
+		const TArrayView<const FTriangleID> Connected = Desc.GetEdgeConnectedTriangleIDs(EdgeID);
 		if (Connected.Num() < 2) continue;
 
 		const FVertexID V0 = Desc.GetEdgeVertex(EdgeID, 0);

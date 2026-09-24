@@ -28,6 +28,9 @@
 #include "AssetHandlers.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
 #include "HandlerJsonProperty.h"
 
 #include "Dom/JsonObject.h"
@@ -129,6 +132,25 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateSubobject(const TSharedPtr<FJsonObj
 	{
 		return MCPClassUnusableError(ClassName, Class, TEXT("class_object"),
 			TEXT("it is a class object rather than an instantiable type. Pass the class you want an INSTANCE of."));
+	}
+
+	// A node built here gets no AllocateDefaultPins and the asset as its outer,
+	// so it can never be wired and the graph will not open (#1059).
+	if (Class->IsChildOf(UEdGraphNode::StaticClass()))
+	{
+		return MCPClassUnusableError(ClassName, Class, TEXT("graph_node"),
+			TEXT("a graph node is created through its graph's schema, which allocates its pins and parents it to "
+			     "the graph. Constructed here it would get neither: no pins, so it can never be connected, and the "
+			     "asset as its outer instead of the graph. The result opens as a broken node. Read the graph with "
+			     "asset(action=\"read_graph\") and author nodes through the editor or an action that knows the "
+			     "schema for that graph type."));
+	}
+	if (Class->IsChildOf(UEdGraph::StaticClass()))
+	{
+		return MCPClassUnusableError(ClassName, Class, TEXT("graph_object"),
+			TEXT("a graph is created by the system that owns it (a Blueprint, a Material, a CustomizableObject), "
+			     "which gives it its schema. One constructed here would have no schema and could hold no valid "
+			     "nodes."));
 	}
 
 	// outer=asset gives "/Game/Foo/DA_Thing.DA_Thing:Name", the ordinary

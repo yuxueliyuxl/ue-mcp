@@ -232,6 +232,27 @@ describe("withBridgeSnapshot", () => {
     expect(merged.summary).toContain("Yes, No");
   });
 
+  it("does not call the editor blocked for a prompt that parks nothing", () => {
+    // #1118: an ordinary editor window is reported and is not an outage. The
+    // summary still names it, because an unanswered question is worth seeing;
+    // `blocked` is what callers act on and it stays false.
+    const merged = withBridgeSnapshot(blindState(), {
+      phase: "ready",
+      modal: { title: "Find Results", message: "3 results", buttons: [], blocksGameThread: false },
+    });
+    expect(merged.blocked).toBe(false);
+    expect(merged.summary).toContain("Find Results");
+    expect(merged.summary).toContain("non-blocking prompt");
+  });
+
+  it("still calls it blocked when the prompt says it parks the game thread", () => {
+    const merged = withBridgeSnapshot(blindState(), {
+      phase: "ready",
+      modal: { title: "Save Content", message: "m", buttons: ["Cancel"], blocksGameThread: true },
+    });
+    expect(merged.blocked).toBe(true);
+  });
+
   it("says the probe found nothing when the probe itself did run", () => {
     const merged = withBridgeSnapshot(blindState({ processProbeFailed: false }), { phase: "ready" });
     expect(merged.running).toBe(true);

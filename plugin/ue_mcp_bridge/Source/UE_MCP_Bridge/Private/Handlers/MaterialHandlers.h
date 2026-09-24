@@ -19,6 +19,9 @@ private:
 	static TSharedPtr<FJsonValue> SetMaterialBaseColor(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddMaterialExpression(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ListMaterialExpressions(const TSharedPtr<FJsonObject>& Params);
+	// #1083/#1115: paged expression graph with input wiring and root material
+	// connections, or one node and its sources when expressionIndex is given.
+	static TSharedPtr<FJsonValue> ReadMaterialGraph(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ListMaterialParameters(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RecompileMaterial(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateMaterialInstance(const TSharedPtr<FJsonObject>& Params);
@@ -64,6 +67,14 @@ private:
 
 	// Helper to find an expression by name (description or class) within a material
 	static UMaterialExpression* FindExpressionByName(UMaterial* Material, const FString& ExpressionName);
+
+	// Shared paged expression walk for list_material_expressions and
+	// read_material_graph. ActionName is the cursor collection identity.
+	static TSharedPtr<FJsonValue> ListMaterialExpressionsInternal(
+		const TSharedPtr<FJsonObject>& Params,
+		const TCHAR* ActionName,
+		bool bIncludeInputs,
+		bool bIncludeRootConnections);
 
 	// v0.7.9 - material depth
 	static TSharedPtr<FJsonValue> DuplicateMaterial(const TSharedPtr<FJsonObject>& Params);

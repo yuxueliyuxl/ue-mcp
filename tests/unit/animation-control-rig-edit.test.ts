@@ -263,10 +263,13 @@ describe("animation Control Rig edit workflow", () => {
 
     expect(begin).toContain("Baseline first");
     expect(begin).toContain("read_control_rig_hierarchy/read_control_rig_graph");
-    expect(begin).toContain("epic_create");
-    expect(begin).toContain("epic_import_bones_from_asset");
-    expect(begin).toContain("epic_add_control");
-    expect(begin).toContain("epic_add_backward_solve_graph");
+    // nativeTools can withhold the wrapped actions, so only the guide names them.
+    expect(begin).toContain("ControlRig toolset");
+    expect(begin).toContain("epic(call_tool)");
+    expect(begin).not.toMatch(/epic_[a-z]/);
+    for (const action of ["epic_create", "epic_import_bones_from_asset", "epic_add_control", "epic_add_backward_solve_graph"]) {
+      expect(guide).toContain(action);
+    }
     expect(begin).toContain("unchanged source round-trip");
     expect(begin).toContain("rejects rigs without inverse execution");
     expect(animationTool.schema.controlRigPath.description).toContain("verified baseline");

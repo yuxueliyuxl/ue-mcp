@@ -237,8 +237,8 @@ export class EditorBridge implements IBridge {
   private idCounter = 0;
 
   /**
-   * #821: what the bridge said it was, answered on connect. Null before the
-   * first connection. `legacy` marks a plugin old enough not to answer at all.
+   * #821: what the current bridge said it was, answered on connect. Null while
+   * disconnected or awaiting its handshake. `legacy` marks an unanswered handshake.
    */
   public capabilities: BridgeCapabilities | null = null;
 
@@ -598,6 +598,7 @@ export class EditorBridge implements IBridge {
         if (this.ws === ws) {
           ws.terminate();
           this.ws = null;
+          this.capabilities = null;
         }
         reject(new McpError(ErrorCode.CONNECTION_LOST, `Failed to send bridge call '${method}': ${err.message}`));
       });
@@ -624,6 +625,7 @@ export class EditorBridge implements IBridge {
     this.pending.clear();
     const ws = this.ws;
     this.ws = null;
+    this.capabilities = null;
     if (!ws) return;
     if (opts?.graceful) ws.close();
     else ws.terminate();
@@ -655,7 +657,7 @@ export class EditorBridge implements IBridge {
         if (settled) return;
         settled = true;
         detach();
-        this.capabilities = null;
+        if (this.ws === ws) this.capabilities = null;
         resolve({ ...LEGACY_CAPABILITIES });
       };
 
@@ -663,6 +665,12 @@ export class EditorBridge implements IBridge {
         if (settled) return;
         settled = true;
         detach();
+        // An obsolete handshake must still settle and detach, but only the
+        // current open socket can publish metadata or mismatch diagnostics.
+        if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+          resolve(capabilities);
+          return;
+        }
         this.capabilities = capabilities;
 
         const mismatch = describeProtocolMismatch(capabilities);
@@ -790,6 +798,7 @@ export class EditorBridge implements IBridge {
       }
       this.pending.clear();
       this.ws = null;
+      this.capabilities = null;
     });
 
     ws.on("error", (err) => {

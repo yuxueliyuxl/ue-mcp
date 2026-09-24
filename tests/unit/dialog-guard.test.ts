@@ -38,6 +38,7 @@ function make(over: Omit<Partial<GuardDeps>, "mode"> & { mode?: DialogMode } = {
     elicit: over.elicit,
     readSnapshot: over.readSnapshot,
     isConnected: over.isConnected,
+    askWaitMs: over.askWaitMs,
   };
   return new DialogGuard(deps);
 }
@@ -295,6 +296,65 @@ describe("detection does not depend on somebody making a call", () => {
       expect(guard.current?.title).toBe("Restore Packages");
       // And it blocks, with no call having been refused first.
       expect((await guard.check("project.search_tools", "action")).allow).toBe(false);
+    } finally {
+      guard.stopWatching();
+    }
+  });
+
+  it("does not gate on a prompt the game thread is not parked behind", async () => {
+    // #1118: the Find results window, an undocked panel, a popped-out asset
+    // editor. The plugin reports them so a quit is never sent at an unanswered
+    // question, and they hold nothing, so every call still has to run. Before
+    // this, one of them refused every action - offline ones included - for as
+    // long as it stayed open, with no button that could clear it.
+    const guard = make({
+      readSnapshot: () => ({
+        modal: { title: "Find Results", message: "3 results", buttons: [], blocksGameThread: false },
+        ageSeconds: 0,
+      }),
+      // The editor agrees there is nothing to answer. The point of the case is
+      // that the snapshot no longer contradicts it.
+      probe: async () => empty,
+    });
+    guard.note(DIALOG);
+    guard.startWatching(20);
+    try {
+      expect(guard.current).toBeNull();
+      expect((await guard.check("project.search_tools", "action")).allow).toBe(true);
+    } finally {
+      guard.stopWatching();
+    }
+  });
+
+  it("still gates on a prompt that says it parks the game thread", async () => {
+    const guard = make({
+      readSnapshot: () => ({
+        modal: { title: "Save Content", message: "m", buttons: ["Cancel"], blocksGameThread: true },
+        ageSeconds: 0,
+      }),
+    });
+    guard.startWatching(20);
+    try {
+      expect(guard.current?.title).toBe("Save Content");
+      expect((await guard.check("project.search_tools", "action")).allow).toBe(false);
+    } finally {
+      guard.stopWatching();
+    }
+  });
+
+  it("believes an older plugin that does not say, because silence is not proof of safety", async () => {
+    // The field arrived with #1118. A plugin without it reports the one modal
+    // field it always had, and the conservative reading is the behaviour every
+    // caller already had.
+    const guard = make({
+      readSnapshot: () => ({
+        modal: { title: "Save Content", message: "m", buttons: ["Cancel"] },
+        ageSeconds: 0,
+      }),
+    });
+    guard.startWatching(20);
+    try {
+      expect(guard.current?.title).toBe("Save Content");
     } finally {
       guard.stopWatching();
     }
@@ -1001,7 +1061,7 @@ describe("a dialog that asks a question per item", () => {
     ],
   };
 
-  it("offers a toggle per tickable row, and none for the select-all header", async () => {
+  it("offers the tickable rows as one multi-select, without the select-all header", async () => {
     let schema: any;
     const guard = make({
       mode: "interactive",
@@ -1014,11 +1074,15 @@ describe("a dialog that asks a question per item", () => {
 
     await guard.check("asset.list", "action");
 
-    // The two real rows, keyed by index, titled by the asset.
-    expect(schema.properties.item_1).toMatchObject({ type: "boolean", title: "L_Test", default: true });
-    expect(schema.properties.item_2).toMatchObject({ type: "boolean", title: "M_Rock" });
-    // The header row carries no path, so it is not a question.
-    expect(schema.properties.item_0).toBeUndefined();
+    // One field holding the two real rows, keyed by index, titled by the asset.
+    expect(schema.properties.items).toMatchObject({ type: "array", title: "Assets", default: ["item_1", "item_2"] });
+    expect(schema.properties.button.title).toBe("Submission");
+    expect(schema.properties.items.items.anyOf).toEqual([
+      { const: "item_1", title: "L_Test  /Game/Maps/L_Test" },
+      { const: "item_2", title: "M_Rock  /Game/Mat/M_Rock" },
+    ]);
+    // No field per row: that is what some clients drew as a page per asset.
+    expect(Object.keys(schema.properties)).toEqual(["items", "button"]);
     // The buttons are still the decision.
     expect(schema.properties.button.enum).toContain("Save Selected");
   });
@@ -1031,7 +1095,7 @@ describe("a dialog that asks a question per item", () => {
       probe: async () => ({ dialogs: [SAVE_ITEMS] }),
       elicit: () => (async () => ({
         action: "accept",
-        content: { button: "Save Selected", item_1: true, item_2: false },
+        content: { button: "Save Selected", items: ["item_1"] },
       })) as never,
     });
 
@@ -1043,6 +1107,47 @@ describe("a dialog that asks a question per item", () => {
     ]);
   });
 
+  it("leaves every row as it was when the answer carries no list", async () => {
+    const press = vi.fn(async () => ({ success: true, answered: true }));
+    const guard = make({
+      mode: "interactive",
+      press,
+      probe: async () => ({ dialogs: [SAVE_ITEMS] }),
+      elicit: () => (async () => ({ action: "accept", content: { button: "Save Selected" } })) as never,
+    });
+
+    await guard.check("asset.list", "action");
+
+    expect(press).toHaveBeenCalledWith("Save Selected", [
+      { index: 1, checked: true },
+      { index: 2, checked: true },
+    ]);
+  });
+
+  it("falls back to a boolean per row when the client refuses the multi-select", async () => {
+    const press = vi.fn(async () => ({ success: true, answered: true }));
+    const schemas: any[] = [];
+    const guard = make({
+      mode: "interactive",
+      press,
+      probe: async () => ({ dialogs: [SAVE_ITEMS] }),
+      elicit: () => (async (req: any) => {
+        schemas.push(req.requestedSchema);
+        if (req.requestedSchema.properties.items) throw new Error("unsupported schema");
+        return { action: "accept", content: { button: "Save Selected", item_1: false, item_2: true } };
+      }) as never,
+    });
+
+    await guard.check("asset.list", "action");
+
+    expect(schemas).toHaveLength(2);
+    expect(schemas[1].properties.item_1).toMatchObject({ type: "boolean", title: "L_Test", default: true });
+    expect(press).toHaveBeenCalledWith("Save Selected", [
+      { index: 1, checked: false },
+      { index: 2, checked: true },
+    ]);
+  });
+
   it("presses with one argument when the dialog has nothing to tick", async () => {
     const press = vi.fn(async () => ({ success: true, answered: true }));
     const guard = make({ mode: "interactive", press, elicit: accept("Cancel") });
@@ -1051,5 +1156,67 @@ describe("a dialog that asks a question per item", () => {
     await guard.check("asset.list", "action");
 
     expect(press).toHaveBeenCalledWith("Cancel");
+  });
+});
+
+describe("an answer that arrives after the call stopped waiting (#1076)", () => {
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  it("is still pressed", async () => {
+    // stop_editor gave up waiting, the person answered minutes later, and the
+    // answer went nowhere: the modal stayed up and they had to answer again.
+    const answer = deferred<unknown>();
+    const press = vi.fn(async () => ({ success: true, answered: true }));
+    const guard = make({
+      mode: "interactive",
+      press,
+      askWaitMs: 5,
+      elicit: () => (async () => answer.promise) as never,
+    });
+
+    const decision = await guard.check("asset.list", "action");
+    expect(decision.allow).toBe(false);
+    expect(press).not.toHaveBeenCalled();
+
+    answer.resolve({ action: "accept", content: { button: "Cancel" } });
+    await vi.waitFor(() => expect(press).toHaveBeenCalledWith("Cancel"));
+  });
+
+  it("raises one form, not one per call, while it is open", async () => {
+    const answer = deferred<unknown>();
+    const elicit = vi.fn(async () => answer.promise);
+    const guard = make({ mode: "interactive", askWaitMs: 5, elicit: () => elicit as never });
+
+    await guard.check("asset.list", "action");
+    await guard.check("asset.list", "action");
+
+    expect(elicit).toHaveBeenCalledTimes(1);
+    answer.resolve({ action: "decline" });
+  });
+
+  it("is not pressed on a different dialog that came up meanwhile", async () => {
+    const answer = deferred<unknown>();
+    const press = vi.fn(async () => ({ success: true, answered: true }));
+    let title = "Save Content";
+    const guard = make({
+      mode: "interactive",
+      press,
+      askWaitMs: 5,
+      probe: async () => listing(title),
+      elicit: () => (async () => answer.promise) as never,
+    });
+
+    await guard.check("asset.list", "action");
+    title = "Message Log";
+    answer.resolve({ action: "accept", content: { button: "Cancel" } });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(press).not.toHaveBeenCalled();
   });
 });

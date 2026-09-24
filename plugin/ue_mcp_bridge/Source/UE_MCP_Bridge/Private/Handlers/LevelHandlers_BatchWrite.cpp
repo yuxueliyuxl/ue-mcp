@@ -341,8 +341,9 @@ TSharedPtr<FJsonValue> FLevelHandlers::BatchSetActorProperties(const TSharedPtr<
 
 		TArray<TSharedPtr<FJsonValue>> PropertyRows;
 		bool bActorOk = true;
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*PropertiesObject)->Values)
+		for (const auto& JsonEntry : (*PropertiesObject)->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 			TSharedPtr<FJsonObject> PropertyRow = MakeShared<FJsonObject>();
 			PropertyRow->SetStringField(TEXT("propertyName"), Pair.Key);
 
@@ -1162,8 +1163,9 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnActorsBatch(const TSharedPtr<FJsonOb
 		auto ApplyProperties = [&](const TSharedPtr<FJsonObject>& Properties)
 		{
 			if (!Properties.IsValid()) return;
-			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Properties->Values)
+			for (const auto& JsonEntry : Properties->Values)
 			{
+				const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 				TSharedPtr<FJsonObject> SubParams = MakeShared<FJsonObject>();
 				SubParams->SetStringField(TEXT("actorLabel"), Actor->GetActorLabel());
 				SubParams->SetStringField(TEXT("propertyName"), Pair.Key);

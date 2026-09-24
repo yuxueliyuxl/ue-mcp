@@ -221,6 +221,8 @@ private:
 	static TSharedPtr<FJsonValue> CreateNewLevel(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SaveCurrentLevel(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> OpenAsset(const TSharedPtr<FJsonObject>& Params);
+	// #1112: which asset editors are open, and which one holds focus.
+	static TSharedPtr<FJsonValue> GetOpenAssetEditors(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RunStatCommand(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetScalability(const TSharedPtr<FJsonObject>& Params);
 	// #591 bulk console-variable setter

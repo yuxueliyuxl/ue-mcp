@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { categoryTool, bp, type ActionSpec, type ToolDef } from "../types.js";
+import { categoryTool, bp, EDITOR_TARGET_PARAM, type ToolContext, type ToolDef } from "../types.js";
 import { Vec3, Rotator } from "../schemas.js";
 import { PAGINATION_SCHEMA, paged } from "../pagination.js";
 import { actions as epicActions, schema as epicSchema } from "./epic/niagara.generated.js";
@@ -68,6 +68,16 @@ function coerceModuleInputValue(value: unknown): string | undefined {
   return scalar(value);
 }
 
+/** Whether a batch op's `editor` names the session the batch itself runs on. */
+function targetsSession(ctx: ToolContext, target: unknown): boolean {
+  if (!ctx.sessions || !ctx.session) return false;
+  try {
+    return ctx.sessions.resolve(target) === ctx.session;
+  } catch {
+    return false;
+  }
+}
+
 export const niagaraTool: ToolDef = categoryTool(
   "niagara",
   "Niagara VFX: systems, emitters, spawning, parameters, and graph authoring.",
@@ -121,18 +131,46 @@ export const niagaraTool: ToolDef = categoryTool(
       handler: async (ctx, params) => {
         const opsUnknown = params.ops;
         if (!Array.isArray(opsUnknown)) throw new Error("'ops' must be an array of {action, params}");
+        // A session graph may add or remove actions, and the category handler
+        // owns every piece of per-call preparation. Dispatch each operation
+        // through that active handler instead of duplicating part of it here.
+        // Contexts built outside the registry (mainly direct unit calls) have
+        // no graph accessor, so only those use the exported base tool.
+        // A session with no surface built throws; that is reported per op, like
+        // a graph without niagara, rather than failing the whole call.
+        let unavailable = "Niagara is not available in the active tool graph";
+        let dispatchTool: ToolDef | undefined;
+        try {
+          const graph = ctx.getToolGraph ? ctx.getToolGraph() : undefined;
+          dispatchTool = graph === undefined ? niagaraTool : graph.find((tool) => tool.name === "niagara");
+        } catch (e) {
+          unavailable = `${unavailable}: ${(e as Error).message}`;
+        }
         const results: Array<{ action: string; result?: unknown; error?: string }> = [];
         for (let i = 0; i < opsUnknown.length; i++) {
           const op = opsUnknown[i] as { action?: string; params?: Record<string, unknown> } | undefined;
           const action = op?.action;
           if (!action) { results.push({ action: "(missing)", error: `ops[${i}] missing 'action'` }); return { results, stoppedAt: i }; }
-          const spec = niagaraTool.actions[action];
+          if (!dispatchTool) { results.push({ action, error: unavailable }); return { results, stoppedAt: i }; }
+          const spec = dispatchTool.actions[action];
           if (!spec) { results.push({ action, error: `Unknown niagara action '${action}'` }); return { results, stoppedAt: i }; }
           if (action === "batch") { results.push({ action, error: "nested batch not allowed" }); return { results, stoppedAt: i }; }
+          // A batch runs on one editor. An op naming another would be stripped
+          // and silently run here, so refuse it unless it names this one.
+          const opTarget = dispatchTool.injectedEditorParam ? op.params?.[EDITOR_TARGET_PARAM] : undefined;
+          if (opTarget !== undefined && opTarget !== "" && !targetsSession(ctx, opTarget)) {
+            results.push({
+              action,
+              error: `ops[${i}] targets editor '${String(opTarget)}', but a batch runs on one editor`
+                + `${ctx.session ? ` ('${ctx.session.name}')` : ""}. Put 'editor' on the batch call, or split the batch per editor.`,
+            });
+            return { results, stoppedAt: i };
+          }
           try {
             const subParams = { ...(op.params ?? {}), action } as Record<string, unknown>;
-            const result = await (spec as ActionSpec).handler?.(ctx, subParams)
-              ?? (spec.bridge ? await ctx.bridge.call(spec.bridge, spec.mapParams ? spec.mapParams(subParams) : (() => { const { action: _, ...r } = subParams; return r; })(), spec.timeoutMs) : undefined);
+            // The batch's own budget covers every op that names none of its own.
+            if (subParams.timeoutMs === undefined && ctx.callTimeoutMs !== undefined) subParams.timeoutMs = ctx.callTimeoutMs;
+            const result = await dispatchTool.handler(ctx, subParams);
             results.push({ action, result });
           } catch (e) {
             results.push({ action, error: (e as Error).message });

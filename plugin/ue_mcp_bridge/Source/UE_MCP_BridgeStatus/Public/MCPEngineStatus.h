@@ -67,8 +67,17 @@ public:
 	 * firing while a modal is up, so this is current rather than stale.
 	 *
 	 * Returns false and leaves the outputs alone when nothing is modal.
+	 *
+	 * OutBlocksGameThread separates the two facts a prompt carries: whether a
+	 * question is on screen, and whether the engine is parked behind it. Only
+	 * a window on Slate's modal stack parks it, and only that justifies
+	 * refusing a call that would otherwise have run (#1118).
 	 */
-	bool GetActiveModal(FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons) const;
+	bool GetActiveModal(
+		FString& OutTitle,
+		FString& OutMessage,
+		TArray<FString>& OutButtons,
+		bool* OutBlocksGameThread = nullptr) const;
 
 	/** Coarse lifecycle label ("config init", "modules loaded", "ready"). */
 	void SetPhase(const FString& InPhase);
@@ -85,7 +94,7 @@ public:
 	 * bridge module, which owns the Slate widget walk. Until it loads, the
 	 * snapshot simply reports no dialog rather than pretending to know.
 	 */
-	using FModalProvider = TFunction<bool(FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons)>;
+	using FModalProvider = TFunction<bool(FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons, bool& OutBlocksGameThread)>;
 	void SetModalProvider(FModalProvider Provider);
 
 	/** Remaining shader jobs and asset compiles. Supplied by the bridge module. */
@@ -151,6 +160,10 @@ private:
 	TArray<FSlowTaskEntry> SlowTaskStack;
 
 	bool bModalActive = false;
+	/** The modal is on Slate's modal stack, so the game thread is inside its
+	 *  loop. False for a prompt the editor raised without AddModalWindow,
+	 *  which is on screen and blocks nothing (#1118). */
+	bool bModalBlocksGameThread = false;
 	FString ModalTitle;
 	FString ModalMessage;
 	TArray<FString> ModalButtons;

@@ -77,6 +77,9 @@ function expandTerms(rawTerms: string[]): Set<string> {
 // advanced escape hatches), so they don't out-rank a real dedicated action.
 const DEPRIORITIZE = new Set(["execute_python", "run_python_file", "execute_command"]);
 
+// Wrapped Epic tools a single tool may place ahead of the other hits.
+const EPIC_HITS_PER_TOOL = 2;
+
 /**
  * Search every registered tool + action for a keyword/intent query.
  * The tool graph is imported lazily to avoid a load-time circular dependency
@@ -98,7 +101,7 @@ export function searchToolGraph(tools: SearchableTool[], query: string, limit = 
   // The live graph, not the pristine declaration: discovery has to see the
   // Epic and plugin actions the server actually advertises, and with one graph
   // per editor session those are no longer the same objects (#817).
-  const hitsByHandler = new Map<string, ToolSearchHit>();
+  const hitsByHandler = new Map<string, ToolSearchHit & { epic: boolean }>();
 
   for (const tool of tools) {
     for (const [actionName, spec] of Object.entries(tool.actions ?? {})) {
@@ -117,13 +120,31 @@ export function searchToolGraph(tools: SearchableTool[], query: string, limit = 
 
       // Collapse aliases that route to the same bridge handler (e.g.
       // add_instances / add_hismc_instances) - keep the best-scoring name.
-      const key = `${tool.name}:${spec?.bridge ?? actionName}`;
+      // Generated Epic actions are different tools multiplexed through one
+      // gateway, so their action names remain their search identities.
+      const isEpicGatewayAction = actionName.startsWith("epic_") && spec?.bridge === "epic_call_tool";
+      const key = `${tool.name}:${isEpicGatewayAction ? actionName : spec?.bridge ?? actionName}`;
       const existing = hitsByHandler.get(key);
       if (!existing || score > existing.score) {
-        hitsByHandler.set(key, { tool: tool.name, action: actionName, description: desc, score });
+        hitsByHandler.set(key, { tool: tool.name, action: actionName, description: desc, score, epic: isEpicGatewayAction });
       }
     }
   }
 
-  return [...hitsByHandler.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+  // First-party actions win ties with wrapped Epic tools, and each tool ranks at
+  // most EPIC_HITS_PER_TOOL wrappers in score order. Further wrappers follow
+  // every other hit, so they stay findable without crowding the default page.
+  const ranked = [...hitsByHandler.values()].sort(
+    (a, b) => b.score - a.score || Number(a.epic) - Number(b.epic),
+  );
+  const primary: ToolSearchHit[] = [];
+  const overflow: ToolSearchHit[] = [];
+  const epicPerTool = new Map<string, number>();
+  for (const { epic, ...hit } of ranked) {
+    if (!epic) { primary.push(hit); continue; }
+    const seen = epicPerTool.get(hit.tool) ?? 0;
+    epicPerTool.set(hit.tool, seen + 1);
+    (seen < EPIC_HITS_PER_TOOL ? primary : overflow).push(hit);
+  }
+  return [...primary, ...overflow].slice(0, limit);
 }

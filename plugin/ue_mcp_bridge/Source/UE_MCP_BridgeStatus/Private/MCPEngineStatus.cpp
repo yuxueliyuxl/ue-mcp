@@ -357,8 +357,9 @@ void FMCPEngineStatus::CaptureNow()
 	FString LocalModalTitle;
 	FString LocalModalMessage;
 	TArray<FString> LocalModalButtons;
+	bool bLocalModalBlocks = false;
 	const bool bDescribedModal = ModalProvider
-		? ModalProvider(LocalModalTitle, LocalModalMessage, LocalModalButtons)
+		? ModalProvider(LocalModalTitle, LocalModalMessage, LocalModalButtons, bLocalModalBlocks)
 		: false;
 
 	// The editor's own slow-task progress window is an active modal window: it
@@ -396,6 +397,7 @@ void FMCPEngineStatus::CaptureNow()
 		SlowTaskFraction = LocalSlowFraction;
 		SlowTaskStack = MoveTemp(LocalStack);
 		bModalActive = bLocalModal;
+		bModalBlocksGameThread = bLocalModal && bLocalModalBlocks;
 		ModalTitle = MoveTemp(LocalModalTitle);
 		ModalMessage = MoveTemp(LocalModalMessage);
 		ModalButtons = MoveTemp(LocalModalButtons);
@@ -404,9 +406,13 @@ void FMCPEngineStatus::CaptureNow()
 	}
 }
 
-bool FMCPEngineStatus::GetActiveModal(FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons) const
+bool FMCPEngineStatus::GetActiveModal(FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons, bool* OutBlocksGameThread) const
 {
 	FScopeLock Lock(&Mutex);
+	if (OutBlocksGameThread)
+	{
+		*OutBlocksGameThread = false;
+	}
 	if (!bModalActive)
 	{
 		return false;
@@ -414,6 +420,10 @@ bool FMCPEngineStatus::GetActiveModal(FString& OutTitle, FString& OutMessage, TA
 	OutTitle = ModalTitle;
 	OutMessage = ModalMessage;
 	OutButtons = ModalButtons;
+	if (OutBlocksGameThread)
+	{
+		*OutBlocksGameThread = bModalBlocksGameThread;
+	}
 	return true;
 }
 
@@ -482,6 +492,10 @@ TSharedPtr<FJsonObject> FMCPEngineStatus::Snapshot() const
 			ButtonsJson.Add(MakeShared<FJsonValueString>(Button));
 		}
 		Modal->SetArrayField(TEXT("buttons"), ButtonsJson);
+		// Whether the engine is parked behind this window, or merely showing
+		// it. A reader that treats the second as the first refuses work that
+		// would have succeeded, which is what #1118 reported.
+		Modal->SetBoolField(TEXT("blocksGameThread"), bModalBlocksGameThread);
 		Out->SetObjectField(TEXT("modal"), Modal);
 	}
 	else

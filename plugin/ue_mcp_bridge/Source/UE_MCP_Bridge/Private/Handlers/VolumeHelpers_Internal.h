@@ -20,4 +20,9 @@ namespace UEMCP
 	 *  PCGHandlers (PCG volume creation). Issue #238.
 	 */
 	void BuildVolumeAsCube(UWorld* World, AVolume* Volume, const FVector& HalfExtent);
+
+	/** Tell the navigation system a volume's shape or transform changed.
+	 *  Only NavMeshBoundsVolume registers bounds, and a PostEditChange with
+	 *  no property does not re-register them. Call after the final transform. */
+	void NotifyVolumeBoundsChanged(AVolume* Volume);
 }

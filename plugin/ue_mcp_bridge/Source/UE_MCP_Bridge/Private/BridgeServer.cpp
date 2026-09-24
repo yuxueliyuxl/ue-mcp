@@ -1647,11 +1647,21 @@ FString FMCPBridgeServer::ProcessMessage(const FString& Message)
 	// the dialog, quotes it whole, lists its buttons in the dialog's own order
 	// and hands back the exact call for each, and it is the identical answer
 	// on every method, so the only way forward is through the dialog.
+	//
+	// It refuses for a window the game thread is PARKED behind, and only that.
+	// A prompt the editor raised without AddModalWindow is on screen without
+	// holding anything: the ticker runs, the handler would have completed, and
+	// refusing it turned a Find results window or an undocked panel into a
+	// session-long outage with no button that could clear it (#1118). Such a
+	// window is still reported by list_dialogs and still stops a quit; it just
+	// stops standing in for a blocked engine.
 	if (!bModalSafe)
 	{
 		FString ModalTitle, ModalMessage;
 		TArray<FString> ModalButtons;
-		if (FMCPEngineStatus::Get().GetActiveModal(ModalTitle, ModalMessage, ModalButtons))
+		bool bModalBlocksGameThread = false;
+		if (FMCPEngineStatus::Get().GetActiveModal(ModalTitle, ModalMessage, ModalButtons, &bModalBlocksGameThread)
+			&& bModalBlocksGameThread)
 		{
 			return CreateJsonRpcResponse(
 				Request,

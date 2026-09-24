@@ -411,7 +411,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateStateMachine(const TSharedPtr<F
 	}
 
 	// Create the state machine container node in the AnimGraph
-	UAnimGraphNode_StateMachine* SMNode = NewObject<UAnimGraphNode_StateMachine>(TargetGraph);
+	UAnimGraphNode_StateMachine* SMNode = NewObject<UAnimGraphNode_StateMachine>(TargetGraph, NAME_None, RF_Transactional);
 	TargetGraph->AddNode(SMNode, false, false);
 	SMNode->CreateNewGuid();
 	SMNode->PostPlacedNewNode();  // This creates the EditorStateMachineGraph sub-graph
@@ -512,7 +512,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddState(const TSharedPtr<FJsonObject
 	}
 
 	// Create state node
-	UAnimStateNode* NewState = NewObject<UAnimStateNode>(SMGraph);
+	UAnimStateNode* NewState = NewObject<UAnimStateNode>(SMGraph, NAME_None, RF_Transactional);
 	SMGraph->AddNode(NewState, false, false);
 	NewState->CreateNewGuid();
 	NewState->PostPlacedNewNode();
@@ -641,7 +641,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddTransition(const TSharedPtr<FJsonO
 	}
 
 	// Create transition node
-	UAnimStateTransitionNode* TransNode = NewObject<UAnimStateTransitionNode>(SMGraph);
+	UAnimStateTransitionNode* TransNode = NewObject<UAnimStateTransitionNode>(SMGraph, NAME_None, RF_Transactional);
 	SMGraph->AddNode(TransNode, false, false);
 	TransNode->CreateNewGuid();
 	TransNode->PostPlacedNewNode();
@@ -791,7 +791,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetStateAnimation(const TSharedPtr<FJ
 	{
 		if (!SeqPlayer)
 		{
-			SeqPlayer = NewObject<UAnimGraphNode_SequencePlayer>(StateGraph);
+			SeqPlayer = NewObject<UAnimGraphNode_SequencePlayer>(StateGraph, NAME_None, RF_Transactional);
 			StateGraph->AddNode(SeqPlayer, false, false);
 			SeqPlayer->CreateNewGuid();
 			SeqPlayer->PostPlacedNewNode();
@@ -803,7 +803,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetStateAnimation(const TSharedPtr<FJ
 	{
 		if (!BSPlayer)
 		{
-			BSPlayer = NewObject<UAnimGraphNode_BlendSpacePlayer>(StateGraph);
+			BSPlayer = NewObject<UAnimGraphNode_BlendSpacePlayer>(StateGraph, NAME_None, RF_Transactional);
 			StateGraph->AddNode(BSPlayer, false, false);
 			BSPlayer->CreateNewGuid();
 			BSPlayer->PostPlacedNewNode();
@@ -1159,7 +1159,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetTransitionCondition(const TSharedP
 	ResultPin->BreakAllPinLinks();
 
 	// Author: VariableGet(bool) -> [optional NOT] -> bCanEnterTransition.
-	UK2Node_VariableGet* GetNode = NewObject<UK2Node_VariableGet>(TransGraph);
+	UK2Node_VariableGet* GetNode = NewObject<UK2Node_VariableGet>(TransGraph, NAME_None, RF_Transactional);
 	TransGraph->AddNode(GetNode, false, false);
 	GetNode->VariableReference.SetSelfMember(FName(*VariableName));
 	GetNode->CreateNewGuid();
@@ -1190,7 +1190,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetTransitionCondition(const TSharedP
 		UFunction* NotFunc = UKismetMathLibrary::StaticClass()->FindFunctionByName(FName(TEXT("Not_PreBool")));
 		if (NotFunc)
 		{
-			UK2Node_CallFunction* NotNode = NewObject<UK2Node_CallFunction>(TransGraph);
+			UK2Node_CallFunction* NotNode = NewObject<UK2Node_CallFunction>(TransGraph, NAME_None, RF_Transactional);
 			TransGraph->AddNode(NotNode, false, false);
 			NotNode->SetFromFunction(NotFunc);
 			NotNode->CreateNewGuid();

@@ -604,29 +604,79 @@ TSharedPtr<FJsonValue> FDialogHandlers::GetDialogPolicy(const TSharedPtr<FJsonOb
 // would merge with whatever other .cpp shares the blob.
 namespace MCPDialogWindows
 {
+	/** Does this window host docked tabs? Such a window is a workspace, never a
+	 *  prompt (#1078). Matched by type name because Slate's docking types are
+	 *  private to their module. */
+	static bool HostsDockedTabs(const TSharedRef<SWidget>& Widget)
+	{
+		const FName Type = Widget->GetType();
+		if (Type == TEXT("SDockingArea")
+			|| Type == TEXT("SDockingTabStack")
+			|| Type == TEXT("SDockingSplitter")
+			|| Type == TEXT("SDockTab"))
+		{
+			return true;
+		}
+		FChildren* Children = Widget->GetChildren();
+		if (Children)
+		{
+			for (int32 i = 0; i < Children->Num(); ++i)
+			{
+				if (HostsDockedTabs(Children->GetChildAt(i))) return true;
+			}
+		}
+		return false;
+	}
+
+	/** Why a window was not counted as blocking, for the diagnostics below. */
+	struct FSkippedWindow
+	{
+		FString Title;
+		FString Reason;
+	};
+
+	/** A window the walk did count, and what it counted it as. */
+	struct FFoundWindow
+	{
+		TSharedPtr<SWindow> Window;
+		EMCPPromptKind Kind = EMCPPromptKind::NotAPrompt;
+	};
+
 	/**
 	 * Every window the editor is holding the user with, gathered recursively.
 	 *
-	 * A REGULAR window that is either on the modal stack or parented to another
-	 * window is something the editor put up and is waiting on. Menus, tooltips
-	 * and notifications are not regular windows, so they are not mistaken for
-	 * questions.
+	 * Menus, tooltips and notifications are not regular windows, so they are
+	 * never mistaken for questions.
 	 *
-	 * Visibility is deliberately NOT consulted. A window that is up but undrawn,
-	 * or drawn behind the editor, still holds whatever raised it, and "the user
-	 * cannot see it" is the worst possible reason to let a quit through.
+	 * Visibility is deliberately NOT consulted: a window that is undrawn or
+	 * behind the editor still holds whatever raised it.
+	 *
+	 * OutSkipped records what was walked past, because a wrong answer either
+	 * way is expensive and an empty list is otherwise undiagnosable.
 	 */
-	static void Gather(const TArray<TSharedRef<SWindow>>& Roots, TArray<TSharedPtr<SWindow>>& Out)
+	static void Gather(
+		const TArray<TSharedRef<SWindow>>& Roots,
+		TArray<FFoundWindow>& Out,
+		TArray<FSkippedWindow>* OutSkipped = nullptr)
 	{
 		for (const TSharedRef<SWindow>& Window : Roots)
 		{
-			const bool bBlocks = Window->IsRegularWindow()
-				&& (Window->IsModalWindow() || Window->GetParentWindow().IsValid());
-			if (bBlocks)
+			FString SkipReason;
+			const EMCPPromptKind Kind = FDialogHandlers::ClassifyWindow(Window, &SkipReason);
+			if (Kind != EMCPPromptKind::NotAPrompt)
 			{
-				Out.AddUnique(TSharedPtr<SWindow>(Window));
+				const bool bAlreadyFound = Out.ContainsByPredicate(
+					[&Window](const FFoundWindow& Found) { return Found.Window == Window; });
+				if (!bAlreadyFound)
+				{
+					Out.Add({ TSharedPtr<SWindow>(Window), Kind });
+				}
 			}
-			Gather(Window->GetChildWindows(), Out);
+			else if (OutSkipped && !SkipReason.IsEmpty())
+			{
+				OutSkipped->Add({ Window->GetTitle().ToString(), SkipReason });
+			}
+			Gather(Window->GetChildWindows(), Out, OutSkipped);
 		}
 	}
 
@@ -642,35 +692,106 @@ namespace MCPDialogWindows
 	 * detector was the whole system's eyes, and absence of evidence from it was
 	 * being reported as evidence of absence.
 	 */
-	static TSharedPtr<SWindow> FindBlocking()
+	static TSharedPtr<SWindow> FindBlocking(
+		TArray<FSkippedWindow>* OutSkipped = nullptr,
+		EMCPPromptKind* OutKind = nullptr)
 	{
+		if (OutKind)
+		{
+			*OutKind = EMCPPromptKind::NotAPrompt;
+		}
 		if (!FSlateApplication::IsInitialized())
 		{
 			return nullptr;
 		}
 		FSlateApplication& Slate = FSlateApplication::Get();
-		TArray<TSharedPtr<SWindow>> Found;
+		TArray<FFoundWindow> Found;
 		if (TSharedPtr<SWindow> Modal = Slate.GetActiveModalWindow())
 		{
-			Found.AddUnique(Modal);
+			Found.Add({ Modal, EMCPPromptKind::Modal });
 		}
-		Gather(Slate.GetInteractiveTopLevelWindows(), Found);
-		return Found.Num() > 0 ? Found[0] : nullptr;
+		Gather(Slate.GetInteractiveTopLevelWindows(), Found, OutSkipped);
+		if (Found.Num() == 0)
+		{
+			return nullptr;
+		}
+		// A modal leads whatever order the walk found things in. It is the one
+		// window the game thread is parked behind, so reporting a Find results
+		// window in its place would name the wrong thing as the reason the
+		// editor is stuck, on the one call that has to be right (#1118).
+		int32 Best = 0;
+		for (int32 Index = 0; Index < Found.Num(); ++Index)
+		{
+			if (Found[Index].Kind == EMCPPromptKind::Modal)
+			{
+				Best = Index;
+				break;
+			}
+		}
+		if (OutKind)
+		{
+			*OutKind = Found[Best].Kind;
+		}
+		return Found[Best].Window;
 	}
 }
 
-TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FString& OutMessage, TArray<FModalButton>& OutButtons, TArray<FModalItem>* OutItems)
+bool FDialogHandlers::IsBlockingWindow(const TSharedRef<SWindow>& Window, FString* OutSkipReason)
+{
+	return ClassifyWindow(Window, OutSkipReason) != EMCPPromptKind::NotAPrompt;
+}
+
+const TCHAR* FDialogHandlers::PromptKindName(EMCPPromptKind Kind)
+{
+	switch (Kind)
+	{
+	case EMCPPromptKind::Modal:    return TEXT("modalWindow");
+	case EMCPPromptKind::Parented: return TEXT("parentedWindow");
+	default:                       return TEXT("none");
+	}
+}
+
+EMCPPromptKind FDialogHandlers::ClassifyWindow(const TSharedRef<SWindow>& Window, FString* OutSkipReason)
+{
+	if (OutSkipReason) OutSkipReason->Reset();
+
+	if (!Window->IsRegularWindow()) return EMCPPromptKind::NotAPrompt;
+	// bIsModalWindow is set by FSlateApplication::AddModalWindow and nothing
+	// else, so this is the one case in which the game thread is parked.
+	if (Window->IsModalWindow()) return EMCPPromptKind::Modal;
+	// Unparented and not modal: a top-level window of its own.
+	if (!Window->GetParentWindow().IsValid()) return EMCPPromptKind::NotAPrompt;
+
+	// Parented and not modal is usually a dialog raised without
+	// AddModalWindow, the case GetActiveModalWindow misses. It is also the
+	// shape of every utility window the editor puts in its own frame.
+	if (MCPDialogWindows::HostsDockedTabs(Window))
+	{
+		if (OutSkipReason)
+		{
+			*OutSkipReason = TEXT("hosts docked tabs, so it is an editor window rather than a prompt");
+		}
+		return EMCPPromptKind::NotAPrompt;
+	}
+	return EMCPPromptKind::Parented;
+}
+
+TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FString& OutMessage, TArray<FModalButton>& OutButtons, TArray<FModalItem>* OutItems, EMCPPromptKind* OutKind)
 {
 	OutTitle.Empty();
 	OutMessage.Empty();
 	OutButtons.Empty();
+	if (OutKind)
+	{
+		*OutKind = EMCPPromptKind::NotAPrompt;
+	}
 
 	if (!FSlateApplication::IsInitialized())
 	{
 		return nullptr;
 	}
 
-	TSharedPtr<SWindow> ActiveModal = MCPDialogWindows::FindBlocking();
+	TSharedPtr<SWindow> ActiveModal = MCPDialogWindows::FindBlocking(nullptr, OutKind);
 	if (!ActiveModal.IsValid())
 	{
 		return nullptr;
@@ -679,6 +800,10 @@ TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FStri
 	OutTitle = ActiveModal->GetTitle().ToString();
 
 	TArray<FString> TextContents;
+	// How many buttons the walk is inside. A button's label is not a cell of
+	// the row before it, and without this the last row of Save Content carried
+	// "Save Selected", "Don't Save" and "Cancel" as its own cells (#1076).
+	int32 ButtonDepth = 0;
 
 	TFunction<void(const TSharedRef<SWidget>&)> TraverseWidgets = [&](const TSharedRef<SWidget>& Widget)
 	{
@@ -693,7 +818,7 @@ TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FStri
 				// checkbox then its cells, so text after a checkbox belongs to
 				// that checkbox until the next one starts a new row. That is
 				// what pairs "L_MoverPawnTest" with the box that saves it.
-				if (OutItems && OutItems->Num() > 0)
+				if (OutItems && OutItems->Num() > 0 && ButtonDepth == 0)
 				{
 					OutItems->Last().Cells.Add(Text);
 				}
@@ -730,6 +855,8 @@ TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FStri
 			OutButtons.Add(Entry);
 		}
 
+		const bool bIsButton = Widget->GetType() == TEXT("SButton");
+		if (bIsButton) ++ButtonDepth;
 		FChildren* Children = Widget->GetChildren();
 		if (Children)
 		{
@@ -738,6 +865,7 @@ TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FStri
 				TraverseWidgets(Children->GetChildAt(i));
 			}
 		}
+		if (bIsButton) --ButtonDepth;
 	};
 
 	TraverseWidgets(ActiveModal.ToSharedRef());
@@ -754,15 +882,24 @@ TSharedPtr<SWindow> FDialogHandlers::CollectActiveModal(FString& OutTitle, FStri
 	return ActiveModal;
 }
 
-bool FDialogHandlers::DescribeActiveModal(FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons)
+bool FDialogHandlers::DescribeActiveModal(FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons, bool* OutBlocksGameThread)
 {
 	OutButtons.Empty();
+	if (OutBlocksGameThread)
+	{
+		*OutBlocksGameThread = false;
+	}
 
 	TArray<FModalButton> Buttons;
-	TSharedPtr<SWindow> Modal = CollectActiveModal(OutTitle, OutMessage, Buttons);
+	EMCPPromptKind Kind = EMCPPromptKind::NotAPrompt;
+	TSharedPtr<SWindow> Modal = CollectActiveModal(OutTitle, OutMessage, Buttons, nullptr, &Kind);
 	if (!Modal.IsValid())
 	{
 		return false;
+	}
+	if (OutBlocksGameThread)
+	{
+		*OutBlocksGameThread = Kind == EMCPPromptKind::Modal;
 	}
 
 	for (const FModalButton& Button : Buttons)
@@ -780,14 +917,41 @@ TSharedPtr<FJsonValue> FDialogHandlers::ListDialogs(const TSharedPtr<FJsonObject
 	auto Result = MCPSuccess();
 	TArray<TSharedPtr<FJsonValue>> DialogsArray;
 
+	// What the walk rejected, reported alongside the dialogs (#1078).
+	TArray<MCPDialogWindows::FSkippedWindow> Skipped;
+	MCPDialogWindows::FindBlocking(&Skipped);
+	if (Skipped.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> SkippedJson;
+		for (const MCPDialogWindows::FSkippedWindow& Window : Skipped)
+		{
+			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("title"), Window.Title);
+			Entry->SetStringField(TEXT("reason"), Window.Reason);
+			SkippedJson.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+		Result->SetArrayField(TEXT("notTreatedAsDialogs"), SkippedJson);
+	}
+
 	FString Title;
 	FString Message;
 	TArray<FModalButton> Buttons;
 	TArray<FModalItem> Items;
-	if (CollectActiveModal(Title, Message, Buttons, &Items).IsValid())
+	EMCPPromptKind Kind = EMCPPromptKind::NotAPrompt;
+	if (CollectActiveModal(Title, Message, Buttons, &Items, &Kind).IsValid())
 	{
 		TSharedPtr<FJsonObject> DialogObj = MakeShared<FJsonObject>();
 		DialogObj->SetStringField(TEXT("title"), Title);
+		// Whether the editor is actually held, and how the walk decided (#1118).
+		// A parented non-modal window is a question worth reporting and is NOT
+		// a reason to refuse a call: the game thread keeps ticking behind it,
+		// so every action that would have worked still works.
+		const bool bBlocks = Kind == EMCPPromptKind::Modal;
+		DialogObj->SetBoolField(TEXT("blocksGameThread"), bBlocks);
+		DialogObj->SetStringField(TEXT("detectedBy"), PromptKindName(Kind));
+		DialogObj->SetStringField(TEXT("blockingNote"), bBlocks
+			? TEXT("This window is on Slate's modal stack. The game thread is inside its loop, so every bridge method except the dialog ones is refused until a button is pressed.")
+			: TEXT("This window is parented to the editor and is not modal, so the game thread keeps ticking and bridge calls keep working. It is reported because an unanswered question must never be quit out from under, not because anything is blocked."));
 		// THE FULL TEXT, never a prefix of it. This is how a person reads what
 		// the editor actually asked, and a question truncated mid-sentence is a
 		// question answered on incomplete information.
@@ -1022,7 +1186,10 @@ TSharedPtr<FJsonValue> FDialogHandlers::RespondToDialog(const TSharedPtr<FJsonOb
 		// itself, which ends the modal loop and releases the game thread. A
 		// synthetic Escape keypress alone does not reach a modal window that
 		// never took keyboard focus, so send both.
-		FString Action = OptionalString(Params, TEXT("action"));
+		// dialogAction on the wire: "action" is the category tool's dispatch
+		// field (#1078). The old name is still read for direct bridge clients.
+		FString Action = OptionalString(Params, TEXT("dialogAction"));
+		if (Action.IsEmpty()) Action = OptionalString(Params, TEXT("action"));
 		if (Action == TEXT("escape") || Action == TEXT("close"))
 		{
 			FSlateApplication::Get().ProcessKeyDownEvent(FKeyEvent(EKeys::Escape, FModifierKeysState(), 0, false, 0, 0));
@@ -1050,7 +1217,7 @@ TSharedPtr<FJsonValue> FDialogHandlers::RespondToDialog(const TSharedPtr<FJsonOb
 			Result->SetBoolField(TEXT("success"), false);
 			Result->SetArrayField(TEXT("availableButtons"), AvailableButtons);
 			Result->SetStringField(TEXT("error"), FString::Printf(
-				TEXT("Button not found on dialog '%s'. Pass buttonLabel as one of [%s], or buttonIndex between 0 and %d, or action='close'."),
+				TEXT("Button not found on dialog '%s'. Pass buttonLabel as one of [%s], or buttonIndex between 0 and %d, or dialogAction='close'."),
 				*Title, *JoinLabels(Buttons), FMath::Max(0, Buttons.Num() - 1)));
 		}
 	}

@@ -26,7 +26,7 @@
  */
 import type { EditorSession } from "./session.js";
 import type { IBridge } from "./bridge.js";
-import type { ElicitFn } from "./types.js";
+import type { ElicitFn, ElicitPrimitiveSchema } from "./types.js";
 import type { DialogMode } from "./user-state.js";
 import { elicitationNeedsRelay } from "./client-quirks.js";
 
@@ -187,12 +187,29 @@ export function isDialogRefusal(v: unknown): boolean {
     && (v as Record<string, unknown>).dialogBlocking === true;
 }
 
-/** Read a dialog out of whatever shape reported it. */
 /** Schema key for one tickable row. Kept in one place so both ends agree. */
 function itemKey(index: number): string {
   return `item_${index}`;
 }
 
+/** Schema key for the multi-select holding every tickable row. */
+const ITEMS_KEY = "items";
+
+/** A dialog's identity: the same prompt on screen reads the same. */
+function dialogIdentity(dialog: BlockingDialog): string {
+  return `${dialog.title} :: ${dialog.message}`;
+}
+
+/** The promise's value, or null if it has not settled within `ms`. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+/** Read a dialog out of whatever shape reported it. */
 function asDialog(v: unknown): BlockingDialog | null {
   if (typeof v !== "object" || v === null) return null;
   const r = v as Record<string, unknown>;
@@ -277,6 +294,13 @@ export interface GuardDeps {
   readSnapshot?: () => { modal?: unknown; ageSeconds?: number } | null;
   /** Whether the bridge socket is currently up. */
   isConnected?: () => boolean;
+  /**
+   * How long one call waits on an open form before refusing, in ms.
+   *
+   * Internal and defaulted; it exists so the wait can be exercised in a test
+   * without sitting through it. The form itself outlives this wait.
+   */
+  askWaitMs?: number;
 }
 
 /**
@@ -288,6 +312,14 @@ export const STATUS_STALE_AFTER_MS = 15_000;
 /** How big a rendered dialog has to be before a form cannot carry it. */
 const RELAY_OVER_LINES = 12;
 const RELAY_OVER_CHARS = 700;
+
+/**
+ * How long a gated call waits for the person to answer an open form.
+ *
+ * The form is not bounded by this. When the wait runs out the call refuses and
+ * the form stays up; whatever the person picks later is still pressed.
+ */
+const ASK_WAIT_MS = 60_000;
 
 export class DialogGuard {
   private blocking: BlockingDialog | null = null;
@@ -520,7 +552,7 @@ export class DialogGuard {
     // shown the same prompt twice and the button was pressed TWICE, which on a
     // save prompt is two real answers for one action. If the same dialog is
     // still there after a press, pressing again will not help: report it.
-    const identity = `${dialog.title} :: ${dialog.message}`;
+    const identity = dialogIdentity(dialog);
     // canElicit: false means this route has nobody to ask. An HTTP request
     // has no person on it, and eliciting would raise a form in whichever
     // MCP client last touched this guard and press a real button on its
@@ -572,25 +604,31 @@ export class DialogGuard {
       // answering a question it was never shown.
       if (!this.asking || this.askingFor !== identity) {
         this.askingFor = identity;
-        this.asking = this.askUser(dialog).finally(() => {
-          this.asking = null;
-          this.askingFor = null;
-        });
+        // The outcome is recorded by the ask itself, not by whichever call is
+        // waiting on it. A person can answer long after every call has stopped
+        // waiting, and that answer is still theirs to have pressed (#1076).
+        this.asking = this.askUser(dialog)
+          .then((outcome) => {
+            // Recorded only once a form was actually SHOWN. Setting it before
+            // the ask meant an elicitation that threw or was declined consumed
+            // the one chance, and the person was never asked about that dialog
+            // again for the life of the process.
+            if (outcome.shown) this.lastAsked = identity;
+            this.pressed = outcome.press;
+            // Only a CONFIRMED press proves the way is clear. An unknown one
+            // is reported, not assumed.
+            if (outcome.press?.confirmed) this.clear();
+            return outcome;
+          })
+          .finally(() => {
+            this.asking = null;
+            this.askingFor = null;
+          });
       }
-      const outcome = await this.asking;
-      const pressed = outcome.press;
-      // Recorded only once a form was actually SHOWN. Setting it before the
-      // ask meant an elicitation that threw, timed out, or was declined
-      // consumed the one chance, and the person was never asked about that
-      // dialog again for the life of the process.
-      if (outcome.shown) this.lastAsked = identity;
-      this.pressed = pressed;
-      // Only a CONFIRMED press proves the way is clear. An unknown one is
-      // reported, not assumed.
-      if (pressed?.confirmed) {
-        this.clear();
-        return { allow: true };
-      }
+      // Bounded, where the form is not. A call that waited on the person for as
+      // long as they took would hold every gated call behind one open form.
+      const outcome = await within(this.asking, this.deps.askWaitMs ?? ASK_WAIT_MS);
+      if (outcome?.press?.confirmed) return { allow: true };
     }
     return { allow: false, refusal: this.refusal(subject, dialog, opts) };
   }
@@ -715,49 +753,81 @@ export class DialogGuard {
       body,
     ];
     message.push("", "Nothing else can run until this is answered, and nothing is pressed unless you choose it.");
-    // One toggle per row the dialog lets a person tick.
+    // The rows the dialog lets a person tick, as ONE multi-select field.
     //
     // Save Content is N questions, not one, and "Save Selected" saves whatever
     // is ticked. Offering the buttons alone made it all or nothing, so a person
     // who wanted two of five files had no way to say so.
     //
+    // One field, not a boolean per row. A client draws a multi-select as a
+    // checkbox group on the same screen as the buttons; a boolean per row is
+    // drawn by some clients as a page per asset, which on a save of forty files
+    // is forty pages before the button.
+    //
     // Only rows carrying a path: the header's select-all box owns the column
-    // headings, and a toggle labelled "Asset" is not a question anybody asked.
+    // headings, and a row labelled "Asset" is not a question anybody asked.
     const tickable = (dialog.items ?? []).filter((i) => i.cells.some((c) => c.startsWith("/")));
-    const itemProps: Record<string, unknown> = {};
+    const button: ElicitPrimitiveSchema = {
+      type: "string",
+      title: "Submission",
+      description: "The dialog's own buttons, in the order it lays them out.",
+      enum: [...dialog.buttons, LEAVE_OPEN],
+    };
+    const schemaWith = (itemProps: Record<string, ElicitPrimitiveSchema>) => ({
+      type: "object" as const,
+      properties: { ...itemProps, button },
+      required: ["button"],
+    });
+    const itemTitle = (item: DialogItem) => item.label === "" ? `Item ${item.index}` : item.label;
+    const itemPath = (item: DialogItem) => item.cells.find((c) => c.startsWith("/")) ?? "";
+    const grouped: Record<string, ElicitPrimitiveSchema> = tickable.length === 0 ? {} : {
+      [ITEMS_KEY]: {
+        type: "array",
+        title: "Assets",
+        description: "Ticked rows are what the dialog acts on.",
+        items: {
+          anyOf: tickable.map((item) => ({
+            const: itemKey(item.index),
+            title: `${itemTitle(item)}  ${itemPath(item)}`,
+          })),
+        },
+        default: tickable.filter((item) => item.checked).map((item) => itemKey(item.index)),
+      },
+    };
+    // A boolean per row, for a client that refuses the multi-select. Array
+    // fields arrived in a later revision of the protocol than the form itself,
+    // and a refused form is otherwise never shown at all.
+    const perRow: Record<string, ElicitPrimitiveSchema> = {};
     for (const item of tickable) {
-      itemProps[itemKey(item.index)] = {
+      perRow[itemKey(item.index)] = {
         type: "boolean",
-        title: item.label === "" ? `Item ${item.index}` : item.label,
-        description: item.cells.find((c) => c.startsWith("/")) ?? "",
+        title: itemTitle(item),
+        description: itemPath(item),
         default: item.checked,
       };
     }
+    let asked: "grouped" | "perRow" = "grouped";
     try {
-      answer = await elicit({
-        message: message.join("\n"),
-        requestedSchema: {
-          type: "object",
-          properties: {
-            ...itemProps,
-            button: {
-              type: "string",
-              title: "Button",
-              description: "The dialog's own buttons, in the order it lays them out.",
-              enum: [...dialog.buttons, LEAVE_OPEN],
-            },
-          },
-          required: ["button"],
-        },
-      });
+      answer = await elicit({ message: message.join("\n"), requestedSchema: schemaWith(grouped) });
     } catch {
-      // The form never rendered. Not an answer, and not a used-up chance.
-      return { shown: false, press: null };
+      if (tickable.length === 0) return { shown: false, press: null };
+      try {
+        asked = "perRow";
+        answer = await elicit({ message: message.join("\n"), requestedSchema: schemaWith(perRow) });
+      } catch {
+        // The form never rendered. Not an answer, and not a used-up chance.
+        return { shown: false, press: null };
+      }
     }
     if (answer.action !== "accept") return { shown: true, press: null };
     const chosen = answer.content?.button;
     if (typeof chosen !== "string" || chosen === LEAVE_OPEN) return { shown: true, press: null };
     if (!dialog.buttons.includes(chosen)) return { shown: true, press: null };
+    // The answer can arrive long after the form went up, and the editor may be
+    // showing something else by then: the dialog answered at its own window, or
+    // a new one with the same buttons. A press is only for the dialog the
+    // person was shown.
+    if (!(await this.stillShowing(dialog))) return { shown: true, press: null };
     // Three outcomes, not two.
     //
     //   pressed      the editor confirmed it
@@ -771,9 +841,16 @@ export class DialogGuard {
     try {
       // What the person ticked travels WITH the button. Sending it separately
       // would leave a modal holding a selection nobody had pressed anything on.
+      //
+      // A grouped answer with no list at all leaves every row as the dialog
+      // had it. A client that drops a field it cannot draw would otherwise
+      // untick everything, and "Save Selected" would save nothing.
+      const picked = answer.content?.[ITEMS_KEY];
       const selections = tickable.map((item) => ({
         index: item.index,
-        checked: answer.content?.[itemKey(item.index)] === true,
+        checked: asked === "perRow"
+          ? answer.content?.[itemKey(item.index)] === true
+          : Array.isArray(picked) ? picked.includes(itemKey(item.index)) : item.checked,
       }));
       // Called with ONE argument when there is nothing to tick, so a dialog
       // that offers no items presses exactly as it always did.
@@ -795,6 +872,17 @@ export class DialogGuard {
       return { shown: true, press: { button: chosen, confirmed: false } };
     } catch {
       return { shown: true, press: null };
+    }
+  }
+
+  /** Whether the editor is still showing this dialog, read fresh. */
+  private async stillShowing(dialog: BlockingDialog): Promise<boolean> {
+    try {
+      const list = ((await this.deps.probe()) as { dialogs?: unknown })?.dialogs;
+      const current = Array.isArray(list) ? asDialog(list[0]) : null;
+      return current !== null && dialogIdentity(current) === dialogIdentity(dialog);
+    } catch {
+      return false;
     }
   }
 
@@ -957,10 +1045,20 @@ export class DialogGuard {
         return;
       }
       this.staleStatus = false;
-      const modal = snap?.modal;
-      const dialog = asDialog(modal);
+      const modal = snap?.modal as { blocksGameThread?: boolean } | null | undefined;
+      // A prompt the game thread is not parked behind holds nothing, so it is
+      // not something to gate on. Treating one as a blocking dialog refused
+      // every call - offline ones included - for as long as an ordinary editor
+      // window stayed open, with no button that could clear it (#1118). An
+      // older plugin omits the field and is believed, which is the behaviour
+      // that existed before it.
+      const blocking = modal != null && modal.blocksGameThread !== false;
+      const dialog = blocking ? asDialog(modal) : null;
       if (dialog) this.note(dialog);
-      else if (modal === null || modal === undefined) this.clear();
+      // Cleared when nothing is holding the editor, which now covers a prompt
+      // that is on screen and blocking nothing. A blocking modal this walk
+      // could not read leaves the previous note standing, as it always did.
+      else if (!blocking) this.clear();
     };
     this.poll = setInterval(read, intervalMs);
     this.poll.unref?.();

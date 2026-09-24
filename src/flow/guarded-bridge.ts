@@ -78,6 +78,10 @@ export class DialogGatedBridge implements IBridge {
     return this.inner.isConnected;
   }
 
+  get capabilities(): IBridge["capabilities"] {
+    return this.inner.capabilities;
+  }
+
   connect(timeoutMs?: number): Promise<void> {
     return this.inner.connect(timeoutMs);
   }
@@ -122,6 +126,10 @@ export class GuardedBridge implements IBridge {
 
   get isConnected(): boolean {
     return this.inner.isConnected;
+  }
+
+  get capabilities(): IBridge["capabilities"] {
+    return this.inner.capabilities;
   }
 
   connect(timeoutMs?: number): Promise<void> {

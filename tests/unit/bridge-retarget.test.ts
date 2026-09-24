@@ -10,7 +10,7 @@ import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { EditorBridge } from "../../src/bridge.js";
+import { CLIENT_PROTOCOL_VERSION, EditorBridge } from "../../src/bridge.js";
 import { deriveProjectPort } from "../../src/port.js";
 
 /** A stand-in editor that answers every call with its own name. */
@@ -26,7 +26,11 @@ async function fakeEditor(name: string): Promise<{
       const request = JSON.parse(data.toString()) as { id: string; method: string };
       // #821: every connect opens with a capability handshake. It says nothing
       // about which editor a caller's work reached, so it stays out of the log.
-      if (request.method !== "get_bridge_capabilities") received.push(request.method);
+      if (request.method === "get_bridge_capabilities") {
+        socket.send(JSON.stringify({ id: request.id, result: { protocolVersion: CLIENT_PROTOCOL_VERSION, projectName: name } }));
+        return;
+      }
+      received.push(request.method);
       socket.send(JSON.stringify({ id: request.id, result: { editor: name } }));
     });
   });
@@ -91,17 +95,20 @@ describe("EditorBridge.retargetProject", () => {
 
     try {
       await expect(bridge.call("ping", {}, 1000)).resolves.toEqual({ editor: "A" });
+      expect(bridge.capabilities?.projectName).toBe("A");
 
       const target = bridge.retargetProject(projectB);
       // The socket to A is gone the moment the retarget returns, before any
       // await gives another handler a chance to run.
       expect(bridge.isConnected).toBe(false);
+      expect(bridge.capabilities).toBeNull();
       expect(target.projectPath).toBe(path.resolve(projectB));
       expect(target.port).toBe(editorB.port);
       expect(target.portSource).toBe("lockfile");
       expect(target.verified).toBe(true);
 
       await expect(bridge.call("ping", {}, 1000)).resolves.toEqual({ editor: "B" });
+      expect(bridge.capabilities?.projectName).toBe("B");
       expect(editorA.received).toEqual(["ping"]);
       expect(editorB.received).toEqual(["ping"]);
     } finally {

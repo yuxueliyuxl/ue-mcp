@@ -303,6 +303,8 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("create_new_level"), &CreateNewLevel);
 	Registry.RegisterHandler(TEXT("save_current_level"), &SaveCurrentLevel);
 	Registry.RegisterHandler(TEXT("open_asset"), &OpenAsset);
+	// #1112: the inverse of open_asset - what is already open, and what has focus.
+	Registry.RegisterHandler(TEXT("get_open_asset_editors"), &GetOpenAssetEditors);
 	Registry.RegisterHandler(TEXT("get_runtime_value"), &PieGetRuntimeValue);
 	// New handlers
 	Registry.RegisterHandler(TEXT("run_stat_command"), &RunStatCommand);

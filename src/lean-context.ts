@@ -1,9 +1,10 @@
 import { z } from "zod";
-import { actionEnum, categoryTool, takeTimeout, type ActionSpec, type ToolDef } from "./types.js";
+import { actionEnum, categoryTool, stripAction, takeTimeout, type ActionSpec, type ToolDef } from "./types.js";
 import { applyCategoryFolding } from "./call-pipeline.js";
 import { McpError, ErrorCode } from "./errors.js";
 import { actionSchema } from "./action-schema.js";
 import { searchToolGraph } from "./tool-search.js";
+import { takeFieldSelection } from "./field-select.js";
 
 /**
  * Lean context strategy.
@@ -177,8 +178,9 @@ export function applyLeanContext(tools: ToolDef[]): ToolDef[] {
  * with list_categories, learns a category with describe, and invokes anything
  * with call. This is the smallest possible seed.
  *
- * `call` dispatches straight to the target ActionSpec (handler or bridge) using
- * the same logic categoryTool() uses, so no registry round-trip is needed.
+ * Live calls and flow steps resolve to the target's registered task. The
+ * handler below also supports direct handler/bridge calls for embedders that
+ * have no task registry; plugin actions require the registry route.
  */
 /**
  * The one tool micro mode advertises. Named here rather than inline because
@@ -190,6 +192,50 @@ export const MICRO_GATEWAY_TOOL = "tools";
 
 /** The gateway action that invokes something. `category` + `method` name it. */
 export const MICRO_GATEWAY_CALL = "call";
+
+/** Unwrap the gateway without preparing paths or projecting a result twice.
+ *  The target's existing task owns that work. Routing options beside `args`
+ *  override the same options inside it, just as prepareCall promises. */
+export function microCallParams(params: Record<string, unknown>): Record<string, unknown> {
+  const inner = params.args && typeof params.args === "object" && !Array.isArray(params.args)
+    ? params.args as Record<string, unknown>
+    : {};
+  const timeoutMs = takeTimeout(params).timeoutMs ?? takeTimeout(inner).timeoutMs;
+  const outerSelection = takeFieldSelection(params).selection;
+  const innerSelection = takeFieldSelection(inner).selection;
+  const select = outerSelection.select ?? innerSelection.select;
+  const omit = outerSelection.omit ?? innerSelection.omit;
+  return {
+    ...stripAction(inner),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(select === undefined ? {} : { select }),
+    ...(omit === undefined ? {} : { omit }),
+  };
+}
+
+/** Resolve only advertised actions; never turn gateway arguments into a
+ *  task class path that the registry could import from disk. */
+export function resolveMicroCall(tools: ToolDef[], params: Record<string, unknown>) {
+  const category = typeof params.category === "string" ? params.category : "";
+  const method = typeof params.method === "string" ? params.method : "";
+  const tool = tools.find((candidate) => candidate.name === category);
+  if (!tool) {
+    throw new McpError(ErrorCode.UNKNOWN_ACTION, `Unknown category "${category}". Use tools(action="list_categories").`);
+  }
+  if (!Object.hasOwn(tool.actions, method)) {
+    throw new McpError(ErrorCode.UNKNOWN_ACTION, `Unknown action "${method}" on ${category}. Use tools(action="describe", category="${category}").`);
+  }
+  return { taskName: `${category}.${method}`, params: microCallParams(params) };
+}
+
+/** The categories each gateway was built to reach: the enabled set, never a
+ *  category the project's `disable:` list removed. */
+const gatewayTargets = new WeakMap<ToolDef, ToolDef[]>();
+
+/** What `tools.call` may resolve when no session graph is on the context. */
+export function microGatewayTargets(gateway: ToolDef): ToolDef[] | undefined {
+  return gatewayTargets.get(gateway);
+}
 
 export function buildMicroGateway(tools: ToolDef[]): ToolDef {
   const byName = new Map(tools.map((t) => [t.name, t] as const));
@@ -269,7 +315,8 @@ export function buildMicroGateway(tools: ToolDef[]): ToolDef {
         });
         if (spec.handler) return spec.handler(ctx, args);
         if (spec.bridge) {
-          const mapped = spec.mapParams ? spec.mapParams(args) : args;
+          const base = stripAction(args);
+          const mapped = spec.mapParams ? spec.mapParams(base) : base;
           return ctx.bridge.call(spec.bridge, mapped, requestedTimeout ?? spec.timeoutMs);
         }
         throw new McpError(ErrorCode.NO_HANDLER, `Action ${category}.${method} has no handler.`);
@@ -277,7 +324,7 @@ export function buildMicroGateway(tools: ToolDef[]): ToolDef {
     },
   };
 
-  return categoryTool(
+  const gateway = categoryTool(
     MICRO_GATEWAY_TOOL,
     "Gateway to every ue-mcp category (micro context mode). Find actions with search, inspect parameters with describe, then invoke with call.",
     actions,
@@ -296,4 +343,6 @@ export function buildMicroGateway(tools: ToolDef[]): ToolDef {
     // as a method argument.
     { nestedParamsKey: "args" },
   );
+  gatewayTargets.set(gateway, tools);
+  return gateway;
 }

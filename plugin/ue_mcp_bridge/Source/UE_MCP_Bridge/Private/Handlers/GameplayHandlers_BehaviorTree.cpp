@@ -86,6 +86,11 @@ namespace
 				return MakeShared<FJsonValueString>(Enum->GetNameStringByValue(Raw));
 			}
 		}
+		if (const FClassProperty* ClassProp = CastField<FClassProperty>(Prop))
+		{
+			UClass* Value = Cast<UClass>(ClassProp->GetObjectPropertyValue(Addr));
+			return MakeShared<FJsonValueString>(Value ? Value->GetPathName() : FString());
+		}
 
 		TSharedPtr<FJsonValue> Json = FJsonObjectConverter::UPropertyToJsonValue(Prop, Addr, 0, 0);
 		if (Json.IsValid()) return Json;

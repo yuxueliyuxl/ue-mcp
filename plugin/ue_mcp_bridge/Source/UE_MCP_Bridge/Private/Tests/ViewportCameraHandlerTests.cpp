@@ -47,9 +47,16 @@ bool FViewportCameraProjectionTest::RunTest(const FString& Parameters)
 	FLevelEditorViewportClient* Client = GCurrentLevelEditingViewportClient
 		? GCurrentLevelEditingViewportClient : GEditor->GetLevelViewportClients()[0];
 	const ELevelViewportType OriginalType = Client->GetViewportType();
+	Client->SetViewportType(LVT_Perspective);
+	const FVector OriginalPerspectiveLocation = Client->GetViewLocation();
+	const FRotator OriginalPerspectiveRotation = Client->GetViewRotation();
+	const float OriginalPerspectiveZoom = Client->GetOrthoZoom();
+	Client->SetViewportType(LVT_OrthoXY);
+	const FVector OriginalOrthographicLocation = Client->GetViewLocation();
+	const FRotator OriginalOrthographicRotation = Client->GetViewRotation();
+	const float OriginalOrthographicZoom = Client->GetOrthoZoom();
+	Client->SetViewportType(OriginalType);
 	const float OriginalZoom = Client->GetOrthoZoom();
-	const FVector OriginalLocation = Client->GetViewLocation();
-	const FRotator OriginalRotation = Client->GetViewRotation();
 
 	const TSharedPtr<FJsonValue> BadProjection = ViewportCall(Registry, TEXT("not-a-view"));
 	TestTrue(TEXT("invalid projection is rejected"), IsFailure(BadProjection));
@@ -83,17 +90,19 @@ bool FViewportCameraProjectionTest::RunTest(const FString& Parameters)
 	const FVector BeforeCrossLocation = Client->GetViewLocation();
 	const FRotator BeforeCrossRotation = Client->GetViewRotation();
 	auto CrossParams = MakeShared<FJsonObject>();
-	auto CrossArgs = MakeShared<FJsonObject>();
-	CrossArgs->SetStringField(TEXT("projection"), TEXT("top"));
-	CrossArgs->SetNumberField(TEXT("orthoZoom"), 4000.0);
+	CrossParams->SetStringField(TEXT("projection"), TEXT("top"));
+	CrossParams->SetNumberField(TEXT("orthoZoom"), 4000.0);
 	auto CrossLocation = MakeShared<FJsonObject>();
 	CrossLocation->SetNumberField(TEXT("x"), 12345.0); CrossLocation->SetNumberField(TEXT("y"), -6789.0); CrossLocation->SetNumberField(TEXT("z"), 10000.0);
-	CrossArgs->SetObjectField(TEXT("location"), CrossLocation);
-	CrossParams->SetObjectField(TEXT("args"), CrossArgs);
+	CrossParams->SetObjectField(TEXT("location"), CrossLocation);
 	const auto Cross = Registry.ExecuteHandler(TEXT("set_viewport_camera"), CrossParams);
-	TestFalse(TEXT("combined nested projection and pose succeeds"), IsFailure(Cross));
+	TestFalse(TEXT("combined projection and pose succeeds"), IsFailure(Cross));
+	TestEqual(TEXT("combined call applies the requested projection"), static_cast<int32>(Client->GetViewportType()), static_cast<int32>(LVT_OrthoXY));
+	TestTrue(TEXT("combined call applies the requested zoom"), FMath::IsNearlyEqual(Client->GetOrthoZoom(), 4000.0f));
 	TestTrue(TEXT("pose applies to the requested projection cache"), Client->GetViewLocation().Equals(FVector(12345,-6789,10000),.01));
-	if (Cross && Cross->Type == EJson::Object && Cross->AsObject()->HasField(TEXT("rollback")))
+	const bool bHasRollback = Cross && Cross->Type == EJson::Object && Cross->AsObject()->HasField(TEXT("rollback"));
+	TestTrue(TEXT("combined call returns a rollback"), bHasRollback);
+	if (bHasRollback)
 	{
 		const auto Payload = Cross->AsObject()->GetObjectField(TEXT("rollback"))->GetObjectField(TEXT("payload"));
 		TestFalse(TEXT("cross-mode rollback succeeds"), IsFailure(Registry.ExecuteHandler(TEXT("set_viewport_camera"),Payload)));
@@ -102,11 +111,17 @@ bool FViewportCameraProjectionTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("rollback restores the previous active rotation"), Client->GetViewRotation().Equals(BeforeCrossRotation,.001));
 	}
 
-	// Restore only the viewport state this test touched.
+	// Restore both transform caches this test touched, then reactivate the
+	// projection that was selected when the test began.
+	Client->SetViewportType(LVT_Perspective);
+	Client->SetViewLocation(OriginalPerspectiveLocation);
+	Client->SetViewRotation(OriginalPerspectiveRotation);
+	Client->SetOrthoZoom(OriginalPerspectiveZoom);
+	Client->SetViewportType(LVT_OrthoXY);
+	Client->SetViewLocation(OriginalOrthographicLocation);
+	Client->SetViewRotation(OriginalOrthographicRotation);
+	Client->SetOrthoZoom(OriginalOrthographicZoom);
 	Client->SetViewportType(OriginalType);
-	Client->SetOrthoZoom(OriginalZoom);
-	Client->SetViewLocation(OriginalLocation);
-	Client->SetViewRotation(OriginalRotation);
 	Client->Invalidate();
 	return true;
 }

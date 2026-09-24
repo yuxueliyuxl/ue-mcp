@@ -53,6 +53,7 @@ bool FMCPBehaviorTreeBlackboardKeysTest::RunTest(const FString& Parameters)
 	UBlackboardData* Blackboard = NewObject<UBlackboardData>(GetTransientPackage());
 	TestNotNull(TEXT("blackboard was created"), Blackboard);
 	if (!Blackboard) return false;
+	const int32 InitialKeyCount = Blackboard->Keys.Num();
 
 	UClass* ObjectKeyClass = MCPBTTestFindClass(TEXT("/Script/AIModule.BlackboardKeyType_Object"));
 
@@ -71,11 +72,11 @@ bool FMCPBehaviorTreeBlackboardKeysTest::RunTest(const FString& Parameters)
 	Blackboard->Keys.Add(Untyped);
 
 	const TArray<TSharedPtr<FJsonValue>> Keys = FGameplayHandlers::DescribeBlackboardKeys(Blackboard);
-	TestEqual(TEXT("both keys are described"), Keys.Num(), 2);
-	if (Keys.Num() != 2) return false;
+	TestEqual(TEXT("the added keys are described"), Keys.Num(), InitialKeyCount + 2);
+	if (Keys.Num() != InitialKeyCount + 2) return false;
 
-	const TSharedPtr<FJsonObject> First = Keys[0]->AsObject();
-	const TSharedPtr<FJsonObject> Second = Keys[1]->AsObject();
+	const TSharedPtr<FJsonObject> First = Keys[InitialKeyCount]->AsObject();
+	const TSharedPtr<FJsonObject> Second = Keys[InitialKeyCount + 1]->AsObject();
 	TestEqual(TEXT("first key name"), MCPBTTestGetString(First, TEXT("name")), FString(TEXT("TargetActor")));
 	TestEqual(TEXT("second key name"), MCPBTTestGetString(Second, TEXT("name")), FString(TEXT("PatrolIndex")));
 	TestEqual(TEXT("untyped key reports an empty type instead of crashing"),
@@ -233,6 +234,8 @@ bool FMCPBehaviorTreeMoveToFilterClassTest::RunTest(const FString& Parameters)
 	{
 		TestEqual(TEXT("FilterClass DefaultValue is the class that was written"),
 			MCPBTTestGetString(FilterValue->AsObject(), TEXT("defaultValue")), FilterClassPath);
+		TestTrue(TEXT("FilterClass export text retains the class path"),
+			MCPBTTestGetString(FilterValue->AsObject(), TEXT("text")).Contains(FilterClassPath));
 		bool bBound = true;
 		FilterValue->AsObject()->TryGetBoolField(TEXT("isBound"), bBound);
 		TestFalse(TEXT("a literal class is not a blackboard binding"), bBound);
@@ -263,6 +266,8 @@ bool FMCPBehaviorTreeMoveToFilterClassTest::RunTest(const FString& Parameters)
 	FilterValue = FGameplayHandlers::ReadBTNodeProperty(MoveTo, TEXT("FilterClass"), Error);
 	if (FilterValue.IsValid() && FilterValue->Type == EJson::Object)
 	{
+		TestEqual(TEXT("cleared DefaultValue path"),
+			MCPBTTestGetString(FilterValue->AsObject(), TEXT("defaultValue")), FString());
 		TestEqual(TEXT("cleared DefaultValue"),
 			MCPBTTestGetString(FilterValue->AsObject(), TEXT("defaultValueName")), FString());
 	}

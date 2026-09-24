@@ -968,7 +968,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::OverrideFunction(const TSharedPtr<FJs
 			return MCPResult(Existed);
 		}
 
-		UK2Node_Event* NewEventNode = NewObject<UK2Node_Event>(EventGraph);
+		UK2Node_Event* NewEventNode = NewObject<UK2Node_Event>(EventGraph, NAME_None, RF_Transactional);
 		NewEventNode->EventReference.SetExternalMember(FuncName, OverrideFuncClass);
 		NewEventNode->bOverrideFunction = true;
 

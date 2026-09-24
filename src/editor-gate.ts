@@ -20,8 +20,8 @@
  */
 import { requiresExplicitEditor, type ActionClass } from "./action-class.js";
 import { taskEffect } from "./action-effects.js";
-import { EDITOR_TARGET_PARAM, stripEditorTarget, type ToolDef } from "./types.js";
-import { MICRO_GATEWAY_TOOL, MICRO_GATEWAY_CALL } from "./lean-context.js";
+import { EDITOR_TARGET_PARAM, stripAction, stripEditorTarget, type ToolDef } from "./types.js";
+import { MICRO_GATEWAY_TOOL, MICRO_GATEWAY_CALL, microCallParams } from "./lean-context.js";
 import type { EditorSession, SessionRegistry } from "./session.js";
 
 /**
@@ -145,6 +145,20 @@ export function effectiveTaskName(tool: ToolDef, params: Record<string, unknown>
     return `${category}.${method}`;
   }
   return `${tool.name}.${action}`;
+}
+
+/**
+ * The task a call runs and the parameters that task reads, seen past any
+ * gateway. Asset locks are classified from this, so a micro call locks exactly
+ * what the direct call to the same action locks.
+ */
+export function callSubject(
+  tool: ToolDef,
+  params: Record<string, unknown>,
+): { taskName: string; params: Record<string, unknown> } {
+  const taskName = effectiveTaskName(tool, params);
+  const viaGateway = tool.name === MICRO_GATEWAY_TOOL && params.action === MICRO_GATEWAY_CALL;
+  return { taskName, params: viaGateway ? microCallParams(params) : stripAction(params) };
 }
 
 /**

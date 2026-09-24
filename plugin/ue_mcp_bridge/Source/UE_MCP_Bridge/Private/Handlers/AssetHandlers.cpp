@@ -1,6 +1,7 @@
 #include "AssetHandlers.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+#include "EdGraph/EdGraphNode.h"
 #include "HandlerPagination.h"
 #include "HandlerJsonProperty.h"
 #include "HandlerPropertyText.h"
@@ -189,6 +190,7 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// #975: a named subobject inside an existing asset package, which
 	// create_asset_by_class cannot make because it always creates a package.
 	Registry.RegisterHandler(TEXT("create_subobject"), &CreateSubobject);
+	Registry.RegisterHandler(TEXT("read_asset_graph"), &ReadAssetGraph);
 	Registry.RegisterHandler(TEXT("save_asset"), &SaveAsset);
 	Registry.RegisterHandler(TEXT("save_all_dirty"), &SaveAllDirty);
 	Registry.RegisterHandler(TEXT("list_textures"), &ListTextures);
@@ -3795,6 +3797,24 @@ TSharedPtr<FJsonValue> FAssetHandlers::AppendAssetArrayElements(const TSharedPtr
 			TEXT("Property '%s' is '%s', not a TArray"),
 			*PropertyName,
 			FinalProp ? *FinalProp->GetCPPType() : TEXT("unknown")));
+	}
+
+	// Nodes IS a UPROPERTY, so an append succeeds and reports a count. The node
+	// is unusable: no pins, wrong outer, and the graph will not open (#1059).
+	if (const FObjectPropertyBase* ElementObject = CastField<FObjectPropertyBase>(ArrayProp->Inner))
+	{
+		if (ElementObject->PropertyClass
+			&& ElementObject->PropertyClass->IsChildOf(UEdGraphNode::StaticClass()))
+		{
+			return MCPError(FString::Printf(
+				TEXT("Refusing to append to '%s': it holds graph nodes, and a node appended to a graph's Nodes ")
+				TEXT("array is not a working node. It has no pins, because only the graph's schema runs ")
+				TEXT("AllocateDefaultPins, so it can never be connected to anything, and its outer is wrong. The ")
+				TEXT("append would report success and leave the graph unable to open. Read the graph with ")
+				TEXT("asset(action=\"read_graph\"), and author nodes through the editor or an action that knows ")
+				TEXT("the schema for that graph type."),
+				*PropertyName));
+		}
 	}
 
 	TArray<void*> StagedElements;

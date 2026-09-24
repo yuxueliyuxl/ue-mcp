@@ -609,6 +609,33 @@ export function dialogLikeWindows(windows: NativeWindow[]): NativeWindow[] {
 // In-process snapshot (written by the plugin's status writer thread)
 // ---------------------------------------------------------------------------
 
+/**
+ * A prompt the editor is showing, as the snapshot records it.
+ *
+ * `blocksGameThread` is the fact that decides whether anything is actually
+ * stuck. Only a window on Slate's modal stack parks the game thread; a prompt
+ * raised without AddModalWindow is on screen and holds nothing (#1118).
+ * Absent on plugin builds before that, where the two were one field.
+ */
+export interface EngineSnapshotModal {
+  title: string;
+  message: string;
+  buttons: string[];
+  blocksGameThread?: boolean;
+}
+
+/**
+ * Is the engine parked behind this prompt?
+ *
+ * An older plugin does not say, and there the conservative answer is the only
+ * safe one: it is the behaviour every caller had before the field existed, and
+ * calling a real modal harmless would send a quit at an unanswered question.
+ */
+export function modalBlocksGameThread(modal: EngineSnapshotModal | null | undefined): boolean {
+  if (!modal) return false;
+  return modal.blocksGameThread !== false;
+}
+
 export interface EngineSnapshot {
   writtenAt?: string;
   ageSeconds?: number;
@@ -623,7 +650,7 @@ export interface EngineSnapshot {
   gameThreadTicking?: boolean;
   modulesLoaded?: number;
   slowTask?: { name: string; fraction: number; stack?: Array<{ name: string; fraction: number }> } | null;
-  modal?: { title: string; message: string; buttons: string[] } | null;
+  modal?: EngineSnapshotModal | null;
   compiling?: { shaders: number; assets: number };
   handler?: { method: string; elapsedSeconds: number } | null;
   [key: string]: unknown;
@@ -741,9 +768,11 @@ function summarise(state: Omit<EngineState, "summary" | "blocked">): { summary: 
   if (ours.length === 0) {
     const modal = state.snapshot?.modal;
     if (modal) {
+      const blocked = modalBlocksGameThread(modal);
+      const verb = blocked ? "is blocked on modal" : "is showing a non-blocking prompt";
       return {
-        summary: `Editor answered over the bridge and is blocked on modal "${modal.title}": ${modal.message} [${(modal.buttons ?? []).join(", ")}]`,
-        blocked: true,
+        summary: `Editor answered over the bridge and ${verb} "${modal.title}": ${modal.message} [${(modal.buttons ?? []).join(", ")}]`,
+        blocked,
       };
     }
     return {
@@ -762,8 +791,17 @@ function summarise(state: Omit<EngineState, "summary" | "blocked">): { summary: 
 
   const snap = state.snapshot;
   if (snap && (snap.ageSeconds ?? 999) < 15) {
-    if (snap.modal) {
+    if (snap.modal && modalBlocksGameThread(snap.modal)) {
       return { summary: `Editor is blocked on modal "${snap.modal.title}": ${snap.modal.message} [${(snap.modal.buttons ?? []).join(", ")}]`, blocked: true };
+    }
+    if (snap.modal) {
+      // On screen, holding nothing: the game thread ticks behind it and every
+      // call still runs. Reported, because an unanswered question is worth
+      // seeing, but never as a reason work cannot proceed (#1118).
+      return {
+        summary: `Editor is showing a non-blocking prompt "${snap.modal.title}": ${snap.modal.message} [${(snap.modal.buttons ?? []).join(", ")}]`,
+        blocked: false,
+      };
     }
     if (snap.slowTask) {
       const pct = Math.round((snap.slowTask.fraction ?? 0) * 100);

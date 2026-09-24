@@ -1804,23 +1804,15 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObj
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/DataTables"));
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
-	// Find the row struct type
-	UScriptStruct* ScriptStruct = nullptr;
-	ScriptStruct = LoadAssetByPath<UScriptStruct>(RowStruct);
+	// #1088: FTableRowBase and /Script/Engine.FTableRowBase are the spellings
+	// callers copy from headers; the UScriptStruct is named TableRowBase.
+	FString ResolveError;
+	UScriptStruct* ScriptStruct = MCPResolveScriptStruct(RowStruct, &ResolveError);
 	if (!ScriptStruct)
 	{
-		for (TObjectIterator<UScriptStruct> It; It; ++It)
-		{
-			if (It->GetName() == RowStruct)
-			{
-				ScriptStruct = *It;
-				break;
-			}
-		}
-	}
-	if (!ScriptStruct)
-	{
-		return MCPError(FString::Printf(TEXT("Row struct not found: %s"), *RowStruct));
+		return MCPError(ResolveError.IsEmpty()
+			? FString::Printf(TEXT("Row struct not found: %s"), *RowStruct)
+			: ResolveError);
 	}
 
 	UDataTableFactory* Factory = NewObject<UDataTableFactory>();

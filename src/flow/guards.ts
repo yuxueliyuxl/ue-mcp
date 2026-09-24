@@ -52,6 +52,14 @@ export interface BuildGuardsDeps {
    * gate back, with no pipeline attached.
    */
   rawBridge: IBridge;
+  /**
+   * The options a guard is declared with RIGHT NOW, re-read per call (#1061).
+   *
+   * Only the options payload: registration appends, so rebuilding the guard
+   * set would double-register rather than replace. Undefined keeps the
+   * declared options.
+   */
+  liveOptions?: (guardName: string, phase: GuardPhase) => Record<string, unknown> | undefined;
 }
 
 /** The result body a hook task returns. */
@@ -122,16 +130,19 @@ function hookOptions(
 
 /** Run one hook and give back what it answered. */
 async function runHook(
+  guardName: string,
   hook: GuardHook,
   cc: CallContext,
   deps: BuildGuardsDeps,
   phase: GuardPhase,
   result?: unknown,
 ): Promise<HookResult> {
+  // What the file says now (#1061). Nothing answered keeps the declared set.
+  const options = deps.liveOptions?.(guardName, phase) ?? hook.options;
   const task = await deps.registry.create(
     hook.class_path,
     hookContext(cc, deps) as never,
-    hookOptions(cc, hook.options, phase, result),
+    hookOptions(cc, options, phase, result),
   );
   return (await task.execute()) as HookResult;
 }
@@ -202,7 +213,7 @@ export async function buildGuards(
             before: async (cc: CallContext): Promise<void> => {
               let answered: HookResult;
               try {
-                answered = await runHook(decl.before!, cc, deps, "before");
+                answered = await runHook(name, decl.before!, cc, deps, "before");
               } catch (e) {
                 // A hook that threw denies the call. It is the same outcome as
                 // returning failure, and a guard that errors is not a guard
@@ -230,7 +241,7 @@ export async function buildGuards(
             after: async (cc: CallContext, result: unknown): Promise<unknown | void> => {
               let answered: HookResult;
               try {
-                answered = await runHook(decl.after!, cc, deps, "after", result);
+                answered = await runHook(name, decl.after!, cc, deps, "after", result);
               } catch (e) {
                 // The call already happened. Failing it now would report a
                 // mutation as not having occurred, which is worse than an

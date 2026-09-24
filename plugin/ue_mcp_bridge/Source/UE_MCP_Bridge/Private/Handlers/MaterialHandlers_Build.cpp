@@ -175,8 +175,9 @@ TSharedPtr<FJsonValue> FMaterialHandlers::BuildMaterial(const TSharedPtr<FJsonOb
 	//    typo in the set never leaves a half-built graph behind. ─────────────
 	TArray<FMaterialBuildSlot> Slots;
 	TArray<FString> Warnings;
-	for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*TexturesObj)->Values)
+	for (const auto& JsonEntry : (*TexturesObj)->Values)
 	{
+		const TPair<FString, TSharedPtr<FJsonValue>> Entry(JsonEntry.Key, JsonEntry.Value);
 		FMaterialBuildSlot Slot;
 		Slot.Key = Entry.Key;
 		if (!Entry.Value.IsValid() || !Entry.Value->TryGetString(Slot.TexturePath) || Slot.TexturePath.IsEmpty())

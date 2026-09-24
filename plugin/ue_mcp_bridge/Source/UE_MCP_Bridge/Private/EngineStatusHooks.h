@@ -2,6 +2,8 @@
 
 #include "CoreMinimal.h"
 
+#include "MCPEngineStatus.h"
+
 /**
  * Wires the editor-only sensors into FMCPEngineStatus, which lives in the
  * UE_MCP_BridgeStatus module and has been publishing since PostConfigInit on
@@ -24,4 +26,11 @@ namespace FMCPEngineStatusHooks
 
 	/** Unregister everything registered by Install. Safe to call twice. */
 	void Remove();
+
+	/** The modal provider Install wires in, as a value.
+	 *
+	 *  Exposed so a test that swaps in its own can put this one back without
+	 *  re-running Install, which would register the Slate delegates a second
+	 *  time, and without a second copy of the wiring drifting from this one. */
+	FMCPEngineStatus::FModalProvider ModalProvider();
 }

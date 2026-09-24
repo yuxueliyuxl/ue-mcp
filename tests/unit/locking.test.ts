@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { classifyAction, resolveLockingConfig, withAssetLocks } from "../../src/locking.js";
 import type { IBridge } from "../../src/bridge.js";
 import { McpError, ErrorCode } from "../../src/errors.js";
+import { callSubject } from "../../src/editor-gate.js";
+import { buildMicroGateway } from "../../src/lean-context.js";
+import { assetTool } from "../../src/tools/asset.js";
+import type { ToolDef } from "../../src/types.js";
 
 describe("classifyAction", () => {
   it("treats read verbs as non-mutating", () => {
@@ -146,5 +150,28 @@ describe("withAssetLocks", () => {
       "acquire_lock:/Game/B",
       "release_lock:/Game/A",
     ]);
+  });
+
+  it("locks a micro tools.call exactly as the direct call to the same action", async () => {
+    const gateway = buildMicroGateway([assetTool]);
+    const locked = async (tool: ToolDef, params: Record<string, unknown>) => {
+      const calls: Array<[string, Record<string, unknown>]> = [];
+      const bridge = fakeBridge(calls, () => ({ acquired: true }));
+      const subject = callSubject(tool, params);
+      await withAssetLocks(bridge, cfg, subject.taskName, subject.params, async () => "ok");
+      return { taskName: subject.taskName, calls: calls.map((c) => `${c[0]}:${c[1].path}`) };
+    };
+    for (const [action, args] of [
+      ["set_property", { assetPath: "/Game/Foo", propertyName: "X", value: 1 }],
+      ["move", { sourcePath: "/Game/A", destinationPath: "/Game/B" }],
+      ["delete_batch", { assetPaths: ["/Game/A", "/Game/B"] }],
+    ] as const) {
+      const direct = await locked(assetTool, { action, ...args });
+      const micro = await locked(gateway, {
+        action: "call", category: "asset", method: action, timeoutMs: 60_000, args: { ...args, select: ["path"] },
+      });
+      expect(direct.calls.length, action).toBeGreaterThan(0);
+      expect(micro, action).toEqual(direct);
+    }
   });
 });

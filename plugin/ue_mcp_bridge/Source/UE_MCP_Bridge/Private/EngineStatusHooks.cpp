@@ -15,14 +15,19 @@ namespace
 	FDelegateHandle GModalLoopHandle;
 }
 
+FMCPEngineStatus::FModalProvider FMCPEngineStatusHooks::ModalProvider()
+{
+	return [](FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons, bool& OutBlocksGameThread)
+	{
+		return FDialogHandlers::DescribeActiveModal(OutTitle, OutMessage, OutButtons, &OutBlocksGameThread);
+	};
+}
+
 void FMCPEngineStatusHooks::Install()
 {
 	FMCPEngineStatus& Status = FMCPEngineStatus::Get();
 
-	Status.SetModalProvider([](FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons)
-	{
-		return FDialogHandlers::DescribeActiveModal(OutTitle, OutMessage, OutButtons);
-	});
+	Status.SetModalProvider(ModalProvider());
 
 	Status.SetCompileProvider([](int32& OutShaderJobs, int32& OutAssetCompiles)
 	{

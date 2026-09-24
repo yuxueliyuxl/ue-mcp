@@ -513,8 +513,9 @@ namespace
 	bool MCPBTAApplyProperties(UBTNode* Instance, const TSharedPtr<FJsonObject>& Properties, FString& OutError)
 	{
 		if (!Instance || !Properties.IsValid()) return true;
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Properties->Values)
+		for (const auto& JsonEntry : Properties->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 			FString WriteError;
 			if (!FGameplayHandlers::WriteBTNodeProperty(Instance, Pair.Key, Pair.Value, WriteError))
 			{
@@ -545,8 +546,9 @@ namespace
 		UClass* NodeClass = Instance->GetClass();
 		UBlackboardData* Blackboard = Tree ? Tree->BlackboardAsset.Get() : nullptr;
 
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Keys->Values)
+		for (const auto& JsonEntry : Keys->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 			FString KeyName;
 			if (!Pair.Value.IsValid() || !Pair.Value->TryGetString(KeyName))
 			{

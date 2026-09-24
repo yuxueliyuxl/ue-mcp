@@ -174,7 +174,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::AddNode(const TSharedPtr<FJsonObject>
 	}
 
 	// Create node instance
-	UEdGraphNode* NewNode = NewObject<UEdGraphNode>(TargetGraph, NodeUClass);
+	UEdGraphNode* NewNode = NewObject<UEdGraphNode>(TargetGraph, NodeUClass, NAME_None, RF_Transactional);
 	if (!NewNode)
 	{
 		return MCPError(TEXT("Failed to create node"));

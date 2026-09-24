@@ -60,7 +60,19 @@ export interface ElicitParams {
 export type ElicitPrimitiveSchema =
   | { type: "string"; title?: string; description?: string; enum?: string[]; enumNames?: string[]; default?: string }
   | { type: "number" | "integer"; title?: string; description?: string; default?: number }
-  | { type: "boolean"; title?: string; description?: string; default?: boolean };
+  | { type: "boolean"; title?: string; description?: string; default?: boolean }
+  | (ElicitMultiSelectBase & { items: { type: "string"; enum: string[] } })
+  | (ElicitMultiSelectBase & { items: { anyOf: Array<{ const: string; title: string }> } });
+
+/** A checkbox group: the answer is the list of ticked values. */
+interface ElicitMultiSelectBase {
+  type: "array";
+  title?: string;
+  description?: string;
+  minItems?: number;
+  maxItems?: number;
+  default?: string[];
+}
 
 export interface ElicitResult {
   action: "accept" | "decline" | "cancel";
@@ -555,6 +567,20 @@ export const TIMEOUT_PARAM = z
     + "call did not happen: read the state back before retrying.",
   );
 
+/** The parameters the dispatcher consumes, built once per category. */
+function routingSchema(actionNames: [string, ...string[]]): Record<string, z.ZodType> {
+  return {
+    action: actionEnum(actionNames),
+    // #989: a call budget the caller controls. The client used to wait a flat
+    // 30s for every bridge call, and a large batch on a machine that is also
+    // compiling shaders finished in the editor after the client had already
+    // reported a failure. A retry then applied the mutation twice.
+    timeoutMs: TIMEOUT_PARAM,
+    select: SELECT_PARAM,
+    omit: OMIT_PARAM,
+  };
+}
+
 export function categoryTool(
   name: string,
   summary: string,
@@ -564,6 +590,7 @@ export function categoryTool(
   options?: CategoryOptions,
 ): ToolDef {
   const actionNames = Object.keys(actions) as [string, ...string[]];
+  const routing = routingSchema(actionNames);
 
   // Auto-generate action docs from per-action descriptions if not provided
   const docs = actionDocs ?? actionNames
@@ -577,17 +604,9 @@ export function categoryTool(
     name,
     options,
     description: `${summary}\n\nActions:\n${docs}`,
-    schema: {
-      action: actionEnum(actionNames),
-      // #989: a call budget the caller controls. The client used to wait a flat
-      // 30s for every bridge call, and a large batch on a machine that is also
-      // compiling shaders finished in the editor after the client had already
-      // reported a failure. A retry then applied the mutation twice.
-      timeoutMs: TIMEOUT_PARAM,
-      select: SELECT_PARAM,
-      omit: OMIT_PARAM,
-      ...extraSchema,
-    },
+    // Spread twice: the first sets the order, the last wins, so a category
+    // cannot replace a parameter the dispatcher consumes.
+    schema: { ...routing, ...extraSchema, ...routing },
     actions,
     handler: async (ctx, rawParams) => {
       // `editor` is a routing instruction, never a handler parameter, and only
@@ -619,9 +638,9 @@ export function categoryTool(
       // parameters (`timeoutMs`, `select`, `omit`) come off so no mapParams can
       // forward one into a bridge call, the paths are repaired before anything
       // reads them, and the category's own folding runs last over the repaired
-      // bag. This route calls it; the live route in flow/task-factory.ts calls
-      // the same function with the same preparation. Neither reimplements a
-      // step of it, and nothing per-call belongs in this closure again.
+      // bag. flow/task-factory.ts calls the same function. `action` is stripped
+      // separately on both routes, because prepareCall leaves a bag that
+      // already carries it alone.
       const pipeline = prepareCall(params, {
         action,
         normalizeParams: options?.normalizeParams,
@@ -643,7 +662,12 @@ export function categoryTool(
         );
       }
       if (spec.kind === "bridge") {
-        const mapped = spec.mapParams ? spec.mapParams(normalized) : stripAction(normalized);
+        // Stripped BEFORE mapParams, not instead of it: a mapParams that
+        // forwards its whole bag would otherwise send the action's own name to
+        // the bridge as an argument. Nothing here reads the key.
+        const mapped = spec.mapParams
+          ? spec.mapParams(stripAction(normalized))
+          : stripAction(normalized);
         // The caller's budget wins over the action's authored one: an action
         // that declares 120s is stating a floor it needs, not a ceiling the
         // caller may not raise.
@@ -660,7 +684,10 @@ export function categoryTool(
   return def;
 }
 
-function stripAction(params: Record<string, unknown>): Record<string, unknown> {
+/** Drop the dispatch key. Every route that hands a bag to a bridge action must
+ *  call this FIRST: a mapParams that forwards its whole bag would otherwise
+ *  send the action's own name as an argument. */
+export function stripAction(params: Record<string, unknown>): Record<string, unknown> {
   const { action: _, ...rest } = params;
   return rest;
 }

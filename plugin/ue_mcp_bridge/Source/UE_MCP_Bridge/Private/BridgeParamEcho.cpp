@@ -57,8 +57,9 @@ void FMCPParamEcho::Record(const FString& Method, const TSharedPtr<FJsonObject>&
 
 	if (Params.IsValid())
 	{
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Params->Values)
+		for (const auto& JsonEntry : Params->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 			// The key, never the value. See the header.
 			Entry.ParamNames.Add(Pair.Key);
 		}

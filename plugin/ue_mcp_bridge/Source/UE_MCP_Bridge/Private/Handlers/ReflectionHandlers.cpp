@@ -486,10 +486,13 @@ TSharedPtr<FJsonValue> FReflectionHandlers::ReflectStruct(const TSharedPtr<FJson
 	FString StructName;
 	if (auto Err = RequireString(Params, TEXT("structName"), StructName)) return Err;
 
-	UScriptStruct* Struct = FindStruct(StructName);
+	FString ResolveError;
+	UScriptStruct* Struct = FindStruct(StructName, &ResolveError);
 	if (!Struct)
 	{
-		return MCPError(FString::Printf(TEXT("Struct not found: %s"), *StructName));
+		return MCPError(ResolveError.IsEmpty()
+			? FString::Printf(TEXT("Struct not found: %s"), *StructName)
+			: ResolveError);
 	}
 
 	auto Result = MCPSuccess();
@@ -992,30 +995,11 @@ UClass* FReflectionHandlers::FindClass(const FString& ClassName)
 	return MCPResolveClass(ClassName, /*bAllowLoad*/ false);
 }
 
-UScriptStruct* FReflectionHandlers::FindStruct(const FString& StructName)
+UScriptStruct* FReflectionHandlers::FindStruct(const FString& StructName, FString* OutError)
 {
-	// Try direct lookup (handles full paths like /Script/ModuleName.StructName)
-	UScriptStruct* Struct = FindObject<UScriptStruct>(nullptr, *StructName);
-	if (Struct)
-	{
-		return Struct;
-	}
-
-	// Short-name lookup via FindFirstObject (UE 5.6+ replacement for the
-	// "any package" FindObject pattern). Tries the caller's spelling first,
-	// then F-prefixed - matches the convention agents typically use ("Vector"
-	// vs "FVector").
-	const TArray<FString> Candidates = { StructName, TEXT("F") + StructName };
-	for (const FString& Candidate : Candidates)
-	{
-		Struct = FindFirstObject<UScriptStruct>(*Candidate, EFindFirstObjectOptions::NativeFirst);
-		if (Struct)
-		{
-			return Struct;
-		}
-	}
-
-	return nullptr;
+	// #1088: shared resolver with create_datatable. reflect_struct alone keeps
+	// the added-F fallback it has always had, for structs registered with an F.
+	return MCPResolveScriptStruct(StructName, OutError, /*bTryAddedF=*/true);
 }
 
 UEnum* FReflectionHandlers::FindEnum(const FString& EnumName)

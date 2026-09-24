@@ -287,8 +287,9 @@ TSharedPtr<FJsonValue> FFoliageHandlers::BatchSetFoliageSettingsWhere(const TSha
 		bool bTypeOk = true;
 		bool bTypeChanged = false;
 		TSharedPtr<FJsonObject> RollbackProperties = MakeShared<FJsonObject>();
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*SettingsObject)->Values)
+		for (const auto& JsonEntry : (*SettingsObject)->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 			TSharedPtr<FJsonObject> SettingRow = MakeShared<FJsonObject>();
 			SettingRow->SetStringField(TEXT("propertyName"), Pair.Key);
 

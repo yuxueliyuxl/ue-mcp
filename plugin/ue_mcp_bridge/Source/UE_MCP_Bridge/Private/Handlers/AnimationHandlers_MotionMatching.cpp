@@ -783,7 +783,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddMotionMatchingNode(const TSharedPt
 		if (!Database) return MCPError(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *DbPath));
 	}
 
-	UAnimGraphNode_MotionMatching* MMNode = NewObject<UAnimGraphNode_MotionMatching>(Graph);
+	UAnimGraphNode_MotionMatching* MMNode = NewObject<UAnimGraphNode_MotionMatching>(Graph, NAME_None, RF_Transactional);
 	PlaceAnimNode(Graph, MMNode, 0, 0);
 
 	UScriptStruct* NodeStruct = nullptr;
@@ -859,7 +859,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddPoseHistoryNode(const TSharedPtr<F
 	for (UEdGraph* G : All) { if (G && G->GetName() == GraphName) { Graph = G; break; } }
 	if (!Graph) return MCPError(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
 
-	UAnimGraphNode_PoseSearchHistoryCollector* HistNode = NewObject<UAnimGraphNode_PoseSearchHistoryCollector>(Graph);
+	UAnimGraphNode_PoseSearchHistoryCollector* HistNode = NewObject<UAnimGraphNode_PoseSearchHistoryCollector>(Graph, NAME_None, RF_Transactional);
 	PlaceAnimNode(Graph, HistNode, -300, 0);
 
 	UScriptStruct* NodeStruct = nullptr;
@@ -970,7 +970,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMotionMatchingChooser(const TShare
 	Graph->Modify();
 
 	// EvaluateChooser(ContextObject, ChooserTable, ObjectClass) -> UObject (typed to ObjectClass).
-	UK2Node_CallFunction* EvalNode = NewObject<UK2Node_CallFunction>(Graph);
+	UK2Node_CallFunction* EvalNode = NewObject<UK2Node_CallFunction>(Graph, NAME_None, RF_Transactional);
 	EvalNode->SetFromFunction(EvalFunc);
 	Graph->AddNode(EvalNode, false, false);
 	EvalNode->CreateNewGuid();
@@ -1002,7 +1002,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMotionMatchingChooser(const TShare
 		{
 			if (UFunction* PawnFunc = UAnimInstance::StaticClass()->FindFunctionByName(TEXT("TryGetPawnOwner")))
 			{
-				UK2Node_CallFunction* PawnNode = NewObject<UK2Node_CallFunction>(Graph);
+				UK2Node_CallFunction* PawnNode = NewObject<UK2Node_CallFunction>(Graph, NAME_None, RF_Transactional);
 				PawnNode->SetFromFunction(PawnFunc);
 				Graph->AddNode(PawnNode, false, false);
 				PawnNode->CreateNewGuid();
@@ -1017,7 +1017,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMotionMatchingChooser(const TShare
 
 		if (!ContextSourcePin) // "self" (default) or pawn-getter unavailable
 		{
-			UK2Node_Self* SelfNode = NewObject<UK2Node_Self>(Graph);
+			UK2Node_Self* SelfNode = NewObject<UK2Node_Self>(Graph, NAME_None, RF_Transactional);
 			Graph->AddNode(SelfNode, false, false);
 			SelfNode->CreateNewGuid();
 			SelfNode->PostPlacedNewNode();
@@ -1135,7 +1135,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddSequenceEvaluator(const TSharedPtr
 		if (!Sequence) return MCPError(FString::Printf(TEXT("AnimSequence not found: %s"), *SequencePath));
 	}
 
-	UAnimGraphNode_SequenceEvaluator* EvalNode = NewObject<UAnimGraphNode_SequenceEvaluator>(Graph);
+	UAnimGraphNode_SequenceEvaluator* EvalNode = NewObject<UAnimGraphNode_SequenceEvaluator>(Graph, NAME_None, RF_Transactional);
 	PlaceAnimNode(Graph, EvalNode, 0, 0);
 
 	UScriptStruct* NodeStruct = nullptr;

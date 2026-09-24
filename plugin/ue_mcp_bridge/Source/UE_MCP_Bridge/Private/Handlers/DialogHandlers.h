@@ -8,6 +8,27 @@ class SButton;
 class SCheckBox;
 class SWindow;
 
+/**
+ * What a window is, to a caller waiting on the editor (#1118).
+ *
+ * The two prompt kinds are not the same fact and were being treated as one.
+ * Only a modal parks the game thread, so only a modal can justify refusing a
+ * call that would otherwise have run.
+ */
+enum class EMCPPromptKind : uint8
+{
+	/** Not a question: a workspace window, a menu, a tooltip, a notification. */
+	NotAPrompt,
+	/** On Slate's modal stack. The game thread is inside the modal loop and
+	 *  nothing else runs until a button is pressed. */
+	Modal,
+	/** Regular, parented, not modal, hosting no docked tabs: the shape of a
+	 *  prompt the editor raised without AddModalWindow. Reported, because a
+	 *  quit must never be sent at an unanswered question, but the engine keeps
+	 *  ticking behind it and bridge calls keep working. */
+	Parented,
+};
+
 class FDialogHandlers
 {
 public:
@@ -52,7 +73,11 @@ public:
 	 * so an out-of-band caller can see the dialog that is blocking the very
 	 * request it is waiting on.
 	 */
-	static bool DescribeActiveModal(FString& OutTitle, FString& OutMessage, TArray<FString>& OutButtons);
+	static bool DescribeActiveModal(
+		FString& OutTitle,
+		FString& OutMessage,
+		TArray<FString>& OutButtons,
+		bool* OutBlocksGameThread = nullptr);
 
 	/**
 	 * One modal's buttons, in the order Slate laid them out. Public only so the
@@ -83,6 +108,23 @@ public:
 		TArray<FString> Cells;
 		bool bChecked = false;
 	};
+
+	/** What this window is, to a caller waiting on the editor (#1078/#1118).
+	 *
+	 *  On NotAPrompt, OutSkipReason carries the sentence list_dialogs reports
+	 *  under notTreatedAsDialogs, and is empty for a window that was never a
+	 *  candidate. */
+	static EMCPPromptKind ClassifyWindow(const TSharedRef<class SWindow>& Window, FString* OutSkipReason = nullptr);
+
+	/** Is the editor waiting on an answer from this window? (#1078)
+	 *
+	 *  True for either prompt kind. Whether the game thread is PARKED behind
+	 *  it is a different question, which ClassifyWindow answers and this cannot
+	 *  (#1118). */
+	static bool IsBlockingWindow(const TSharedRef<class SWindow>& Window, FString* OutSkipReason = nullptr);
+
+	/** The wire name of a prompt kind, as list_dialogs reports it. */
+	static const TCHAR* PromptKindName(EMCPPromptKind Kind);
 
 private:
 	// Dialog policy: pattern -> response mapping
@@ -121,7 +163,8 @@ private:
 	// Shared modal walk. One traversal answers DescribeActiveModal,
 	// list_dialogs, respond_to_dialog and the policy applier, so the four
 	// cannot disagree about which buttons a dialog has.
-	static TSharedPtr<SWindow> CollectActiveModal(FString& OutTitle, FString& OutMessage, TArray<FModalButton>& OutButtons, TArray<FModalItem>* OutItems = nullptr);
+	static TSharedPtr<SWindow> CollectActiveModal(FString& OutTitle, FString& OutMessage, TArray<FModalButton>& OutButtons, TArray<FModalItem>* OutItems = nullptr, EMCPPromptKind* OutKind = nullptr);
+
 
 	/** First policy whose pattern appears in the title or the message. */
 	static const FDialogPolicy* FindMatchingPolicy(const FString& Title, const FString& Message);

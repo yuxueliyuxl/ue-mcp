@@ -6,6 +6,7 @@
 #include "HandlerRegistry.h"
 #include "Handlers/DiffHandlers.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/TextBuffer.h"
 #include "ReferenceSkeleton.h"
 #include "UObject/ObjectSaveContext.h"
 #include "UObject/Package.h"
@@ -83,7 +84,7 @@ public:
 
 	UObject* AddWrongTypeObject(const TCHAR* Name)
 	{
-		return NewObject<UObject>(Package, FName(Name), RF_Transient);
+		return NewObject<UTextBuffer>(Package, FName(Name), RF_Transient);
 	}
 
 	void ResetDirty() const
@@ -246,10 +247,15 @@ bool FSkeletonDiffRegistrationAndValidationTest::RunTest(const FString& Paramete
 		TestFalse(TEXT("wrong-type otherPath fails"), WrongTypeResult->GetBoolField(TEXT("success")));
 		const FString Error = WrongTypeResult->GetStringField(TEXT("error"));
 		TestTrue(TEXT("wrong type requires an exact Skeleton"), Error.Contains(TEXT("must be exactly a Skeleton")));
-		TestTrue(TEXT("wrong type identifies the resolved class"), Error.Contains(TEXT("Object")));
+		TestTrue(TEXT("wrong type identifies the resolved class"), Error.Contains(TEXT("TextBuffer")));
 	}
 
 	const FString MissingFromPath = Fixture.GetPackage()->GetName() + TEXT(".MissingFrom");
+	AddExpectedError(
+		FString::Printf(TEXT("LoadAsset failed: The AssetData '%s'"),
+			*MissingFromPath.Replace(TEXT("."), TEXT("\\."))),
+		EAutomationExpectedErrorFlags::Contains,
+		1);
 	const TSharedPtr<FJsonObject> MissingFrom = ExecuteDiff(
 		Registry,
 		MissingFromPath,
@@ -264,6 +270,11 @@ bool FSkeletonDiffRegistrationAndValidationTest::RunTest(const FString& Paramete
 	}
 
 	const FString MissingToPath = Fixture.GetPackage()->GetName() + TEXT(".MissingTo");
+	AddExpectedError(
+		FString::Printf(TEXT("LoadAsset failed: The AssetData '%s'"),
+			*MissingToPath.Replace(TEXT("."), TEXT("\\."))),
+		EAutomationExpectedErrorFlags::Contains,
+		1);
 	const TSharedPtr<FJsonObject> MissingTo = ExecuteDiff(
 		Registry,
 		Skeleton->GetPathName(),

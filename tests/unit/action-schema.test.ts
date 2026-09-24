@@ -20,7 +20,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { z } from "zod";
-import { categoryTool, bp } from "../../src/types.js";
+import { categoryTool, bp} from "../../src/types.js";
 import { ALL_TOOLS } from "../../src/tools.js";
 import { requiresExplicitEditor } from "../../src/action-class.js";
 import {
@@ -48,6 +48,145 @@ describe("action parameter schema", () => {
         + "call still reports success. Declare it in the category's extraSchema, or\n"
         + "stop documenting/reading it:\n  " + offenders.join("\n  "),
     ).toEqual([]);
+  });
+
+  // ROUTING_PARAMS exempts `action` from the drift check above, which is also
+  // a blind spot: a HANDLER parameter of that name is undeclarable,
+  // unforwardable and undocumentable, and nothing said so (#1078).
+  it("never declares or documents a handler parameter named 'action'", () => {
+    const offenders: string[] = [];
+    for (const tool of ALL_TOOLS) {
+      const declared = new Set(Object.keys(tool.schema));
+      for (const [name, spec] of Object.entries(tool.actions)) {
+        const parsed = parseParams(spec.description ?? "", declared);
+        if (parsed.params.some((p) => p.name === "action")) {
+          offenders.push(`${tool.name}.${name}: documents a parameter named 'action'`);
+        }
+        if (forwardedParams(spec).includes("action")) {
+          offenders.push(`${tool.name}.${name}: forwards a parameter named 'action'`);
+        }
+      }
+    }
+    expect(
+      offenders,
+      "The category tool dispatches on 'action', so a handler parameter of that\n"
+        + "name can never arrive: the surface strips it, and a caller who writes it\n"
+        + "selects an action instead. Give it another name on the wire and read the\n"
+        + "new one in the handler, or accept it nested inside 'input':\n  "
+        + offenders.join("\n  "),
+    ).toEqual([]);
+  });
+
+  // The static check above cannot see a closure that spreads its argument, and
+  // every generated Epic action has that shape. This one dispatches for real
+  // and looks at what the bridge was handed.
+  it("never hands the bridge the dispatch key, whatever mapParams does with its bag", async () => {
+    const offenders: string[] = [];
+    for (const tool of ALL_TOOLS) {
+      for (const [name, spec] of Object.entries(tool.actions)) {
+        if (spec.kind !== "bridge") continue;
+        let seen: Record<string, unknown> | null = null;
+        const ctx = {
+          bridge: {
+            isConnected: true,
+            call: async (_m: string, params: Record<string, unknown>) => { seen = params; return {}; },
+            getTarget: () => ({ projectPath: null, port: 0, portSource: "default", verified: true }),
+            connect: async () => {},
+            retargetProject: () => ({}),
+          },
+          project: {},
+        } as never;
+        try {
+          await tool.handler(ctx, { action: name });
+        } catch {
+          // A refusal before dispatch proves the key never reached the bridge.
+          continue;
+        }
+        if (seen === null) continue;
+        const serialized = JSON.stringify(seen);
+        if (serialized.includes(`"${name}"`)) {
+          offenders.push(`${tool.name}.${name}: the bridge payload contains the action name`);
+        }
+        // An `action` KEY is not the fault: play_in_editor and play_sequence
+        // call bridge methods whose own argument is named action, renamed on
+        // the surface. The fault is the dispatch key's VALUE travelling.
+      }
+    }
+    expect(
+      offenders,
+      "The dispatcher consumes 'action' to choose the spec, so it must never\n"
+        + "reach the bridge as an argument. An action whose mapParams forwards its\n"
+        + "whole bag sends the action's own NAME to the handler, which for a\n"
+        + "wrapped tool taking an argument called 'action' is a real value it will\n"
+        + "try to use:\n  " + offenders.join("\n  "),
+    ).toEqual([]);
+  });
+
+  // niagara(batch) dispatches to other actions itself, so it never reaches the
+  // check above and carried the same leak after types.ts was fixed. The probe
+  // is a spec that forwards its bag verbatim, because no shipped niagara action
+  // does today and a test that cannot fail proves nothing.
+  it("never leaks the dispatch key through a category's own batch route", async () => {
+    const niagara = ALL_TOOLS.find((t) => t.name === "niagara")!;
+    const probe = "epic_leak_probe";
+    (niagara.actions as Record<string, unknown>)[probe] = bp(
+      "read",
+      "Probe. Params: none",
+      "probe_method",
+      (p) => ({ ...p }),
+    );
+    try {
+      const seen: Array<Record<string, unknown>> = [];
+      const ctx = {
+        bridge: {
+          isConnected: true,
+          call: async (_m: string, params: Record<string, unknown>) => { seen.push(params); return {}; },
+          getTarget: () => ({ projectPath: null, port: 0, portSource: "default", verified: true }),
+          connect: async () => {},
+          retargetProject: () => ({}),
+        },
+        project: {},
+      } as never;
+
+      await niagara.handler(ctx, { action: "batch", ops: [{ action: probe }] });
+
+      expect(seen.length, "the probe should have reached the bridge").toBe(1);
+      expect(
+        Object.prototype.hasOwnProperty.call(seen[0], "action"),
+        "A batch route hands each op's bag to that action's mapParams, so it\n"
+          + "must strip the dispatch key exactly as the tool handler does. Payload:\n"
+          + JSON.stringify(seen[0]),
+      ).toBe(false);
+    } finally {
+      delete (niagara.actions as Record<string, unknown>)[probe];
+    }
+  });
+
+  // The generator is no longer the only thing standing between a wrapped tool
+  // argument and the dispatch parameter: categoryTool re-asserts its own keys
+  // after merging a category's, so declaring one cannot replace it.
+  it("cannot have its routing parameters replaced by a category's own schema", () => {
+    const hostile = categoryTool(
+      "probe",
+      "Probe.",
+      { alpha: bp("read", "Alpha. Params: none", "probe_alpha") },
+      undefined,
+      {
+        action: z.string().optional().describe("hostile"),
+        timeoutMs: z.string().optional().describe("hostile"),
+        select: z.string().optional().describe("hostile"),
+        omit: z.string().optional().describe("hostile"),
+      },
+    );
+
+    for (const key of ["action", "timeoutMs", "select", "omit"]) {
+      expect(
+        hostile.schema[key].description ?? "",
+        `${key} was replaced by the category's own declaration`,
+      ).not.toBe("hostile");
+    }
+    // And the dispatch parameter still enumerates the category's actions.
+    expect(JSON.stringify(hostile.schema.action)).toContain("alpha");
   });
 
   it("documents parameters on every action", () => {

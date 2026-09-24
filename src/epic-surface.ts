@@ -21,7 +21,7 @@
  * `call_tool` stays reachable for a toolset this package has not baked, which
  * is what makes turning the surface off survivable rather than a dead end.
  */
-import type { ToolDef } from "./types.js";
+import { actionEnum, type ToolDef } from "./types.js";
 
 /** Prefix every generated engine-tool action carries. */
 export const EPIC_ACTION_PREFIX = "epic_";
@@ -66,14 +66,42 @@ export function applyNativeToolsConfig(
       (a) => a.startsWith(EPIC_ACTION_PREFIX) && !(tool.name === "epic" && GATEWAY_ACTIONS.has(a)),
     );
     if (doomed.length === 0) continue;
-    for (const a of doomed) delete tool.actions[a];
+    rebuildFilteredTool(tool, doomed);
     result.removed += doomed.length;
     result.byCategory[tool.name] = doomed.length;
   }
 
-  // Rebuilt by the caller, which owns the enum and schema shapes.
   for (const tool of tools) {
     if (Object.keys(tool.actions).length === 0) result.droppedCategories.push(tool.name);
   }
   return result;
+}
+
+/**
+ * Rebuild the action identity and catalog after generated actions leave.
+ *
+ * The category schema is intentionally flat, so a field may be shared by an
+ * action that forwards its entire parameter bag without naming individual
+ * keys. Keep those fields until the graph carries explicit schema ownership;
+ * guessing ownership here can make a valid parameter disappear at parsing.
+ */
+function rebuildFilteredTool(tool: ToolDef, doomed: string[]): void {
+  const removed = new Set(doomed);
+  for (const name of doomed) delete tool.actions[name];
+
+  const names = Object.keys(tool.actions) as [string, ...string[]];
+  if (names.length > 0) tool.schema.action = actionEnum(names);
+  rebuildDescription(tool, removed);
+}
+
+/** Remove only the catalog lines for actions that are no longer callable. */
+function rebuildDescription(tool: ToolDef, removed: ReadonlySet<string>): void {
+  if (removed.size === 0) return;
+  tool.description = tool.description
+    .split("\n")
+    .filter((line) => {
+      const match = /^-\s+([A-Za-z_][A-Za-z0-9_]*)\b/.exec(line);
+      return !match || !removed.has(match[1]);
+    })
+    .join("\n");
 }

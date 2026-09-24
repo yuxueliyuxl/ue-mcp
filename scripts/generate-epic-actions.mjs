@@ -30,6 +30,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+// The dispatcher's own parameter names, imported from the module that
+// declares them. Run under tsx, so this reads the real export rather than
+// parsing the file.
+import { ROUTING_PARAMS } from "../src/action-schema.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CATALOG = path.join(ROOT, "tests", "golden", "epic-catalog.json");
@@ -105,12 +109,33 @@ function prose(description) {
     .trim();
 }
 
-/** The `Params:` clause every action on this surface is required to carry. */
+/**
+ * Names the dispatcher consumes before a call reaches the bridge (#1078).
+ * Declaring one here would overwrite the category's own parameter, so such an
+ * argument goes inside `input` instead.
+ */
+const RESERVED_TOP_LEVEL = ROUTING_PARAMS;
+
+/** Tool argument names this generator must not declare at the top level. */
+function reservedArgs(inputSchema) {
+  return Object.keys(inputSchema?.properties ?? {}).filter((n) => RESERVED_TOP_LEVEL.has(n));
+}
+
+/** The `Params:` clause every action on this surface is required to carry.
+ *  A reserved argument is named in a parenthetical, which the parser reads as
+ *  prose rather than as a promised key. */
 function paramsClause(inputSchema) {
   const props = Object.keys(inputSchema?.properties ?? {});
   if (props.length === 0) return "Params: none";
   const required = new Set(inputSchema?.required ?? []);
-  return `Params: ${props.map((n) => (required.has(n) ? n : `${n}?`)).join(", ")}`;
+  const reserved = reservedArgs(inputSchema);
+  const plain = props
+    .filter((n) => !RESERVED_TOP_LEVEL.has(n))
+    .map((n) => (required.has(n) ? n : `${n}?`));
+  if (reserved.length > 0) {
+    plain.push(`input? (carries ${reserved.join(", ")}, which cannot be sent at the top level)`);
+  }
+  return `Params: ${plain.join(", ")}`;
 }
 
 /* ── parameter types ────────────────────────────────────────────────────── */
@@ -186,7 +211,7 @@ function main() {
 
   for (const ts of catalog.toolsets ?? []) {
     const category = routeToolset(ts.name);
-    if (!byCategory.has(category)) byCategory.set(category, { actions: [], params: new Map(), keys: new Set() });
+    if (!byCategory.has(category)) byCategory.set(category, { actions: [], params: new Map(), keys: new Set(), needsInput: false });
     const bucket = byCategory.get(category);
 
     for (const tool of ts.tools ?? []) {
@@ -206,7 +231,10 @@ function main() {
       bucket.keys.add(key);
 
       const input = tool.inputSchema ?? {};
+      if (reservedArgs(input).length > 0) bucket.needsInput = true;
       for (const [name, prop] of Object.entries(input.properties ?? {})) {
+        // Never declared: the category tool owns the name.
+        if (RESERVED_TOP_LEVEL.has(name)) continue;
         if (!bucket.params.has(name)) bucket.params.set(name, { kinds: new Set(), description: "" });
         const entry = bucket.params.get(name);
         entry.kinds.add(kindOf(prop));
@@ -283,6 +311,22 @@ import { bp, type ActionSpec } from "../../types.js";
 import { epicToolCall } from "../../epic-input.js";
 
 `;
+
+  // The nested escape, declared only where a wrapped tool needs it.
+  if (bucket.needsInput) {
+    if (!bucket.params.has("input")) {
+      bucket.params.set("input", {
+        kinds: new Set(["object"]),
+        description: "The wrapped tool's arguments as an object. Use it for an argument this category cannot take at the top level because its dispatcher owns that name.",
+      });
+    }
+    if (!bucket.params.has("inputJson")) {
+      bucket.params.set("inputJson", {
+        kinds: new Set(["string"]),
+        description: "The wrapped tool's arguments as a raw JSON string. Takes full control: nothing is merged in when it is set.",
+      });
+    }
+  }
 
   const schemas = [...bucket.params.entries()]
     .sort((a, b) => a[0].localeCompare(b[0]))

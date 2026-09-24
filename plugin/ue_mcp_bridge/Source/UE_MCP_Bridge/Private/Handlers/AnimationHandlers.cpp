@@ -1393,8 +1393,9 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 				*NotifyClassName));
 		}
 
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*NotifyProperties)->Values)
+		for (const auto& JsonEntry : (*NotifyProperties)->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Entry(JsonEntry.Key, JsonEntry.Value);
 			FProperty* Property = NewNotify->GetClass()->FindPropertyByName(FName(*Entry.Key));
 			if (!Property)
 			{

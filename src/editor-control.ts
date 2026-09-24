@@ -14,9 +14,10 @@ import {
   readEngineState,
   readEngineSnapshot,
   readLogState,
+  modalBlocksGameThread,
   type EngineState,
 } from "./engine-observer.js";
-import { findLiveInstanceRecord, isPidAlive, lockfileIsFromThisLaunch, resolveBridgeTarget } from "./editor-target.js";
+import { findLiveInstanceRecord, isPidAlive, lockfileIsFromThisLaunch, readBridgeInstanceRecords, resolveBridgeTarget } from "./editor-target.js";
 import { startProgress } from "./ui/progress.js";
 import { getDialogMode, getUserStatePath, type DialogMode } from "./user-state.js";
 import { DialogGuard, STATUS_STALE_AFTER_MS, oneLine, type DialogPhase } from "./dialog-guard.js";
@@ -326,9 +327,14 @@ export async function waitForEditorReady(
     if (logIsCurrent && logState.phase === "crashed") {
       return finish({ ready: false, elapsedSeconds: elapsed(), timeline, reason: "the editor crashed during startup", state: await readEngineState(projectPath ?? null) });
     }
-    if (snapshot?.modal) {
+    if (snapshot?.modal && modalBlocksGameThread(snapshot.modal)) {
       // No bridge yet, so no gate and no press: name the prompt as the reason the
       // launch did not finish. dialogPolicy is how a caller answers one this early.
+      //
+      // Only a prompt the game thread is parked behind ends the wait. A window
+      // the editor raised without AddModalWindow does not stop startup, and
+      // failing a launch that went on to finish is worse than saying nothing
+      // about the window at all (#1118).
       const buttons = (snapshot.modal.buttons ?? []).filter((b) => b !== "");
       const shown = snapshot.modal.message ? `: ${oneLine(snapshot.modal.message)}` : "";
       const offered = buttons.length > 0 ? ` Buttons: ${buttons.join(", ")}.` : "";
@@ -1023,9 +1029,12 @@ function forgetPreviousEditors(): void {
 function blockedStopDetail(state: EngineState): string {
   const modal = state.snapshot?.modal;
   if (!modal) return ` ${state.summary}`;
-  // Named, not handled. The gate reports it in full on the next call.
+  // Named, not handled. The gate reports it in full on the next call. A prompt
+  // that holds nothing is still named here: it did not stop the stop, but it is
+  // an unanswered question and the caller is entitled to see it (#1118).
   const shown = modal.message ? `: ${oneLine(modal.message)}` : "";
-  return ` The editor is showing a modal dialog "${modal.title}"${shown}.`
+  const kind = modalBlocksGameThread(modal) ? "modal dialog" : "non-blocking prompt";
+  return ` The editor is showing a ${kind} "${modal.title}"${shown}.`
     + " Read it with editor(action='list_dialogs')."
 }
 
@@ -1201,6 +1210,9 @@ export interface StopEditorResult {
   refusedReason?: "unsaved-work" | "unknown-dirty-state";
   /** Every package that was dirty when the stop was asked for. */
   dirtyPackages?: string[];
+  /** Other editors of THIS project still running after the stop (#1072).
+   *  Present only when there is something to report. */
+  remainingInstances?: Array<{ pid: number; port: number }>;
 }
 
 /**
@@ -1290,6 +1302,37 @@ function unsavedWorkRefusal(dirty: string[]): string {
  * The port comes from what this project published and nowhere else, and the
  * process behind it is checked before the quit goes out (#819).
  */
+/**
+ * Editors of this project still running after one was stopped (#1072).
+ *
+ * A record and a live process must agree: a record outlives a crash, and a
+ * running editor may have published none. `stoppedPid` is excluded because its
+ * record may not be deleted yet.
+ *
+ * `listEditors` is injected so the filtering is testable without real pids.
+ */
+export async function findRemainingInstances(
+  projectDir: string | undefined,
+  projectPath: string | null | undefined,
+  stoppedPid: number | null,
+  listEditors: (p?: string | null) => Promise<Array<{ pid: number }>> = findInteractiveEditors,
+): Promise<Array<{ pid: number; port: number }>> {
+  if (!projectDir) return [];
+  let live: Array<{ pid: number }>;
+  try {
+    live = await listEditors(projectPath);
+  } catch {
+    // Best effort: this must never turn a successful stop into an error.
+    return [];
+  }
+  const livePids = new Set(live.map((p) => p.pid));
+  return readBridgeInstanceRecords(projectDir)
+    .filter((r) => r.state !== "bind-failed")
+    .filter((r) => r.pid !== stoppedPid)
+    .filter((r) => livePids.has(r.pid))
+    .map((r) => ({ pid: r.pid, port: r.port }));
+}
+
 export async function stopEditor(
   projectDir?: string,
   opts: {
@@ -1446,11 +1489,23 @@ export async function stopEditor(
     await new Promise((resolve) => setTimeout(resolve, confirmPollMs));
     if (!(await isBridgeAvailable(host, port))) {
       quitsInFlight.delete(editorKey);
+      // The stop aims at one editor; say so when it was not the only one.
+      const remaining = await findRemainingInstances(projectDir, projectPath, ownership.pid ?? null);
+      const remainingNote = remaining.length === 0
+        ? ""
+        : ` ${remaining.length} other editor${remaining.length === 1 ? "" : "s"} of this project ${
+            remaining.length === 1 ? "is" : "are"} still running (${
+            remaining.map((r) => `pid ${r.pid} on port ${r.port}`).join(", ")
+          }). This call closed one editor, the one this project's lockfile named. Stop ${
+            remaining.length === 1 ? "it" : "them"} by targeting ${
+            remaining.length === 1 ? "its" : "their"} own editor session.`;
       return {
         success: true,
         message:
           "Editor quit itself via the bridge." +
-          (ownership.healed ? ` ${ownership.healed}` : ""),
+          (ownership.healed ? ` ${ownership.healed}` : "") +
+          remainingNote,
+        ...(remaining.length > 0 ? { remainingInstances: remaining } : {}),
         // Reported whenever a dialog was in the way, including when answering
         // it is what let the stop through, so the caller can always see which
         // mode applied and why.

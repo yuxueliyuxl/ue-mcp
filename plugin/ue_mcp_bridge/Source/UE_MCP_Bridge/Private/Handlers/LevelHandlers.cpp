@@ -527,6 +527,21 @@ TSharedPtr<FJsonValue> FLevelHandlers::PlaceActor(const TSharedPtr<FJsonObject>&
 		return MCPError(TEXT("Failed to spawn actor"));
 	}
 
+	// #1119: SpawnActor does not run the editor's volume factory, so native
+	// volumes otherwise have no brush, bounds or collision. Keep any brush
+	// supplied by the class; only initialize a missing or polygonless one with
+	// the native 200 cm cube. The builder can snap location and resets scale, so restore
+	// the spawned transform before applying the caller's scale below.
+	AVolume* BuiltVolume = nullptr;
+	if (AVolume* Volume = Cast<AVolume>(NewActor);
+		Volume && (!Volume->Brush || !Volume->Brush->Polys || Volume->Brush->Polys->Element.Num() == 0))
+	{
+		const FTransform VolumeTransform = Volume->GetActorTransform();
+		UEMCP::BuildVolumeAsCube(World, Volume, FVector(100.0));
+		Volume->SetActorTransform(VolumeTransform);
+		BuiltVolume = Volume;
+	}
+
 	if (!Label.IsEmpty())
 	{
 		NewActor->SetActorLabel(Label);
@@ -535,6 +550,14 @@ TSharedPtr<FJsonValue> FLevelHandlers::PlaceActor(const TSharedPtr<FJsonObject>&
 	if (Params->HasField(TEXT("scale")))
 	{
 		NewActor->SetActorScale3D(OptionalVec3(Params, TEXT("scale"), FVector::OneVector));
+	}
+
+	// Nav bounds are captured when registered, so re-register them against
+	// the final transform, not the unscaled cube the builder produced.
+	if (AVolume* PlacedVolume = Cast<AVolume>(NewActor))
+	{
+		if (BuiltVolume) BuiltVolume->PostEditChange();
+		UEMCP::NotifyVolumeBoundsChanged(PlacedVolume);
 	}
 
 	// Static mesh shorthand

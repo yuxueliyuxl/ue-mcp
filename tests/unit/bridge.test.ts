@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 /** A throwaway project directory with a Saved/UE_MCP_Bridge folder. */
 function makeProjectDir(): string {
@@ -26,10 +26,20 @@ const DEFAULT_CAPABILITIES = {
   actions: ["first", "second", "ping"],
 };
 
+type RequestHandler = (request: Record<string, unknown>, socket: import("ws").WebSocket) => void;
+
+/** Hold a real loopback handshake until the test chooses its outcome. */
+function holdHandshake() {
+  let receive!: (value: { request: Record<string, unknown>; socket: import("ws").WebSocket }) => void;
+  const received = new Promise<Parameters<typeof receive>[0]>((resolve) => { receive = resolve; });
+  const handle: RequestHandler = (request, socket) => receive({ request, socket });
+  return { received, handle };
+}
+
 async function withBridgeServer(
-  onRequest: (request: Record<string, unknown>, socket: import("ws").WebSocket) => void,
+  onRequest: RequestHandler,
   /** null makes the server answer the handshake the way a pre-handshake plugin does. */
-  capabilities: Record<string, unknown> | null = DEFAULT_CAPABILITIES,
+  capabilities: Record<string, unknown> | RequestHandler | null = DEFAULT_CAPABILITIES,
 ): Promise<{
   close: () => Promise<void>;
   connectionCount: () => number;
@@ -43,6 +53,10 @@ async function withBridgeServer(
     socket.on("message", (data) => {
       const request = JSON.parse(data.toString()) as Record<string, unknown>;
       if (request.method === "get_bridge_capabilities") {
+        if (typeof capabilities === "function") {
+          capabilities(request, socket);
+          return;
+        }
         socket.send(
           JSON.stringify(
             capabilities
@@ -246,6 +260,182 @@ describe("bridge state records", () => {
 });
 
 describe("bridge capability handshake", () => {
+  it.each(["disconnect", "remote close"])("clears capabilities on %s", async (event) => {
+    const server = await withBridgeServer(() => {});
+    const { EditorBridge } = await import("../../src/bridge.js");
+    const bridge = new EditorBridge("127.0.0.1", server.port);
+
+    try {
+      await bridge.connect(1000);
+      expect(bridge.capabilities?.builtAt).toBe(DEFAULT_CAPABILITIES.builtAt);
+      if (event === "disconnect") {
+        bridge.disconnect();
+      } else {
+        const closed = once(bridge["ws"]!, "close");
+        await server.close();
+        await closed;
+      }
+      expect(bridge.isConnected).toBe(false);
+      expect(bridge.capabilities).toBeNull();
+    } finally {
+      bridge.disconnect();
+      if (event === "disconnect") await server.close();
+    }
+  });
+
+  it("keeps A's metadata absent until B answers its handshake", async () => {
+    const held = holdHandshake();
+    const serverA = await withBridgeServer(() => {});
+    const serverB = await withBridgeServer(() => {}, held.handle);
+    const { EditorBridge } = await import("../../src/bridge.js");
+    const bridge = new EditorBridge("127.0.0.1", serverA.port);
+    let connecting: Promise<void> | undefined;
+
+    try {
+      await bridge.connect(1000);
+      expect(bridge.capabilities?.builtAt).toBe(DEFAULT_CAPABILITIES.builtAt);
+      bridge.disconnect();
+      bridge.port = serverB.port;
+      connecting = bridge.connect(1000);
+      const { request, socket } = await held.received;
+      expect(bridge.capabilities).toBeNull();
+      socket.send(JSON.stringify({ id: request.id, result: { ...DEFAULT_CAPABILITIES, projectName: "B" } }));
+      await connecting;
+      expect(bridge.capabilities?.projectName).toBe("B");
+    } finally {
+      bridge.disconnect();
+      await connecting;
+      await serverA.close();
+      await serverB.close();
+    }
+  });
+
+  it.each(["close", "response", "timeout"])("ignores A's delayed %s after B completes its handshake", async (event) => {
+    const held = holdHandshake();
+    const serverA = await withBridgeServer(() => {}, held.handle);
+    const serverB = await withBridgeServer(() => {}, { ...DEFAULT_CAPABILITIES, projectName: "B" });
+    const { EditorBridge } = await import("../../src/bridge.js");
+    const bridge = new EditorBridge("127.0.0.1", serverA.port);
+    const warnings = vi.spyOn(await import("../../src/log.js"), "warn").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const connectingA = bridge.connect(5000);
+    let socketA: import("ws").WebSocket | undefined;
+
+    try {
+      const { request, socket } = await held.received;
+      socketA = bridge["ws"]!;
+      // Keep A's transport alive to deliver each obsolete completion after B.
+      // This controls event ordering without depending on network timing.
+      const terminate = vi.spyOn(socketA, "terminate").mockImplementation(() => {});
+      bridge.retargetProject(path.join(makeProjectDir(), "B.uproject"), serverB.port);
+      terminate.mockRestore();
+      await bridge.connect(1000);
+      const capabilitiesB = bridge.capabilities;
+      expect(capabilitiesB?.projectName).toBe("B");
+
+      if (event === "close") socketA.emit("close", 1000, Buffer.alloc(0));
+      else if (event === "response") {
+        socket.send(JSON.stringify({ id: request.id, result: { protocolVersion: 1, projectName: "A" } }));
+      } else {
+        await vi.advanceTimersByTimeAsync(5000);
+      }
+      await connectingA;
+
+      expect(bridge.capabilities).toBe(capabilitiesB);
+      expect(bridge.isConnected).toBe(true);
+      expect(warnings).not.toHaveBeenCalled();
+      expect(socketA.listenerCount("message")).toBe(1);
+      expect(socketA.listenerCount("close")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+      // Repeated events from A must stay inert after its handshake settles.
+      socketA.emit("message", Buffer.from(JSON.stringify({ id: request.id, result: { protocolVersion: 1 } })));
+      socketA.emit("close", 1000, Buffer.alloc(0));
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(bridge.capabilities).toBe(capabilitiesB);
+      expect(warnings).not.toHaveBeenCalled();
+    } finally {
+      socketA?.terminate();
+      bridge.disconnect();
+      await connectingA;
+      vi.useRealTimers();
+      warnings.mockRestore();
+      await serverA.close();
+      await serverB.close();
+    }
+  });
+
+  it.each(["legacy timeout", "remote close", "closing timeout"])("settles the current handshake on %s and cleans up", async (event) => {
+    const held = holdHandshake();
+    const server = await withBridgeServer(() => {}, held.handle);
+    const { EditorBridge } = await import("../../src/bridge.js");
+    const bridge = new EditorBridge("127.0.0.1", server.port);
+    const warnings = vi.spyOn(await import("../../src/log.js"), "warn").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const connecting = bridge.connect(1000);
+
+    try {
+      const { socket: remote } = await held.received;
+      const socket = bridge["ws"]!;
+      expect(bridge.capabilities).toBeNull();
+      if (event === "legacy timeout") {
+        await vi.advanceTimersByTimeAsync(1000);
+      } else {
+        const closed = once(socket, "close");
+        const remoteClosed = once(remote, "close");
+        if (event === "remote close") remote.terminate();
+        else {
+          socket.close();
+          // Fire the handshake deadline while the transport is CLOSING,
+          // before its close event can remove the current socket.
+          vi.advanceTimersByTime(1000);
+          await connecting;
+          expect(bridge.capabilities).toBeNull();
+        }
+        await Promise.all([closed, remoteClosed]);
+      }
+      await connecting;
+      if (event === "legacy timeout") {
+        expect(bridge.capabilities).toEqual({ protocolVersion: 1, legacy: true });
+        expect(bridge.isConnected).toBe(true);
+        expect(warnings).toHaveBeenCalledExactlyOnceWith("bridge", expect.stringContaining("protocol version 1"));
+      } else {
+        expect(bridge.capabilities).toBeNull();
+        expect(bridge.isConnected).toBe(false);
+        expect(warnings).not.toHaveBeenCalled();
+      }
+      expect(socket.listenerCount("message")).toBe(1);
+      expect(socket.listenerCount("close")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      bridge.disconnect();
+      await connecting;
+      vi.useRealTimers();
+      warnings.mockRestore();
+      await server.close();
+    }
+  });
+
+  it("clears capabilities immediately when a call cannot be sent", async () => {
+    const server = await withBridgeServer(() => {});
+    const { EditorBridge } = await import("../../src/bridge.js");
+    const bridge = new EditorBridge("127.0.0.1", server.port);
+
+    try {
+      await bridge.connect(1000);
+      const socket = bridge["ws"]!;
+      const send = vi.spyOn(socket, "send").mockImplementation((_data, callback) => {
+        (callback as (err: Error) => void)(new Error("send failed"));
+      });
+      await expect(bridge.call("ping", {}, 1000)).rejects.toThrow("send failed");
+      send.mockRestore();
+      expect(bridge.isConnected).toBe(false);
+      expect(bridge.capabilities).toBeNull();
+    } finally {
+      bridge.disconnect();
+      await server.close();
+    }
+  });
+
   it("records what the bridge says it is on connect", async () => {
     const server = await withBridgeServer((request, socket) => {
       socket.send(JSON.stringify({ id: request.id, result: "ok" }));

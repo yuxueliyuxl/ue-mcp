@@ -1213,8 +1213,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::EditStructMetadata(const TSharedPtr<F
 					TEXT("fields[%d] sets metadata, which requires Unreal Engine 5.5 or newer: 5.4's user-defined struct members do not store metadata. Remove the metadata object to author the rest of the field."),
 					Slot));
 #endif
-				for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*MetaObj)->Values)
+				for (const auto& JsonEntry : (*MetaObj)->Values)
 				{
+					const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 					if (Pair.Key.IsEmpty())
 					{
 						return MCPError(FString::Printf(TEXT("fields[%d] has an empty metadata key."), Slot));

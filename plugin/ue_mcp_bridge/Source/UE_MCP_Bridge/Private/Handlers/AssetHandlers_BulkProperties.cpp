@@ -216,8 +216,9 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkSetAssetProperties(const TSharedPtr<F
 		PreparedAsset.Properties.Reserve((*PropertiesObject)->Values.Num());
 
 		FString ItemPropertyError;
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*PropertiesObject)->Values)
+		for (const auto& JsonEntry : (*PropertiesObject)->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 			FPreparedPropertyWrite PreparedProperty;
 			PreparedProperty.PropertyName = Pair.Key;
 			PreparedProperty.RequestedValue = Pair.Value;

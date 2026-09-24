@@ -1,6 +1,6 @@
 import type { TaskResult, TaskConstructor } from "@db-lyon/flowkit";
 import { UeMcpTask } from "../task.js";
-import { stripEditorTarget } from "../types.js";
+import { stripAction, stripEditorTarget } from "../types.js";
 import { prepareCall, finishCall, type CallPreparation } from "../call-pipeline.js";
 import type { FlowContext } from "./context.js";
 import { liftRollback } from "./rollback.js";
@@ -19,23 +19,17 @@ import { DialogGuard, ensureGuard } from "../dialog-guard.js";
 async function refuseStepIfBlocked(
   ctx: FlowContext,
   taskName: string,
-  options: Record<string, unknown>,
 ): Promise<Record<string, unknown> | null> {
   const session = ctx.session;
   if (!session) return null;
-  // The micro gateway arrives as one task carrying the real category and
-  // method in its options. Asking the allowlist about the wrapper refused
-  // respond_to_dialog, which is the single call that clears the dialog, so the
-  // gateway could never escape one.
-  const subject = taskName === "tools.call"
-    ? `${String(options.category ?? "")}.${String(options.method ?? "")}`
-    : taskName;
+  // A micro gateway call never reaches here as tools.call: the registry
+  // creates the target task instead, so taskName is always the real action.
   // No early return for an allow-listed subject. `check` already exempts them,
   // and it additionally applies the mode to the one allow-listed subject that
   // PRESSES a button, so short-circuiting here let a flow step answer a modal
   // under interactive by walking around the gate rather than through it.
   const guard = await ensureGuard(session);
-  const decision = await guard.check(subject, "action");
+  const decision = await guard.check(taskName, "action");
   return decision.allow ? null : (decision.refusal ?? null);
 }
 
@@ -66,8 +60,9 @@ export function bridgeTaskClass(
     async execute(): Promise<TaskResult> {
       // `editor` addresses a session; it is never a bridge parameter. Strip it
       // before the mapper too, since a mapper that forwards its input verbatim
-      // would carry it into the call.
-      const options = stripEditorTarget(this.options as Record<string, unknown>);
+      // would carry it into the call. The task name selects the action here,
+      // so `action` is the dispatcher's and never an argument.
+      const options = stripAction(stripEditorTarget(this.options as Record<string, unknown>));
       // THE per-call preparation. This is the route a live MCP call and a flow
       // step both take, so everything a call is promised has to happen here:
       // the routing parameters come off, the paths are repaired, and the
@@ -141,11 +136,7 @@ export function handlerTaskClass(
       // a dialog raised at step 3 was missed by every later step, which
       // includes the editor lifecycle handlers. Checking per step is what
       // makes "any process, at any point" true of flows as well.
-      const refusal = await refuseStepIfBlocked(
-        this.ctx,
-        name,
-        this.options as Record<string, unknown>,
-      );
+      const refusal = await refuseStepIfBlocked(this.ctx, name);
       if (refusal) {
         return { success: false, data: refusal, error: refusalError(name, refusal) };
       }

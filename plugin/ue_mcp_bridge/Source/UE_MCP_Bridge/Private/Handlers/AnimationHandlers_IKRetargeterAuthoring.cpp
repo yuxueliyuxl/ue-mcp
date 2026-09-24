@@ -534,8 +534,9 @@ namespace
 			const TSharedPtr<FJsonObject>* SettingsObject = nullptr;
 			if ((*Object)->TryGetObjectField(TEXT("settings"), SettingsObject) && SettingsObject && SettingsObject->IsValid())
 			{
-				for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*SettingsObject)->Values)
+				for (const auto& JsonEntry : (*SettingsObject)->Values)
 				{
+					const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 					Prepared.Settings.Add({ Pair.Key, Pair.Value });
 				}
 			}
@@ -558,8 +559,9 @@ namespace
 						return false;
 					}
 					TArray<TPair<FString, TSharedPtr<FJsonValue>>> Properties;
-					for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*ChainObject)->Values)
+					for (const auto& JsonEntry : (*ChainObject)->Values)
 					{
+						const TPair<FString, TSharedPtr<FJsonValue>> Pair(JsonEntry.Key, JsonEntry.Value);
 						if (Pair.Key.Equals(TEXT("chain"), ESearchCase::IgnoreCase)) continue;
 						Properties.Add({ Pair.Key, Pair.Value });
 					}

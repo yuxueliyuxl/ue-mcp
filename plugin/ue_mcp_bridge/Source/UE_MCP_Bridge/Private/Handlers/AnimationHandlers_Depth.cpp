@@ -1011,8 +1011,9 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddNotifyState(const TSharedPtr<FJson
 	if (Params->TryGetObjectField(TEXT("notifyProperties"), NotifyProperties)
 		&& NotifyProperties && (*NotifyProperties).IsValid())
 	{
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*NotifyProperties)->Values)
+		for (const auto& JsonEntry : (*NotifyProperties)->Values)
 		{
+			const TPair<FString, TSharedPtr<FJsonValue>> Entry(JsonEntry.Key, JsonEntry.Value);
 			FProperty* Property = StateClass->FindPropertyByName(FName(*Entry.Key));
 			if (!Property)
 			{

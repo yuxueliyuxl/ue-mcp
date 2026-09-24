@@ -17,6 +17,9 @@ import {
   type SessionSurface,
 } from "../../src/session-surface.js";
 import { ALL_TOOLS } from "../../src/tools.js";
+import { buildMicroGateway } from "../../src/lean-context.js";
+import { callSubject } from "../../src/editor-gate.js";
+import { buildFlowRegistry } from "../../src/flow/registry.js";
 
 function graph(): ToolDef[] {
   return [
@@ -181,6 +184,29 @@ describe("explainMissingAction", () => {
     expect(msg).toContain("disabled for editor 'Alpha'");
     expect(msg).toContain("ue-mcp.yml");
     expect(msg).toContain("Beta");
+  });
+
+  it("sees past the micro gateway to the action it calls", () => {
+    // Registry graphs as micro mode builds them: the gateway plus every category.
+    const pie = categoryTool("pie", "PIE", { inject_input: bp("mutate", "Inject input", "inject_input") });
+    const alphaTools = [...graph(), pie];
+    const betaTools = graph();
+    const alpha = [buildMicroGateway(alphaTools), ...alphaTools];
+    const beta = [buildMicroGateway(betaTools), ...betaTools];
+    const union = unionSurface([surfaceOf("Alpha", alpha), surfaceOf("Beta", beta, ["beta"])]);
+    const refuse = (tools: ToolDef[], editor: string, params: Record<string, unknown>) => {
+      const task = callSubject(tools[0], params).taskName;
+      return explainMissingAction(union, task, editor, buildFlowRegistry(tools).listRegistered().includes(task));
+    };
+
+    // Every editor has tools.call, so judging the wrapper said nothing here.
+    expect(explainMissingAction(union, "tools.call", "Beta", true)).toBeNull();
+    const missing = refuse(beta, "Beta", { action: "call", category: "pie", method: "inject_input" });
+    expect(missing).toContain("'pie.inject_input' is not available in editor 'Beta'");
+    expect(missing).toContain("Editors that provide it: Alpha");
+    const disabled = refuse(beta, "Beta", { action: "call", category: "beta", method: "read" });
+    expect(disabled).toContain("disabled for editor 'Beta'");
+    expect(refuse(alpha, "Alpha", { action: "call", category: "pie", method: "inject_input" })).toBeNull();
   });
 
   it("says nothing when the addressed editor can serve the action", () => {

@@ -774,7 +774,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::AddFunctionParameter(const TSharedPtr
 			}
 			if (ResultNodeClass)
 			{
-				UEdGraphNode* NewResultNode = NewObject<UEdGraphNode>(FuncGraph, ResultNodeClass);
+				UEdGraphNode* NewResultNode = NewObject<UEdGraphNode>(FuncGraph, ResultNodeClass, NAME_None, RF_Transactional);
 				FuncGraph->AddNode(NewResultNode, false, false);
 				NewResultNode->CreateNewGuid();
 				NewResultNode->PostPlacedNewNode();
