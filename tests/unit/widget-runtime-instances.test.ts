@@ -18,18 +18,16 @@ describe("widget inspect_runtime_instances", () => {
       },
     );
 
+    // Spec'd (#1057): the bag is forwarded as sent, no mapper in between.
+    expect(widgetTool.actions.inspect_runtime_instances.mapParams).toBeUndefined();
     expect(call).toHaveBeenCalledWith("inspect_runtime_instances", {
-      widgetName: undefined,
       classFilter: "Hero",
       propertyNames: ["MemberID", "BuffDynamic"],
       includeSubtree: true,
-      childName: undefined,
       childClassFilter: "BuffSlot",
-      viewportOnly: undefined,
       world: "pie",
       pieInstance: 2,
       maxInstances: 8,
-      maxNodesPerInstance: undefined,
     }, undefined);
   });
 

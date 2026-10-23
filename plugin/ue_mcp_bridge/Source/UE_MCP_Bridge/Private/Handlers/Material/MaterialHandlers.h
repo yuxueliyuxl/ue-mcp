@@ -1,0 +1,190 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Dom/JsonValue.h"
+#include "Dom/JsonObject.h"
+#include "UObject/ObjectPtr.h"
+#include "Containers/ArrayView.h"
+
+class UObject;
+class UMaterial;
+class UMaterialInterface;
+class UMaterialFunction;
+class UMaterialExpression;
+
+/** A Material or a MaterialFunction whose expression graph a handler edits.
+ *  Exactly one of the two pointers is set once resolved (#1138). */
+struct FMaterialGraphTarget
+{
+	UMaterial* Material = nullptr;
+	UMaterialFunction* Function = nullptr;
+
+	UObject* GetAsset() const;
+	FString GetPathName() const;
+	/** The parameter that names this asset: materialPath or functionPath. */
+	const TCHAR* GetPathKey() const;
+	TConstArrayView<TObjectPtr<UMaterialExpression>> GetExpressions() const;
+	void PreEdit() const;
+	/** A material recompiles; a function propagates to every material using it. */
+	void PostEdit() const;
+	/** Close a PreEdit that changed nothing. */
+	void CancelEdit() const;
+};
+
+class FMaterialHandlers
+{
+public:
+	static void RegisterHandlers(class FMCPHandlerRegistry& Registry);
+	static TSharedPtr<FJsonObject> DescribeMaterialInstance(UMaterialInterface* Material);
+
+private:
+	static TSharedPtr<FJsonValue> ListExpressionTypes(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> CreateMaterial(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReadMaterial(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialShadingModel(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialBlendMode(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialDomain(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialBaseColor(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AddMaterialExpression(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListMaterialExpressions(const TSharedPtr<FJsonObject>& Params);
+	// #1083/#1115: paged expression graph with input wiring and root material
+	// connections, or one node and its sources when expressionIndex is given.
+	static TSharedPtr<FJsonValue> ReadMaterialGraph(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListMaterialParameters(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RecompileMaterial(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> CreateMaterialInstance(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialParameter(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReadMaterialInstance(const TSharedPtr<FJsonObject>& Params);
+	// #1114: read_material_instance for a material on a placed component, in
+	// the editor or PIE world (runtime MaterialInstanceDynamic included).
+	static TSharedPtr<FJsonValue> ReadComponentMaterial(const TSharedPtr<FJsonObject>& Params);
+	// #1116: MPC defaults, plus live values from a world's collection instance.
+	static TSharedPtr<FJsonValue> ReadMaterialParameterCollection(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialInstanceParent(const TSharedPtr<FJsonObject>& Params);
+	// #594 batch reparent + reassign params across many Material Instances
+	static TSharedPtr<FJsonValue> BatchSetInstances(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ClearMaterialInstanceParameters(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListMaterialStaticSwitches(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialStaticSwitch(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetExpressionValue(const TSharedPtr<FJsonObject>& Params);
+	// #617 read/write a MaterialExpressionCustom's HLSL Code, inputs, output type
+	static TSharedPtr<FJsonValue> SetCustomExpression(const TSharedPtr<FJsonObject>& Params);
+
+	// Name-based handlers matching TS tool expectations
+	static TSharedPtr<FJsonValue> ConnectTextureToMaterial(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ConnectMaterialExpressions(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ConnectToMaterialProperty(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> DeleteMaterialExpression(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> DisconnectMaterialProperty(const TSharedPtr<FJsonObject>& Params);
+
+	// Helper to load a UMaterial from an asset path
+	static UMaterial* LoadMaterialFromPath(const FString& AssetPath);
+
+	// Helper to load a UMaterialInstanceConstant from an asset path
+	static UMaterialInstanceConstant* LoadMaterialInstanceFromPath(const FString& AssetPath);
+
+	// Helper to convert shading model string to enum
+	static EMaterialShadingModel ParseShadingModel(const FString& ShadingModelStr);
+	static FString ShadingModelToString(EMaterialShadingModel ShadingModel);
+
+	// Helper to map material property name string to EMaterialProperty enum
+	static bool ParseMaterialProperty(const FString& PropertyName, EMaterialProperty& OutProperty);
+
+	// Resolve an EMaterialProperty to its backing FExpressionInput* on the
+	// material's editor-only data. Returns nullptr when the property is not
+	// one of the supported direct-connection slots. Centralises the switch
+	// that previously lived verbatim in three places.
+	static FExpressionInput* GetMaterialPropertyInput(
+		class UMaterialEditorOnlyData* EditorOnlyData,
+		EMaterialProperty MatProperty);
+
+	// Helper to find an expression by name (description or class) within a material
+	static UMaterialExpression* FindExpressionByName(UMaterial* Material, const FString& ExpressionName);
+	// Same lookup over any expression list, e.g. a MaterialFunction's. Also
+	// matches FunctionInput/FunctionOutput names.
+	static UMaterialExpression* FindExpressionInList(TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions, const FString& ExpressionName);
+
+	// Resolve the graph an expression edit targets: functionPath (or
+	// materialFunctionPath) names a UMaterialFunction; materialPath, path or
+	// assetPath names a UMaterial, or a UMaterialFunction. Returns an error
+	// response on failure, nullptr on success.
+	static TSharedPtr<FJsonValue> ResolveMaterialGraphTarget(const TSharedPtr<FJsonObject>& Params, FMaterialGraphTarget& OutTarget);
+
+	// Expression class from a short name ("Multiply"), a class name
+	// ("MaterialExpressionMultiply"), a U-prefixed name or a /Script path.
+	static UClass* ResolveExpressionClass(const FString& ExpressionType);
+
+	// Shared paged expression walk for list_material_expressions and
+	// read_material_graph. ActionName is the cursor collection identity.
+	static TSharedPtr<FJsonValue> ListMaterialExpressionsInternal(
+		const TSharedPtr<FJsonObject>& Params,
+		const TCHAR* ActionName,
+		bool bIncludeInputs,
+		bool bIncludeRootConnections);
+
+	// v0.7.9 - material depth
+	static TSharedPtr<FJsonValue> DuplicateMaterial(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ValidateMaterial(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GetMaterialShaderStats(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ExportMaterialGraph(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ImportMaterialGraph(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> BuildMaterialGraph(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RenderMaterialPreview(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> BeginMaterialTransaction(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> EndMaterialTransaction(const TSharedPtr<FJsonObject>& Params);
+
+	// #946: single-call PBR build from a texture set. Picks each TextureSample's
+	// sampler type from the texture itself, which is the step that fails
+	// silently by hand when the texture is virtual (UDIM).
+	static TSharedPtr<FJsonValue> BuildMaterial(const TSharedPtr<FJsonObject>& Params);
+
+	// #225: single-call simple material authoring + EMaterialUsage flag
+	static TSharedPtr<FJsonValue> CreateMaterialSimple(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialUsage(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GetMaterialUsage(const TSharedPtr<FJsonObject>& Params);
+
+	// #463: MaterialFunction creation + expression authoring inside functions.
+	// Material asset authoring API exists; MaterialFunction was the gap.
+	static TSharedPtr<FJsonValue> CreateMaterialFunction(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AddMaterialFunctionExpression(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ConnectMaterialFunctionExpressions(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListMaterialFunctionExpressions(const TSharedPtr<FJsonObject>& Params);
+	// #1138: delete_material_expression's MaterialFunction branch.
+	static TSharedPtr<FJsonValue> DeleteFunctionExpression(UMaterialFunction* Function, UMaterialExpression* Expression, const FString& ExpressionName);
+
+	// Runtime Virtual Textures, in MaterialHandlers_RVT.cpp. Every SETTING on
+	// a URuntimeVirtualTexture, on its component and on a landscape's virtual
+	// texture group is a UPROPERTY that asset/editor(set_property) already
+	// reaches, so none of these is a setter. Each one calls an engine function
+	// a property write cannot: creating the asset, spawning and fitting the
+	// bounding volume, InitVirtualTextureDependentSettings on a sample node,
+	// mirroring graph connections into the output node, and fanning a landscape
+	// assignment across every streaming proxy with a render-state refresh.
+	static TSharedPtr<FJsonValue> CreateRuntimeVirtualTexture(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReadRuntimeVirtualTexture(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AddRvtVolume(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetRvtVolumeBounds(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AddRvtSampler(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AddRvtOutput(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AssignRvtToLandscape(const TSharedPtr<FJsonObject>& Params);
+
+	// #1131: Material Designer (DynamicMaterial) layer stacks, in MaterialHandlers_Designer.cpp.
+	static TSharedPtr<FJsonValue> ReadMaterialDesigner(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetMaterialDesignerValue(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AddMaterialDesignerLayer(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RemoveMaterialDesignerLayer(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> CreateMaterialDesigner(const TSharedPtr<FJsonObject>& Params);
+
+	// Pin addressing shared by every connect path (#1403): an index, a pin name,
+	// or "Input"/"Output" for the single unnamed pin a node like Sine carries.
+	// The per-node keys add_material_expression and build_material_graph share:
+	// name, parameterName, group, sortPriority, defaultValue, value, channels.
+	static void ApplyExpressionSpec(UMaterialExpression* Expression, const TSharedPtr<FJsonObject>& Spec);
+	static bool ResolveExpressionInputIndex(UMaterialExpression* Expression, const FString& Pin, int32& OutIndex, FString& OutError);
+	static bool ResolveExpressionOutputIndex(UMaterialExpression* Expression, const FString& Pin, int32& OutIndex, FString& OutError);
+
+	// Expressions reachable from a material output or a custom output node.
+	// validate_material reports the rest as orphans; delete_orphan_expressions removes them (#1403).
+	static TSet<UMaterialExpression*> CollectReachableExpressions(UMaterial* Material);
+	static TSharedPtr<FJsonValue> DeleteOrphanExpressions(const TSharedPtr<FJsonObject>& Params);
+};

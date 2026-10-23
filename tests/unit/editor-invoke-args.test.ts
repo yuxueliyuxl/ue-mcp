@@ -1,10 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { describe, it, expect, vi } from "vitest";
+import type { z } from "zod";
 import { normalizeObjectSchema } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import { editorTool } from "../../src/tools/editor.js";
-import { applyLeanContext } from "../../src/lean-context.js";
-import { normalizeFunctionArgs, normalizePythonArgs } from "../../src/function-args.js";
-import type { ToolDef } from "../../src/types.js";
+import { applyLeanContext } from "../../src/surface/context/lean-context.js";
+import { handlerSpecs } from "../../src/tools/specs/editor.generated.js";
+import { paramZod, zodSignature } from "../../src/surface/handler-spec.js";
+import type { ToolContext, ToolDef } from "../../src/core/types.js";
+import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
 /**
  * #811: `args` was advertised as a union whose object branch carried an empty
@@ -141,69 +145,65 @@ describe("editor args schema (#811)", () => {
   }
 });
 
-describe("normalizeFunctionArgs", () => {
-  it("passes the canonical object through", () => {
-    expect(normalizeFunctionArgs({ bEnabled: true })).toEqual({ bEnabled: true });
+const ARG_METHODS = ["run_python_file", "invoke_function", "invoke_object_function", "invoke_static_function"] as const;
+
+describe("args is declared once, in each handler's C++ spec (#1057)", () => {
+  it("declares the same four forms on every action that takes args", () => {
+    for (const method of ARG_METHODS) {
+      const args = handlerSpecs[method].params.find((p) => p.name === "args");
+      expect(args, method).toMatchObject({ type: "any", forms: ["argMap", "stringList", "argEntryList", "string"] });
+    }
+    const calls = handlerSpecs.invoke_object_functions.params.find((p) => p.name === "calls");
+    expect(calls?.fields?.find((f) => f.name === "args")).toMatchObject({ type: "any", forms: ["argMap", "stringList", "argEntryList", "string"] });
   });
 
-  it("folds an entry list into the parameter map", () => {
-    expect(normalizeFunctionArgs([{ name: "bEnabled", value: 1 }, { name: "Count", value: 2 }]))
-      .toEqual({ bEnabled: 1, Count: 2 });
+  it("advertises exactly the schema the spec generates", () => {
+    const spec = handlerSpecs.invoke_function.params.find((p) => p.name === "args")!;
+    expect(zodSignature(editorTool.schema.args as z.ZodTypeAny)).toBe(zodSignature(paramZod(spec).optional()));
   });
 
-  it("decodes a JSON string of either form", () => {
-    expect(normalizeFunctionArgs('{"bEnabled": true}')).toEqual({ bEnabled: true });
-    expect(normalizeFunctionArgs('[{"name": "bEnabled", "value": true}]')).toEqual({ bEnabled: true });
-  });
-
-  it("drops nothing-to-send values", () => {
-    expect(normalizeFunctionArgs(undefined)).toBeUndefined();
-    expect(normalizeFunctionArgs(null)).toBeUndefined();
-    expect(normalizeFunctionArgs("  ")).toBeUndefined();
-  });
-
-  it("explains what to send instead of failing silently", () => {
-    expect(() => normalizeFunctionArgs(["bEnabled"])).toThrow(/parameter name to value/);
-    expect(() => normalizeFunctionArgs("not json")).toThrow(/not valid JSON/);
-    expect(() => normalizeFunctionArgs([{ value: 1 }])).toThrow(/name/);
-  });
-});
-
-describe("normalizePythonArgs", () => {
-  it("keeps positional strings", () => {
-    expect(normalizePythonArgs(["one", "two"])).toEqual(["one", "two"]);
-  });
-
-  it("accepts a lone string and a JSON array string", () => {
-    expect(normalizePythonArgs("one")).toEqual(["one"]);
-    expect(normalizePythonArgs('["one", "two"]')).toEqual(["one", "two"]);
-  });
-
-  it("refuses a parameter map, which is a function-call shape", () => {
-    expect(() => normalizePythonArgs({ bEnabled: true })).toThrow(/positional strings/);
+  it("forwards args to the bridge as sent, for the handler to normalize", async () => {
+    const call = vi.fn().mockResolvedValue({ success: true });
+    const ctx = { bridge: { call } } as unknown as ToolContext;
+    for (const action of [...ARG_METHODS, "invoke_object_functions"] as const) {
+      expect(editorTool.actions[action].mapParams, action).toBeUndefined();
+    }
+    const entryList = [{ name: "bEnabled", value: true }];
+    await editorTool.handler(ctx, { action: "invoke_function", actorLabel: "A", functionName: "F", args: entryList });
+    expect(call).toHaveBeenLastCalledWith("invoke_function", { actorLabel: "A", functionName: "F", args: entryList }, undefined);
+    await editorTool.handler(ctx, { action: "invoke_object_function", target: "playerpawn", functionName: "F", args: '{"bEnabled": true}' });
+    expect(call).toHaveBeenLastCalledWith("invoke_object_function", { target: "playerpawn", functionName: "F", args: '{"bEnabled": true}' }, undefined);
   });
 });
 
-describe("editor actions normalize args before the bridge sees them", () => {
-  const entryList = [{ name: "bEnabled", value: true }];
+describe("the C++ normalizers", () => {
+  const read = (rel: string): string => readFileSync(new URL(`../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/${rel}`, import.meta.url), "utf8");
+  const utils = read("Public/HandlerFunctionCall.h");
 
-  it("invoke_function", () => {
-    expect(editorTool.actions.invoke_function.mapParams?.({ actorLabel: "A", functionName: "F", args: entryList }))
-      .toMatchObject({ args: { bEnabled: true } });
+  it("live in HandlerFunctionCall.h, once, with the refusals the TS normalizers had", () => {
+    for (const refusal of [
+      "was a string, but it is not valid JSON",
+      "decoded to a string, not a parameter map",
+      "was an array of values, so no parameter name can be resolved",
+      "was an array whose entries are missing a \\\"name\\\" string",
+      "Pass an object mapping parameter name to value",
+      "looked like a JSON array but does not parse. Pass an array of positional strings.",
+      "must be an array of positional strings for run_python_file, not an object.",
+    ]) {
+      expect(utils, refusal).toContain(refusal);
+    }
   });
 
-  it("invoke_object_function", () => {
-    expect(editorTool.actions.invoke_object_function.mapParams?.({ target: "playerpawn", functionName: "F", args: '{"bEnabled": true}' }))
-      .toMatchObject({ args: { bEnabled: true } });
-  });
-
-  it("invoke_static_function", () => {
-    expect(editorTool.actions.invoke_static_function.mapParams?.({ className: "C", functionName: "F", args: entryList }))
-      .toMatchObject({ args: { bEnabled: true } });
-  });
-
-  it("run_python_file keeps positional args a list", () => {
-    expect(editorTool.actions.run_python_file.mapParams?.({ filePath: "/tmp/x.py", args: ["one"] }))
-      .toMatchObject({ args: ["one"] });
+  it("are how every handler taking args reads it", () => {
+    const editor = readHandlerFile("EditorHandlers.cpp");
+    const pie = readHandlerFile("EditorHandlers_PIE.cpp");
+    const runtime = readHandlerFile("EditorHandlers_PIERuntime.cpp");
+    expect(editor).toContain('MCPReadPythonArgs(Params, TEXT("args"), ExtraArgs)');
+    expect(pie.match(/MCPReadFunctionArgs\(Params, TEXT\("args"\), ArgsMap\)/g)).toHaveLength(2);
+    expect(runtime).toContain('MCPReadFunctionArgs(Params, TEXT("args"), ArgsMap)');
+    expect(runtime).toContain("MCPNormalizeFunctionArgs(");
+    for (const source of [editor, pie, runtime]) {
+      expect(source).not.toMatch(/TryGet(Object|Array)Param\(Params, TEXT\("args"\)/);
+    }
   });
 });

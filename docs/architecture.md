@@ -14,26 +14,32 @@ flowchart LR
 
 **Entry point:** `src/index.ts`
 
-The server creates an `McpServer` instance (from `@modelcontextprotocol/sdk`), registers <!-- count:tools -->26<!-- /count --> category tools plus a `flow` tool, and communicates with the AI client over stdio.
+The server creates an `McpServer` instance (from `@modelcontextprotocol/sdk`), registers <!-- count:tools -->29<!-- /count --> category tools plus a `flow` tool, and communicates with the AI client over stdio.
 
 ### Key Modules
 
-| Module | Purpose |
+| Module (under `src/`) | Purpose |
 |--------|---------|
 | `index.ts` | Tool registration, MCP server lifecycle |
 | `tools.ts` | The `ALL_TOOLS` registry consumed by `index.ts` and tests |
-| `bridge.ts` | `EditorBridge` (implements `IBridge`) - WebSocket client, JSON-RPC messaging, auto-reconnect |
-| `project.ts` | `ProjectContext` - path resolution, INI parsing, C++ header parsing |
-| `types.ts` | `ToolDef`, `ActionSpec`, `categoryTool()` factory |
-| `schemas.ts` | Shared Zod schemas - `Vec3`, `Rotator`, `Color`, `Quat` |
-| `errors.ts` | `McpError` class with `ErrorCode` enum for structured error handling |
-| `deployer.ts` | First-run deployment: copy plugin, mutate `.uproject` |
-| `editor-control.ts` | Start/stop/restart the Unreal Editor process |
-| `instructions.ts` | AI-facing server instructions (embedded documentation) |
-| `auth.ts` | GitHub OAuth device flow + `~/.ue-mcp/auth.json` token cache (default authorship path for feedback issues) |
-| `github-app.ts` | GitHub App auth used as the bot fallback when OAuth isn't authorized |
+| `bridge/bridge.ts` | `EditorBridge` (implements `IBridge`) - WebSocket client, JSON-RPC messaging, auto-reconnect |
+| `config/project.ts` | `ProjectContext` - path resolution, INI parsing, C++ header parsing |
+| `core/types.ts` | `ToolDef`, `ActionSpec` and the other shared type declarations |
+| `surface/category-tool.ts` | `categoryTool()` factory, `bp()` action builder, routing parameter schemas |
+| `surface/target-params.ts` | Per-call `editor` / `toEditor` parameter injection |
+| `surface/schemas.ts` | Zod schemas for `.uproject`, `.uplugin` and `ue-mcp.yml` |
+| `core/errors.ts` | `McpError` class with `ErrorCode` enum for structured error handling |
+| `editor/deployer.ts` | First-run deployment: copy plugin, mutate `.uproject` |
+| `editor/editor-control.ts` | Start/stop/restart the Unreal Editor process; `editor/editor-build.ts` compiles the project C++ |
+| `surface/context/instructions.ts` | AI-facing server instructions (embedded documentation), one variant per context strategy |
+| `surface/context/lean-context.ts` | Choosing a context strategy, the lean `catalog` tool, paged `describe` and signature `search` |
+| `surface/context/micro-context.ts` | The micro `tools` gateway and how a call through it resolves to its target |
+| `surface/action-signature.ts` | One-line action signatures and the legend that explains them |
+| `surface/context/call-envelope.ts` | The `action` + `args` call shape and the server-side validation behind it |
+| `feedback/github-auth.ts` | GitHub OAuth device flow + `~/.ue-mcp/auth.json` token cache (default authorship path for feedback issues) |
+| `feedback/github-app.ts` | GitHub App auth used as the bot fallback when OAuth isn't authorized |
 | `flow/` | Flow engine (registry, loader, task factory, HTTP server) - see [Flows](flows.md) |
-| `init.ts` / `update.ts` / `resolve.ts` / `hook-handler.ts` | CLI subcommands (`npx ue-mcp init`, `update`, `resolve`, `hook`) |
+| `cli/` | CLI subcommands (`npx ue-mcp init`, `update`, `resolve`, `hook`) |
 
 ### Tool Registration Pattern
 
@@ -53,8 +59,16 @@ export const levelTool: ToolDef = categoryTool(
 
 **Two action types:**
 
-- **Bridge actions** (`bp()`) - forwarded to the C++ plugin over WebSocket
+- **Bridge actions** (`bp()`) - forwarded to the C++ plugin over WebSocket. An action whose handler declares a [parameter spec](#parameter-specs) uses `specBp()` instead, and its parameters are generated rather than written here
 - **Local actions** - handled in Node.js (filesystem operations like INI parsing, C++ header reading)
+
+### Advertised surface and context strategy
+
+What a client is handed at startup is decided by the [context strategy](configuration.md#context-strategy-full-lean-micro). `micro`, the default, advertises one `tools` gateway (<!-- tax:micro -->~2.2k<!-- /tax --> tokens with the instructions); `lean` advertises the category tools with a summary each (<!-- tax:lean -->~19k<!-- /tax -->); `full` adds one signature line per action (<!-- tax:full -->~51k<!-- /tax -->). `scripts/context-tax.mjs` measures these and the release gate holds each to its budget.
+
+A category tool is advertised as `action` (the enum of its actions) plus `args` (an object). The flat zod shape `categoryTool()` builds is not advertised any more, but it is still the contract: `index.ts` unwraps `args` and validates the result against that shape with the same zod object the MCP SDK used to build from it, so a refusal carries the SDK's text. The micro gateway checks `call` against the target category's shape the same way.
+
+Action signatures (`set_property(assetPath|path, propertyName, value:*, save?:b)`) are generated from structured data: a spec'd bridge action's recorded C++ spec, an `epic_*` action's generated input schema, and otherwise the declared shape `describe_action` reports. The notation is written once, in the instructions.
 
 ### Bridge Communication
 
@@ -107,10 +121,49 @@ On connect the client asks `get_bridge_capabilities`, which the bridge answers o
 | `engineVersion`, `projectName`, `pid`, `port`, `instanceId`, `startedAt` | Which editor answered |
 | `features` | Named capabilities, for asking about one thing rather than a version floor |
 | `actions`, `actionCount` | The method names the running binary actually registered |
+| `handlerSpecs` | The declared parameter contract of every handler registered with one (see [Parameter specs](#parameter-specs)) |
 
 A plugin built before the handshake existed answers `Unknown method`, which the client records as protocol version 1. When the plugin and client versions differ, the client says so once at connect, repeats it on any unknown-method answer (naming both versions and the method), and reports it under `bridgeProtocol` in `project(get_status)`.
 
 `bridgeApiVersion` in `project(get_status)` is read from the header on disk and therefore describes the source; `bridgeProtocol` comes from the running binary. When the two disagree, the deployed plugin has not been rebuilt.
+
+#### Parameter specs
+
+A handler's parameters used to be written twice: read off `Params` in C++, and declared again in the category's zod shape, `Params:` clause and `mapParams`. Nothing bound the two, so a parameter one side had and the other did not was stripped or ignored without an error (#1057). A handler registered with a spec declares them once, in C++:
+
+```cpp
+Registry.RegisterHandler(TEXT("set_montage_slot"), &SetMontageSlot, {
+	MCPParam::Required(TEXT("assetPath"), EMCPParamType::String, TEXT("AnimMontage asset path")).Alias(TEXT("path")),
+	MCPParam::Required(TEXT("slotName"), EMCPParamType::String, TEXT("Slot name to write onto the track")),
+	MCPParam::Optional(TEXT("trackIndex"), EMCPParamType::Integer, TEXT("Slot track index (default 0)")),
+});
+```
+
+From there the contract travels one way:
+
+1. **The registry** validates the spec at registration and refuses the dispatcher's routing names (`action`, `timeoutMs`, `select`, `omit`, `editor`, `toEditor`), a name declared twice, an item type on anything but an array, a value shape that does not fit its type, and a choice that names an undeclared or required parameter. A refused spec is logged and dropped; the handler still registers. At dispatch it renames each declared alias to its parameter's name, so the handler reads the declared names only.
+2. **The bridge** publishes every spec in `get_bridge_capabilities.handlerSpecs`, keyed by method.
+3. **`npm run specs:record`** writes that answer from a `tests/ue_mcp` editor to `tests/golden/handler-specs.json`.
+4. **`npm run specs:generate`** renders the recording into `src/tools/specs/<category>.generated.ts`: one zod entry per declared name and alias, and the `Params:` clause of each method.
+5. **The category** declares the action with `specBp(effect, summary, method)`. The summary and the effect are the only things written by hand; there is no `mapParams`, because a rename is an alias in the spec. A spec's choices travel on the action, and `prepareCall` refuses a call that does not satisfy them before anything is sent, on the MCP route and the flow route alike.
+
+The advertised surface always comes from the recording, whether an editor is connected or not, so the startup contract does not depend on which plugin answered. When one is connected, `project(get_status)` compares its `handlerSpecs` against the recording and reports any difference under `deployedPlugin.handlerSpecDrift`.
+
+Four tests hold the chain: `tests/unit/handler-specs.test.ts` (the generated modules are exactly what the recording renders to, every spec'd action takes its clause from the spec, and a key shared with hand-written actions has one type), `tests/live/handler-specs.test.ts` (the running plugin still publishes what was recorded), the C++ suite's `UE.MCP.Bridge.HandlerSpec.Contract` (each spec'd handler, called with every declared parameter, reads exactly those and nothing else), and `tests/unit/handler-spec-exempt.test.ts` (a contract-exempt handler's source reads exactly what its spec declares).
+
+##### What a spec can say
+
+Beyond a list of named, typed parameters:
+
+- **A required choice.** `MCPSpec::ExactlyOne({ { TEXT("settings") }, { TEXT("propertyName"), TEXT("propertyValue") } })` says a call supplies one branch and never two; `MCPSpec::AtLeastOne(...)` says one or more. Each branch is a set of names that go together, and every name in a choice is a declared, optional parameter, since the group is what is required. The clause reads as the hand-written ones did (`settings OR propertyName + propertyValue`, `at least one of actorLabels/labelPrefix/tag`), `describe_action` reports each choice as a choice group, and a call that satisfies none, two sides of an exactly-one choice, or half a branch is refused with the choice spelled out. The contract test calls such a handler once per branch.
+- **A value shape.** `EMCPParamType::Color` is `{r, g, b, a?}`. `.Or(EMCPParamType::Color)` makes a union (a number or a colour), `.Nullable()` makes null a value of its own (clear the reference), `.Literal(false)` accepts one value only, and `.WithFields({ MCPParam::RequiredField(...), ... })` declares the fields of an object, or of each element of an array of objects.
+- **A tagged union.** `.Tagged(TEXT("op"), { MCPParam::Variant(TEXT("set"), TEXT("..."), { fields }), ... })` on an object, or on an array of objects, says the field `op` holds a tag and each tag has its own fields. It generates a zod `discriminatedUnion` of strict objects, so a field that belongs to another variant is refused rather than stripped. The signature writes it `o<op>` (`[o<op>]` for an array), and `describe_action` lists the variants with their `discriminator`. A rule between fields (a range whose end follows its start, a blend that must leave a frame) is not part of the spec; the handler enforces it and says what failed.
+- **Value forms.** `.OneOfForms({ EMCPValueForm::ArgMap, EMCPValueForm::StringList, EMCPValueForm::ArgEntryList, EMCPValueForm::String })` on an `Any` parameter or field lists the named shapes it takes: a name-to-value map, a list of strings, a `[{name, value}]` entry list, a string. Each form has one fixed, fully typed schema, so the value is advertised without the untyped member #811 removed, and a value that fits none is refused with a message naming every form. The handler reads the value through the normalizer for its kind in `HandlerFunctionCall.h`: `MCPReadFunctionArgs` reduces a map, an entry list or a JSON string of either to the name-to-value map a UFUNCTION is called with, and `MCPReadPythonArgs` reduces a list, a JSON array string or one string to positional arguments. Each refuses the forms its kind cannot use, with the same message wherever it is called.
+- **A contract exemption.** `MCPSpec::ContractExempt(TEXT("why"))` marks a handler whose contract values would reach a create, spawn, save or run before anything failed. Its spec is recorded and generates the surface like any other; the contract test does not call it, and the source check above holds it to its spec instead: the names its body reads through the `HandlerUtils.h` helpers, and through any function it hands `Params` to, must be the declared names, and a read whose key is not a literal fails the check rather than passing it.
+
+A choice or an exemption goes in the last argument, after the parameter list: `RegisterHandler(name, fn, { ... }, MCPSpec::ExactlyOne(...).ContractExempt(...))`, or `RegisterHandlerWithTimeout(name, fn, seconds, { ... }, rules)`. Each addition is written into the recording only when it is used (`choices`, `contractExempt`, and on a parameter `nullable`, `orTypes`, `literal`, `fields`, `forms`, `oneOf`), so a spec that uses none of them records exactly what it did before they existed.
+
+Every bridge action takes its parameters from a spec, and `tests/unit/handler-specs.test.ts` fails on one that does not. The one passthrough is the generated `epic_*` actions: each dispatches to `epic_call_tool`, whose spec declares the bag it takes (`toolset`, `tool`, `input`, `inputJson`), through a mapper that builds that bag from the wrapped tool's recorded Epic input schema. That schema is the action's contract, and the test holds every such action to building exactly the bag the spec declares.
 
 #### Socket and thread ownership
 
@@ -132,11 +185,22 @@ The plugin runs a raw WebSocket server on a dedicated thread, dispatches incomin
 | `FMCPBridgeServer` | WebSocket server (raw platform sockets, Windows + Linux/Mac) |
 | `FMCPHandlerRegistry` | Maps method names to C++ handler functions |
 | `FMCPGameThreadExecutor` | Queues tasks to the game thread (required for UE API access) |
-| `HandlerUtils.h` + `HandlerAssetCreate.h` | Shared utilities - `MCPError`/`MCPSuccess`/`MCPResult`, `RequireString`/`OptionalVec3`/`OptionalRotator`/etc., `FindActorByLabel`/`FindActorByLabelOrName`, `MCPCheckAssetExists`/`MCPCheckActorLabelExists`, `LoadAssetByPath<T>`, `LoadBlueprintCDO<T>`, `MCPCreateAssetIdempotent<T>`, `SaveAssetPackage`. |
+| `HandlerUtils.h` | Umbrella over the shared helper headers, and the one include external plugins rely on. |
+| `HandlerResult.h` | `MCPError`/`MCPSuccess`/`MCPResult`, `MCPErrorWithCode`, `MCPSetCreated`/`Existed`/`Updated`, `MCPSetRollback`/`MCPSetNoRollback`. |
+| `HandlerParams.h` | `RequireString`/`OptionalString`/`OptionalVec3`/`OptionalRotator`/etc., and the #1057 parameter read tracking. |
+| `HandlerAssetResolve.h` | `MCPLoadAssetObject`, `MCPAssetNotFoundError`, `LoadAssetByPath<T>`, `REQUIRE_ASSET`, `LoadBlueprintCDO<T>`, `MCPCheckAssetExists`, the protected-mount rule. |
+| `HandlerActorResolve.h` | `MCPResolveActor` and its selector, ambiguity refusals, `MCPCheckActorLabelExists`. |
+| `HandlerClassResolve.h` | `MCPResolveClass`/`MCPResolveClassOfType`, `MCPResolveScriptStruct`. |
+| `HandlerWorld.h` | `GetEditorWorld`, the PIE world lookups, `ResolveWorldFromParams`, `REQUIRE_EDITOR_WORLD`. |
+| `HandlerPackageSave.h` | `SaveAssetPackage`/`SaveAssetPackageChecked`, `MCPPackageWriteBlocked`, `MCPNoteSaveOutcome`. |
+| `HandlerJsonConvert.h` | Vector, rotator, colour, quaternion, transform and string-list JSON builders. |
+| `HandlerObjectUtils.h` | Property export, file dumps, `FGCRootScope`, subobject walks, component and collision lookup. |
+| `HandlerEngineVersion.h` | The `UE_MCP_HAS_5_x_API` gates and engine API shims. |
+| `HandlerAssetCreate.h` | `MCPCreateAssetIdempotent<T>`. |
 
 ### Handler Categories
 
-34 C++ handler groups are registered in `BridgeServer.cpp`. Together they expose <!-- count:actions -->1933+<!-- /count --> method names (some of which are aliases mapped onto a smaller number of canonical handlers):
+34 C++ handler groups are registered in `HandlerCatalog.cpp`. Together they expose <!-- count:actions -->2049+<!-- /count --> method names (some of which are aliases mapped onto a smaller number of canonical handlers):
 
 | Handler group | Coverage |
 |---------|----------|

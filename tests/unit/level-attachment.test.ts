@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { levelTool } from "../../src/tools/level.js";
 
+// A spec'd action has no mapper and forwards its bag as sent (#1057).
+const forwarded = (action: string, params: Record<string, unknown>) =>
+  levelTool.actions[action].mapParams?.(params) ?? params;
+
 describe("level attachment surface", () => {
   it("forwards component, actor, socket, and transform-rule selectors", () => {
-    const mapped = levelTool.actions.attach_component.mapParams!({
-      action: "attach_component",
+    const mapped = forwarded("attach_component", {
       childLabel: "Preview",
       parentLabel: "Character",
       childComponentName: "StaticMeshComponent0",
@@ -33,8 +36,7 @@ describe("level attachment surface", () => {
   });
 
   it("forwards the child component selector when detaching", () => {
-    const mapped = levelTool.actions.detach_component.mapParams!({
-      action: "detach_component",
+    const mapped = forwarded("detach_component", {
       childLabel: "Preview",
       childComponentName: "PreviewMesh",
     });

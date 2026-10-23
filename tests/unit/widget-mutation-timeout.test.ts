@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { widgetTool } from "../../src/tools/widget.js";
-import type { IBridge } from "../../src/bridge.js";
-import type { ToolContext } from "../../src/types.js";
+import type { IBridge } from "../../src/bridge/bridge.js";
+import type { ToolContext } from "../../src/core/types.js";
 
 /**
  * #799: add_widget and remove_widget compile and save the Widget Blueprint
@@ -14,6 +14,8 @@ function recordingBridge(): IBridge & { calls: Array<{ method: string; timeoutMs
     calls,
     isConnected: true,
     connect: async () => {},
+    retargetProject: () => ({ projectPath: null, port: 0, portSource: "default" as const, verified: true }),
+    getTarget: () => ({ projectPath: null, port: 0, portSource: "default" as const, verified: true }),
     call: async (method, _params, timeoutMs) => {
       calls.push({ method, timeoutMs });
       return { success: true };
@@ -34,7 +36,8 @@ describe("widget tree mutations", () => {
         action,
         assetPath: "/Game/UI/WBP_Test",
         widgetName: "StartButton",
-        widgetClass: "Button",
+        // Only add_widget takes a class; remove_widget refuses an undeclared key (#1336).
+        ...(action === "add_widget" ? { widgetClass: "Button" } : {}),
       });
 
       expect(bridge.calls).toEqual([{ method: action, timeoutMs: 120_000 }]);

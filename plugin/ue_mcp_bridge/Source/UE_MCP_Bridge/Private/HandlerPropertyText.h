@@ -3,7 +3,9 @@
 #include "CoreMinimal.h"
 #include "UObject/UnrealType.h"
 #include "UObject/PropertyPortFlags.h"
+#include "Misc/OutputDevice.h"
 #include "Misc/OutputDeviceNull.h"
+#include "Misc/DefaultValueHelper.h"
 
 // Structured UE export-text import for container properties (#820).
 //
@@ -204,15 +206,120 @@ namespace MCPPropertyText
 		return 0;
 	}
 
-	// Engine text import, with the engine's own warnings swallowed: a null
-	// return is the failure signal the callers act on.
+	// Collects what the engine importer reports. It skips a struct member it
+	// cannot find with only a warning, so that warning has to be read.
+	class FImportTextCapture : public FOutputDevice
+	{
+	public:
+		TArray<FString> UnknownMembers;
+		virtual void Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category) override
+		{
+			const FString Line(V);
+			if (Line.Contains(TEXT("Unknown member"), ESearchCase::IgnoreCase)
+				|| Line.Contains(TEXT("Unknown property"), ESearchCase::IgnoreCase))
+			{
+				UnknownMembers.Add(Line.TrimStartAndEnd());
+			}
+		}
+	};
+
+	// The member a struct text field names, by its property name or its authored
+	// (display) name, which is how a UserDefinedStruct member is written. A static
+	// array element (Name[2] or Name(2)) names the same member.
+	inline const FProperty* FindStructMemberForText(const UStruct* Struct, const FString& InKey)
+	{
+		if (!Struct) return nullptr;
+		FString Key = InKey;
+		int32 Bracket = INDEX_NONE;
+		if (Key.FindChar(TEXT('['), Bracket) || Key.FindChar(TEXT('('), Bracket)) Key = Key.Left(Bracket);
+		Key.TrimStartAndEndInline();
+		if (const FProperty* Exact = Struct->FindPropertyByName(FName(*Key))) return Exact;
+		for (TFieldIterator<FProperty> It(Struct); It; ++It)
+		{
+			if (It->GetName().Equals(Key, ESearchCase::IgnoreCase) || It->GetAuthoredName().Equals(Key, ESearchCase::IgnoreCase))
+			{
+				return *It;
+			}
+		}
+		return nullptr;
+	}
+
+	// The engine importer skips a struct member it cannot find without a word,
+	// so a misspelt or stale member used to vanish while the write reported
+	// success. Every member named in struct text, at any depth, has to exist.
+	// Text that is not a parenthesised group is left to the importer.
+	inline bool ValidateStructMembers(const FProperty* Prop, const FString& Text, FString& OutError, int32 Depth = 0)
+	{
+		if (!Prop || Depth > MaxTypeDepth) return true;
+		if (const FStructProperty* StructProp = CastField<const FStructProperty>(Prop))
+		{
+			TArray<TPair<FString, FString>> Fields;
+			FString Ignored;
+			if (!SplitStructFields(Text, Fields, Ignored)) return true;
+			for (const TPair<FString, FString>& Field : Fields)
+			{
+				const FProperty* Member = FindStructMemberForText(StructProp->Struct, Field.Key);
+				if (!Member)
+				{
+					TArray<FString> Names;
+					for (TFieldIterator<FProperty> It(StructProp->Struct); It; ++It) Names.Add(It->GetAuthoredName());
+					OutError = FString::Printf(TEXT("struct '%s' has no member '%s'. Members: [%s]"),
+						*StructProp->Struct->GetName(), *Field.Key, *FString::Join(Names, TEXT(", ")));
+					return false;
+				}
+				if (!ValidateStructMembers(Member, Field.Value, OutError, Depth + 1)) return false;
+			}
+			return true;
+		}
+		const FProperty* Inner = nullptr;
+		if (const FArrayProperty* ArrProp = CastField<const FArrayProperty>(Prop)) Inner = ArrProp->Inner;
+		else if (const FSetProperty* SetProp = CastField<const FSetProperty>(Prop)) Inner = SetProp->ElementProp;
+		if (!Inner || !CastField<const FStructProperty>(Inner)) return true;
+		TArray<FString> Elements;
+		FString Ignored;
+		if (!SplitTopLevel(Text, Elements, Ignored)) return true;
+		for (const FString& Element : Elements)
+		{
+			if (!ValidateStructMembers(Inner, Element, OutError, Depth + 1)) return false;
+		}
+		return true;
+	}
+
+	// Engine text import. A null return, or a struct member the target does
+	// not have, is the failure signal the callers act on.
 	inline bool ImportTextRaw(const FProperty* Prop, void* ValueAddr, const FString& Text, UObject* Owner, int32 PortFlags, FString& OutError)
 	{
-		FOutputDeviceNull Silent;
-		const TCHAR* Rest = Prop->ImportText_Direct(*Text, ValueAddr, Owner, PortFlags, &Silent);
+		// The engine's numeric import reads "banana" as 0 and reports success.
+		if (const FNumericProperty* Num = CastField<const FNumericProperty>(Prop))
+		{
+			if (!Num->IsEnum())
+			{
+				const FString Trimmed = Text.TrimStartAndEnd();
+				const bool bValid = Num->IsInteger()
+					? FDefaultValueHelper::IsStringValidInteger(Trimmed)
+					: (FDefaultValueHelper::IsStringValidFloat(Trimmed) || FDefaultValueHelper::IsStringValidInteger(Trimmed));
+				if (!bValid)
+				{
+					OutError = FString::Printf(TEXT("'%s' is not a number"), *Text);
+					return false;
+				}
+			}
+		}
+
+		if (!ValidateStructMembers(Prop, Text, OutError)) return false;
+
+		FImportTextCapture Capture;
+		const TCHAR* Rest = Prop->ImportText_Direct(*Text, ValueAddr, Owner, PortFlags, &Capture);
 		if (Rest == nullptr)
 		{
 			OutError = FString::Printf(TEXT("ImportText failed for '%s'"), *Text);
+			return false;
+		}
+		if (Capture.UnknownMembers.Num() > 0)
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' names a member the target does not have (%s). If a struct was just edited, its dependents may need reinstancing"),
+				*Prop->GetName(), *FString::Join(Capture.UnknownMembers, TEXT("; ")));
 			return false;
 		}
 		return true;

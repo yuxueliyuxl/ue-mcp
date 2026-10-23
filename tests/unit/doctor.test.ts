@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { findLocalShadow, findBareNpxConfigs, parseServerInvocation, formatDoctor, type DoctorReport } from "../../src/doctor.js";
+import { findLocalShadow, findBareNpxConfigs, parseServerInvocation, formatDoctor, type DoctorReport } from "../../src/cli/doctor.js";
 
 const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
@@ -142,6 +142,21 @@ describe("parseServerInvocation", () => {
 });
 
 describe("formatDoctor verdict", () => {
+  it("flags a pinned client config that does not match the bridge plugin", () => {
+    const out = stripAnsi(formatDoctor(baseReport({
+      pinnedConfigs: [{ config: "C:/proj/Vale/.mcp.json", version: "0.2.9" }],
+    })));
+    expect(out).not.toContain("Everything aligned");
+    expect(out).toContain("pins ue-mcp@0.2.9 but the bridge plugin is 0.3.0");
+  });
+
+  it("accepts a pin that matches the bridge plugin", () => {
+    const out = stripAnsi(formatDoctor(baseReport({
+      pinnedConfigs: [{ config: "C:/proj/Vale/.mcp.json", version: "0.3.0" }],
+    })));
+    expect(out).not.toContain("pins ue-mcp@");
+  });
+
   it("reports aligned when global, npx, and the target server are all latest", () => {
     const out = stripAnsi(formatDoctor(baseReport({
       runningServers: [{ pid: 1, version: "1.0.78", script: "x", project: "C:/proj/Vale", servesTarget: true }],

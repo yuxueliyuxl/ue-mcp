@@ -17,15 +17,24 @@ describe("log helper", () => {
 
   it("emits info lines at default level", async () => {
     delete process.env.UE_MCP_LOG_LEVEL;
-    const { info } = await import("../../src/log.js");
+    const { info } = await import("../../src/core/log.js");
     info("test", "hello");
     expect(stderr).toHaveBeenCalledTimes(1);
     expect(stderr.mock.calls[0][0]).toContain("[ue-mcp] info test: hello");
   });
 
+  it("puts the time on every line once the daemon asks, so its log says when", async () => {
+    delete process.env.UE_MCP_LOG_LEVEL;
+    const { info, stampLogs } = await import("../../src/core/log.js");
+    stampLogs();
+    info("test", "hello");
+    expect(stderr.mock.calls[0][0]).toMatch(/^\[ue-mcp\] \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z info test: hello$/);
+    stampLogs(false);
+  });
+
   it("suppresses debug below info", async () => {
     delete process.env.UE_MCP_LOG_LEVEL;
-    const { debug } = await import("../../src/log.js");
+    const { debug } = await import("../../src/core/log.js");
     debug("test", "hidden");
     expect(stderr).not.toHaveBeenCalled();
   });
@@ -33,7 +42,7 @@ describe("log helper", () => {
   it("honours UE_MCP_LOG_LEVEL=debug", async () => {
     process.env.UE_MCP_LOG_LEVEL = "debug";
     vi.resetModules();
-    const { debug } = await import("../../src/log.js");
+    const { debug } = await import("../../src/core/log.js");
     debug("test", "shown");
     expect(stderr).toHaveBeenCalledTimes(1);
   });
@@ -41,7 +50,7 @@ describe("log helper", () => {
   it("formats Error instances", async () => {
     process.env.UE_MCP_LOG_LEVEL = "warn";
     vi.resetModules();
-    const { warn } = await import("../../src/log.js");
+    const { warn } = await import("../../src/core/log.js");
     warn("test", "boom", new Error("root cause"));
     expect(stderr).toHaveBeenCalledTimes(1);
     expect(stderr.mock.calls[0][0]).toContain("root cause");

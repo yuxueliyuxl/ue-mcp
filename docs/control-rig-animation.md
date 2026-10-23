@@ -330,6 +330,26 @@ transform first. The rules are:
 - Apply related controls and scalar switches in one
   `apply_control_rig_edits` call. The batch is prevalidated, transacted,
   read back, and undone if application or readback fails.
+- Operations in one call are keyed in order, and each is sampled after the
+  ones before it have landed, so batched control offsets compose like the same
+  offsets sent as separate calls. A component-space `offset` on a child
+  after one on its parent adds to the parent's edit. Order matters for the
+  same reason: put the parent first when the child's offset should ride on
+  it. The rollback undoes the operations last-first. Before the transaction
+  closes, the stored contact control/driver and stabilizer poses are checked
+  again against the final batch pose; a failed readback rolls back the batch.
+- A contact using `targetReference`, or using `drivenReference` without the FK
+  rotation-chain solver, must be first in the batch. These paths sample the
+  source animation and require a fresh session without earlier rig edits,
+  including edits from previous calls. Being first in a later call does not
+  satisfy that requirement; the bridge does not detect edits from prior calls.
+  If they follow another operation in one batch, the call
+  returns `contact_lock_reference_batch_unsupported` before writing keys.
+  Use a direct control contact with a component-space target, or bake prior
+  edits and begin a new session before applying the reference-based contact.
+  Driven contacts check the final FK end-control or asset-driver pose;
+  target-reference motion is not re-evaluated after later rig edits. Reference
+  contacts require baking and analysis before accepting the bone/socket result.
 
 Read the same frames again after applying. Check both local continuity and the
 global/component anatomical targets before baking.
@@ -403,14 +423,15 @@ orientation unkeyed; the end control joins the keyed chain only when
 `target.rotationQuaternion` is supplied.
 
 The apply call transactionally reads back the driver and stabilizer keys. With
-`drivenReference`, `contactQa.verification` is
+`drivenReference` or `targetReference`, `contactQa.verification` is
 `bake_and_analyze_required`: the composed layered bone/socket result is not
 claimed before export. Bake to a new AnimSequence, run `analyze_animation` on
 every constrained frame, and compare the driven reference with the fixed or
 moving target. If it exceeds the motion's acceptance tolerance, reject that
-output and revise the driver, stabilizers, or rig mapping. Without
-`drivenReference`, the driver itself is constrained and its residual is checked
-during apply.
+output and revise the driver, stabilizers, or rig mapping. `passed=true` is
+returned only for direct control contacts without either reference. A contact
+with `targetReference` checks the driver against the sampled source target;
+it does not verify the target bone/socket after subsequent rig edits.
 
 This is deliberately a generic contact primitive, not a foot-specific macro.
 It works for hands on props, planted feet, held tools, mechanical linkages, and
@@ -467,6 +488,18 @@ Timing metadata is explicit: `durationSeconds` is the raw sequence duration,
 the raw duration divided by the rate magnitude. Each `notifies` record includes
 `rawTriggerTimeSeconds` and its rate-scaled `effectiveTriggerTimeSeconds`. A
 zero asset rate reports null effective times because playback does not advance.
+
+`facingBones=[boneA, boneB]` adds a heading metric for any two bones. At every
+sampled frame the component-space vector from boneA to boneB is rotated into
+the root bone's frame and its yaw is reported as `facingYawDegrees` (0 is root
++X, 90 is root +Y). `summary.facing` gives the clip's circular mean
+(`averageYawDegrees`), `minYawDegrees`, `maxYawDegrees`, `spreadDegrees`,
+`resultantLength` (1 when every sample agrees) and `degenerateSampleCount` for
+samples where the vector is vertical. A hip or shoulder pair tells a clip that
+faces its direction of travel from one that moves sideways.
+
+To compare length, rate scale and frame counts across many clips first, use
+`read_sequence` with `assetPaths` or `directory` and a `fields` selector.
 
 Derive motion-specific assertions from the samples rather than screenshots:
 

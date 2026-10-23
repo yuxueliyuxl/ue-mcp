@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyActionClass } from "../../src/action-class.js";
+import { declaredActionEffect } from "../../src/surface/action-effects.js";
 import { levelTool } from "../../src/tools/level.js";
 
 describe("level.bulk_line_trace", () => {
@@ -22,24 +22,16 @@ describe("level.bulk_line_trace", () => {
     expect(levelTool.schema.traces.safeParse(traces).success).toBe(true);
   });
 
-  it("rejects empty, oversized, and malformed batches", () => {
-    expect(levelTool.schema.traces.safeParse([]).success).toBe(false);
-    expect(levelTool.schema.traces.safeParse(
-      Array.from({ length: 257 }, () => ({ start: { x: 0, y: 0, z: 0 }, end: { x: 0, y: 0, z: 1 } })),
-    ).success).toBe(false);
+  it("rejects malformed entries; the handler refuses an empty or oversized batch", () => {
     expect(levelTool.schema.traces.safeParse([{ start: "origin" }]).success).toBe(false);
     expect(levelTool.schema.traces.safeParse([{ end: { x: 0, y: 0, z: 1 } }]).success).toBe(false);
   });
 
-  it("routes only traces to the native bridge", () => {
+  it("takes its parameters from its spec and forwards the bag as sent", () => {
     const action = levelTool.actions.bulk_line_trace;
     expect(action.bridge).toBe("bulk_line_trace");
-    const traces = [{ start: { x: 0, y: 0, z: 0 }, end: { x: 1, y: 0, z: 0 } }];
-    expect(action.mapParams?.({
-      action: "bulk_line_trace",
-      traces,
-      unrelated: "ignored",
-    })).toEqual({ traces });
+    expect(action.mapParams).toBeUndefined();
+    expect(action.kind === "bridge" && action.paramSpec?.map((p) => p.name)).toEqual(["traces", "world", "pieInstance"]);
   });
 
   it("documents the cap and ordered per-item contract", () => {
@@ -50,9 +42,6 @@ describe("level.bulk_line_trace", () => {
   });
 
   it("is a read, like line_trace", () => {
-    expect(classifyActionClass("level", "bulk_line_trace")).toEqual({
-      class: "read",
-      source: "override",
-    });
+    expect(declaredActionEffect("level", "bulk_line_trace")).toBe("read");
   });
 });

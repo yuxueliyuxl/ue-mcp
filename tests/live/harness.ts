@@ -20,7 +20,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { EditorBridge } from "../../src/bridge.js";
+import { EditorBridge } from "../../src/bridge/bridge.js";
 import {
   assertLiveTestProjectDir,
   assertLoopbackHost,
@@ -58,6 +58,8 @@ export interface LiveCapabilities {
   actionCount?: number;
   /** True when the editor was launched with the parameter echo switched on. */
   paramEcho?: boolean;
+  /** Declared parameter contracts of the spec'd handlers (#1057). */
+  handlerSpecs?: Record<string, unknown>;
 }
 
 const HOST = process.env.UE_MCP_LIVE_HOST ?? process.env.UE_MCP_TEST_HOST ?? "127.0.0.1";

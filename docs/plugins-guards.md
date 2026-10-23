@@ -71,7 +71,13 @@ Both hooks are optional and independent, so one named guard can hold both halves
 
 `class_path` is a path, resolved from the server's working directory: `guards/PolicyGuard` looks for `guards/PolicyGuard.ts`, `.js`, or an `index` under that name. Nothing enforces a directory, and `guards/` is the convention here only because a guard is not a task and should not sit in `tasks/` next to things that are. A plugin package is the one place a directory IS fixed: a plugin's own tasks resolve from its compiled `dist/tasks/`.
 
-`options` are bound when the guard is built. The call being guarded is layered over them, so a hook reads its configuration and its subject from one object: `method`, `params`, `paths` (the existing files the call will touch, empty for reads) and, for `after`, `result`.
+YAML guard `options` are reloaded when a config file changes, with file checks shared across hooks at most every 250 ms. Layers follow the flow configuration order: `~/.ue-mcp/config.yml` (or `UE_MCP_GLOBAL_CONFIG`), the project's `ue-mcp.yml`, `ue-mcp.{UE_MCP_ENV}.yml`, then `ue-mcp.local.yml`. Environment and local overlays apply when a project file exists. Plugin guard options remain those declared in the plugin manifest; a YAML guard with the same name is a separate guard and cannot override them.
+
+Removing a config layer, guard or hook retains the last valid guard options until restart. This also keeps guards active while an editor saves YAML by deleting and rewriting a file. Malformed YAML, invalid guard declarations and file access errors retain the last valid guard configuration and log a warning. Unchanged invalid content is not repeatedly parsed; transient read errors are retried after five seconds. At startup, an unreadable or malformed global file is warned about and ignored, matching flow configuration loading. Invalid project configuration still prevents startup. Concurrent saves are retried, with the last successfully parsed startup snapshot used if the files keep changing.
+
+Adding or removing guards or hooks, or changing `class_path`, `scope` or `order`, requires restarting ue-mcp. Such changes retain the previous guard configuration until restart and log a warning when a registered YAML hook next checks the files. Restoring the registered structure allows option reloads to resume. A session with no registered YAML hooks only reads guard configuration at startup. Plugin manifest changes also require a restart.
+
+The call being guarded is layered over the options for legacy task hooks, so a hook reads its configuration and its subject from one object: `method`, `params`, `paths` (the existing files the call will touch, empty for reads) and, for `after`, `result`.
 
 A `class_path` that cannot be resolved stops the server at boot, naming the guard and the manifest or config that declared it. With no guard registered the pipeline is a pass-through, so a guard that failed to build would leave the calls it covers ungated while the configuration says they are guarded.
 
@@ -145,4 +151,12 @@ export default class AuditGuard extends UeMcpGuard<{ file?: string }> {
 
 Multiple guards compose into one pipeline. `before` hooks run in order, `after` hooks in reverse order (the same nesting an interceptor stack gives you). A guard that denies short-circuits the rest of the `before` chain and the call itself.
 
-Guards from different plugins coexist - a source-control checkout guard, an access-policy deny guard, and an audit guard can all be installed at once, each shipped by whatever plugin owns that concern. The [`ue-mcp-perforce`](https://github.com/db-lyon/ue-mcp-perforce) plugin's source-control guard is the canonical example: a `before` hook scoped to writes, checking the target files out, or refusing when a person holds the lock, before the write reaches the editor.
+Guards from different plugins coexist - a source-control checkout guard, an access-policy deny guard, and an audit guard can all be installed at once, each shipped by whatever plugin owns that concern. The [`ue-mcp-perforce`](https://github.com/db-lyon/ue-mcp-perforce) plugin's source-control guard is an example: a `before` hook scoped to writes, checking the target files out, or refusing when a person holds the lock, before the write reaches the editor.
+
+## Source control: core first, guards opt-in
+
+Checkout on write belongs to core. `source_control(action="set_checkout_mode")` decides what a bridge write does with a read-only file under source control, for whichever provider the editor has configured: `manual` (the default) refuses the write and names `source_control(checkout)`, and `auto` checks the file out through the provider first and lists it on the result as `autoCheckedOut`. `UE_MCP_CHECKOUT_MODE=auto` at editor startup turns `auto` on from the start. No plugin is needed for any of that.
+
+A source control guard from a plugin is an opt-in extra on top: a policy core does not have, such as refusing a write early when a person holds the lock, or opening files in a named changelist. Install one when you want that policy; leave it out and core's checkout mode still applies.
+
+The `source_control_*` calls themselves are never seen by `writes`. They are the provider operations a guard would make, so a guard intercepting `checkout`, `revert` or `submit` would check a file out before checking it out. The write classification declares them as writing nothing guardable rather than relying on how their parameters happen to be named.

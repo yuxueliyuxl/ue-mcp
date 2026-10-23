@@ -5,7 +5,7 @@ ue-mcp:
 # that runs this flow. tests/ue_mcp is the one project that suite is allowed to
 # drive, so its fixtures live here.
 #
-# Every step is a read: the suite attaches to an editor somebody else started
+# Every step of the leak probe is a read: the suite attaches to an editor somebody else started
 # and has to leave it exactly as it found it.
 #
 # The `editor:` key inside each step's options is deliberate, and is the point
@@ -30,7 +30,6 @@ flows:
         task: asset.list_textures
         options:
           directory: /Game
-          recursive: false
           editor: ue_mcp
       "2":
         task: project.get_status
@@ -41,5 +40,17 @@ flows:
         options:
           method: list_textures
           directory: /Game
-          recursive: false
           editor: ue_mcp
+
+  # Run only by the opt-in lifecycle cases (npm run test:live -- --lifecycle),
+  # which are allowed to stop and start this project's editor (#1223).
+  live_lifecycle_rebuild:
+    description: Save, then stop, build and relaunch the tests/ue_mcp editor. Live lifecycle fixture.
+    on_editor_loss: resume
+    steps:
+      "1":
+        task: editor.save_dirty
+        options:
+          includeMaps: true
+      "2":
+        task: editor.rebuild

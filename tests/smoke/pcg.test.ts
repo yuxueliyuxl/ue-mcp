@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { getBridge, disconnectBridge, callBridge, checkFeature, TEST_PREFIX } from "../setup.js";
-import type { EditorBridge } from "../../src/bridge.js";
+import type { EditorBridge } from "../../src/bridge/bridge.js";
 
 let bridge: EditorBridge;
 let hasPCG = false;
@@ -45,5 +45,20 @@ describe("pcg - create (with cleanup)", () => {
       assetPath: `${TEST_PREFIX}/PCG_SmokeTest`,
     });
     expect(r.ok, r.error).toBe(true);
+  });
+
+  it("add_pcg_node creates a node that owns its settings (#1087)", async ({ skip }) => {
+    if (!hasPCG) skip();
+    const assetPath = `${TEST_PREFIX}/PCG_SmokeTest`;
+    const added = await callBridge(bridge, "add_pcg_node", { assetPath, nodeType: "PCGSurfaceSamplerSettings" });
+    expect(added.ok, added.error).toBe(true);
+    const nodeName = (added.result as { nodeName: string }).nodeName;
+
+    const r = await callBridge(bridge, "unwrap_pcg_instance_nodes", { assetPath, nodeName });
+    expect(r.ok, r.error).toBe(true);
+    const res = r.result as { unwrappedCount: number; alreadyOwnedCount: number; unchanged: boolean };
+    expect(res.unwrappedCount).toBe(0);
+    expect(res.alreadyOwnedCount).toBe(1);
+    expect(res.unchanged).toBe(true);
   });
 });

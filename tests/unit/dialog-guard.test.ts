@@ -11,8 +11,8 @@ import {
   isModalSafeMethod,
   stampBlockedEditor,
   type GuardDeps,
-} from "../../src/dialog-guard.js";
-import type { DialogMode } from "../../src/user-state.js";
+} from "../../src/editor/dialog-guard.js";
+import type { DialogMode } from "../../src/config/user-state.js";
 
 const DIALOG = {
   title: "Save Content",
@@ -38,6 +38,7 @@ function make(over: Omit<Partial<GuardDeps>, "mode"> & { mode?: DialogMode } = {
     elicit: over.elicit,
     readSnapshot: over.readSnapshot,
     isConnected: over.isConnected,
+    exiting: over.exiting,
     askWaitMs: over.askWaitMs,
   };
   return new DialogGuard(deps);
@@ -45,24 +46,6 @@ function make(over: Omit<Partial<GuardDeps>, "mode"> & { mode?: DialogMode } = {
 
 const accept = (button: string) =>
   () => (vi.fn(async () => ({ action: "accept", content: { button } })) as unknown as ReturnType<NonNullable<GuardDeps["elicit"]>>);
-
-/**
- * Get past the relay, so a case about the FORM is about the form.
- *
- * Under interactive the first gated call for a dialog hands its whole text
- * back and refuses without asking anything, because an elicitation form is a
- * few lines tall and a client may collapse the rest of it. The form goes up on
- * the next call. A case about what the person is shown therefore starts one
- * call earlier than it used to, and this makes that call rather than letting
- * every such case open with an unexplained duplicate line.
- *
- * The relay decision is returned, not swallowed: a case that wants to assert
- * on it can, and one that ignores it still pays for it visibly.
- */
-async function relay(guard: DialogGuard, subject = "asset.list") {
-  const decision = await guard.check(subject, "action");
-  return decision;
-}
 
 describe("a failing probe never disarms the guard", () => {
   it("keeps the dialog when the probe throws but the editor is still publishing", async () => {
@@ -836,6 +819,24 @@ describe("who may press the button is the mode's decision, not the allow list's"
     expect((await guard.check("editor.respond_to_dialog", "action")).allow).toBe(true);
   });
 
+  it("gates the window press and close by the mode, and leaves list_windows readable (#1231)", async () => {
+    for (const method of ["list_windows", "press_window_button", "close_window"]) {
+      expect(isModalSafeMethod(method), method).toBe(true);
+      expect(DialogGuard.bridgeAllowed(method), method).toBe(true);
+    }
+    for (const mode of ["interactive", "defer"] as const) {
+      const guard = make({ mode, elicit: accept("Cancel") });
+      for (const action of ["editor.press_window_button", "editor.close_window"]) {
+        expect((await guard.check(action, "action")).allow, `${mode} ${action}`).toBe(false);
+      }
+      expect((await guard.check("editor.list_windows", "action")).allow, mode).toBe(true);
+    }
+    const auto = make({ mode: "auto" });
+    for (const action of ["editor.list_windows", "editor.press_window_button", "editor.close_window"]) {
+      expect((await auto.check(action, "action")).allow, action).toBe(true);
+    }
+  });
+
   it("still lets the guard press the button the PERSON picked", async () => {
     // The gate is on the action route only. The guard's own press, on the
     // button chosen in the elicitation form, travels over the bridge, and
@@ -1218,5 +1219,57 @@ describe("an answer that arrives after the call stopped waiting (#1076)", () => 
     await new Promise((r) => setTimeout(r, 20));
 
     expect(press).not.toHaveBeenCalled();
+  });
+});
+
+describe("an editor that is exiting (#1384)", () => {
+  // The Save Content prompt was answered, the editor began to exit, and the next
+  // rebuild was refused naming that prompt: the probe could no longer be answered
+  // and the latch was kept, three seconds before the editor logged its exit.
+  it("does not refuse on a dialog latched before it began to exit, socket up or down", async () => {
+    for (const connected of [true, false]) {
+      const guard = make({
+        isConnected: () => connected,
+        readSnapshot: () => ({ modal: null, ageSeconds: 1 }),
+        exiting: () => true,
+        probe: async () => {
+          throw new Error("closed");
+        },
+      });
+      guard.note(DIALOG);
+      expect((await guard.check("editor.stop_editor", "action")).allow, `connected=${connected}`).toBe(true);
+      expect(guard.current).toBeNull();
+    }
+  });
+
+  it("still refuses for an editor that is parked and not exiting", async () => {
+    const guard = make({ isConnected: () => true, exiting: () => false, probe: async () => { throw new Error("ETIMEDOUT"); } });
+    guard.note(DIALOG);
+    expect((await guard.check("editor.stop_editor", "action")).allow).toBe(false);
+  });
+});
+
+describe("the status file of an editor that is exiting (#1384)", () => {
+  it("is not read as a live modal: the editor stopped rewriting it when it began to exit", async () => {
+    let exiting = false;
+    const guard = make({
+      isConnected: () => true,
+      readSnapshot: () => ({ modal: { title: "Save Content", message: "m", buttons: DIALOG.buttons, blocksGameThread: true }, ageSeconds: 2 }),
+      exiting: () => exiting,
+      probe: async () => {
+        throw new Error("closed");
+      },
+    });
+    guard.startWatching(10);
+    try {
+      await new Promise((r) => setTimeout(r, 40));
+      expect(guard.current?.title).toBe("Save Content");
+      exiting = true;
+      await new Promise((r) => setTimeout(r, 40));
+      expect(guard.current).toBeNull();
+      expect((await guard.check("editor.stop_editor", "action")).allow).toBe(true);
+    } finally {
+      guard.stopWatching();
+    }
   });
 });

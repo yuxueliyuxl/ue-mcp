@@ -9,19 +9,17 @@ actionPrefix: pie                    # used only when injecting into a built-in
 
 nativeModule:
   uePluginName: PIE_Studio           # name of the .uplugin that gets deployed
-  minBridgeApi: 1                    # gate against UEMCP_BRIDGE_API_VERSION
+  minBridgeApi: 2                    # gate against UEMCP_BRIDGE_API_VERSION; 2 = typed contracts
   source: ue/Plugins/PIE_Studio      # path inside your npm tarball
   category: pie                      # surface handlers under a pie(...) tool
   categoryDescription: "PIE record, replay, observe, and input injection"
+  specs: handler-specs.json          # recorded C++ contracts (ue-mcp plugin record-specs)
   handlers:
     record_arm:   { description: "Arm the PIE input recorder" }
     replay_arm:   { description: "Arm the PIE input replayer" }
     inject_input:
       description: "Single-frame Enhanced Input inject"
       timeoutSeconds: 5
-      schema:
-        action_path: { type: string, description: "InputAction asset path (required)" }
-        value_x:     { type: number }
     # ... more handlers
 ```
 
@@ -34,10 +32,46 @@ Set `category` and ue-mcp surfaces every handler as an MCP action that dispatche
 
 Two rules that bite if missed:
 
-- **Declare params under each handler's `schema:`.** The MCP SDK strips any param not in the action's schema before it reaches the bridge, so an undeclared param silently never arrives. Same field types as `inject:` schemas, including an omitted `type` for a param that takes any JSON value and a `type:` list for one that takes a union - see [`ue-mcp.plugin.yml`](plugins-authoring.md#ue-mcpplugin-yml). Params-free handlers (status polls, list calls) need no schema. Leave params **optional** (ue-mcp forces them optional regardless): one flat schema backs every action in a category, so a required param would be forced onto unrelated actions - let your C++ handler validate and return a clear error, and note "(required)" in the param description.
+- **Declare each handler's parameters in C++, and record them.** See [Typed contracts](#typed-contracts). A handler surfaced without a contract has only the manifest's loose `schema:` (types `string`, `number`, `boolean`, `object`, `array`, with `required:` reported per action but left to the handler to enforce), which cannot express enums, ranges, integers or nested fields. With `specs:` set, a declared handler with no recorded contract is not surfaced at all.
 - **`timeoutSeconds`** sets the bridge-call timeout for that action (default 30s). Raise it for long-running handlers.
 
 Omit `category` entirely and handlers are still registered on the bridge but exposed as no MCP action - useful only if another task calls them internally. For an agent-facing plugin you almost always want `category`.
+
+## Typed contracts
+
+Bridge ABI 2 lets a native handler register with the same parameter contract a core ue-mcp handler declares (`MCPHandlerSpec.h`, shipped under the bridge's `Public/`). ue-mcp generates the action's `Params:` clause, its signature and its `describe_action` output from that contract. It checks every call against the contract before anything is sent:
+
+- each parameter's type, including `integer`, `vec3`, `rotator` and `color`;
+- `Enum({...})` values on a string or an array of strings, matched case-sensitively;
+- `Min`, `Max` and `Range` on a number or integer, or on each element of an array of them;
+- `WithFields({...})` on an object or an array of objects, nested to any depth, each field with its own type, enum and range;
+- required parameters, aliases, unions, literals, tagged variants (`oneOf`) and choices (`MCPSpec::ExactlyOne`, `MCPSpec::AtLeastOne`);
+- any key the contract does not declare, which is refused rather than silently ignored.
+
+```cpp
+UEMCP::RegisterExternalHandler(TEXT("stamp_set"), &FStampHandlers::Set, {
+    MCPParam::Required(TEXT("actorPath"), EMCPParamType::String, TEXT("The stamp actor")).Alias(TEXT("path")),
+    MCPParam::Optional(TEXT("blendMode"), EMCPParamType::String, TEXT("How heights combine"))
+        .Enum({ TEXT("Max"), TEXT("Min"), TEXT("Override") }),
+    MCPParam::Optional(TEXT("priority"), EMCPParamType::Integer, TEXT("Evaluation order")).Min(0.0),
+    MCPParam::Optional(TEXT("quality"), EMCPParamType::Object, TEXT("Per-platform quality")).WithFields({
+        MCPParam::RequiredField(TEXT("lod"), EMCPParamType::Integer, TEXT("LOD index")).Range(0.0, 7.0),
+    }),
+});
+```
+
+A contract that fails validation (an enum on a number, a minimum above its maximum, a field declared twice) is logged as an error and dropped, and the call returns `false`. The handler stays registered.
+
+The bridge enforces the contract too. Every call to a handler registered with one is checked before the handler runs, whoever sent it, and refused with `Invalid parameters for <handler>: <reason>`. The bridge then renames declared aliases to their parameter's name, so read only the declared name and do not re-validate what the contract already says. `UEMCP::ContractViolation` (`MCPContract.h`) is the same check, for a handler that wants it for a nested call of its own. For a name-to-scalar map such as graph parameter overrides, declare it `Any` with `.OneOfForms({ EMCPValueForm::ScalarMap })`: each value must be a string, number, boolean or null.
+
+The bridge publishes the contracts in `get_bridge_capabilities.pluginHandlerSpecs`. Record them into the file `nativeModule.specs` names, with an editor running that has your module loaded:
+
+```bash
+ue-mcp plugin record-specs --project path/to/Project.uproject
+ue-mcp plugin record-specs --project path/to/Project.uproject --check   # CI: fail when the file is stale
+```
+
+Ship that file in the tarball (`files:`). The server builds the surface from the recording, so the surface is the same whether or not an editor is connected. `project(get_status)` reports `deployedPlugin.handlerSpecDrift` when the running module registered something different. A call to a drifted handler is checked against the contract the running module registered, since the bridge enforces that one anyway; `describe_action` keeps showing the recording until you re-record it and the client reconnects.
 
 ## Layout inside the npm tarball
 
@@ -94,6 +128,10 @@ void FPIE_StudioModule::StartupModule()
             TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
             Result->SetBoolField(TEXT("success"), true);
             return MakeShared<FJsonValueObject>(Result);
+        },
+        {
+            MCPParam::Required(TEXT("action_path"), EMCPParamType::String, TEXT("InputAction asset path")),
+            MCPParam::Optional(TEXT("value_x"), EMCPParamType::Number, TEXT("X axis value")).Range(-1.0, 1.0),
         });
 }
 
@@ -120,7 +158,7 @@ The CLI now also:
 
 ## Bridge ABI versioning
 
-`UEMCP_BRIDGE_API_VERSION` is the C++ ABI contract every native plugin compiles against. Bumps are reserved for breaking changes to the `FExternalHandlerFn` signature or the registration contract. A plugin declaring `minBridgeApi: N` refuses to load against a bridge whose version is below N. Inspect the deployed bridge's version with:
+`UEMCP_BRIDGE_API_VERSION` is the C++ ABI contract every native plugin compiles against. Bumps are reserved for changes to the `FExternalHandlerFn` signature or the registration contract. Version 2 added typed contracts; a module that registers with one needs `minBridgeApi: 2`. A plugin declaring `minBridgeApi: N` refuses to load against a bridge whose version is below N. Inspect the deployed bridge's version with:
 
 ```text
 project(action="get_status")

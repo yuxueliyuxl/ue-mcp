@@ -1,16 +1,10 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { assetTool } from "../../src/tools/asset.js";
-import { classifyAction } from "../../src/locking.js";
+import { classifyAction } from "../../src/dispatch/locking.js";
 import { classifyWrite } from "../../src/flow/write-methods.js";
+import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
-const handlerSource = readFileSync(
-  new URL(
-    "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/SkeletalMeshHandlers.cpp",
-    import.meta.url,
-  ),
-  "utf8",
-);
+const handlerSource = readHandlerFile("SkeletalMeshHandlers.cpp");
 
 describe("skeletal mesh skin-weight actions", () => {
   it("publishes bounded selected-vertex payloads", () => {
@@ -28,46 +22,21 @@ describe("skeletal mesh skin-weight actions", () => {
         { boneName: "clavicle_l", weight: 0.25 },
       ],
     }]).success).toBe(true);
-    expect(assetTool.schema.edits.safeParse([{
-      vertexIndex: 17,
-      influences: [{ boneName: "upperarm_l", weight: -0.1 }],
-    }]).success).toBe(false);
+    // The influence entries are checked by the handler, before any write.
+    expect(assetTool.schema.edits.safeParse([{ vertexIndex: 17, influences: [] }]).success).toBe(false);
     expect(assetTool.schema.edits.safeParse([{
       vertexIndex: 17,
       influences: [{ boneName: "upperarm_l", rawWeight: 65535 }],
     }]).success).toBe(true);
   });
 
-  it("routes the exact read and edit contracts", () => {
-    expect(assetTool.actions.read_skeletal_mesh_skin_weights.mapParams?.({
-      action: "read_skeletal_mesh_skin_weights",
-      assetPath: "/Game/Characters/SK_Hero",
-      vertexIndices: [2, 3],
-      lodIndex: 1,
-      profileName: "Default",
-      unrelated: true,
-    })).toEqual({
-      assetPath: "/Game/Characters/SK_Hero",
-      vertexIndices: [2, 3],
-      lodIndex: 1,
-      profileName: "Default",
-    });
-
-    const edits = [{ vertexIndex: 2, influences: [{ boneName: "root", weight: 1 }] }];
-    expect(assetTool.actions.set_skeletal_mesh_skin_weights.mapParams?.({
-      action: "set_skeletal_mesh_skin_weights",
-      assetPath: "/Game/Characters/SK_Hero",
-      edits,
-      lodIndex: 0,
-      restoreRawWeights: true,
-      unrelated: true,
-    })).toEqual({
-      assetPath: "/Game/Characters/SK_Hero",
-      edits,
-      lodIndex: 0,
-      profileName: undefined,
-      restoreRawWeights: true,
-    });
+  it("takes the read and edit contracts from their C++ specs (#1057)", () => {
+    const read = assetTool.actions.read_skeletal_mesh_skin_weights;
+    expect(read.mapParams).toBeUndefined();
+    expect(read.description).toContain("Params: assetPath, vertexIndices, lodIndex?, profileName?");
+    const set = assetTool.actions.set_skeletal_mesh_skin_weights;
+    expect(set.mapParams).toBeUndefined();
+    expect(set.description).toContain("Params: assetPath, edits, lodIndex?, profileName?, restoreRawWeights?");
   });
 
   it("preflights the whole edit batch before the first write and only sets listed vertices", () => {

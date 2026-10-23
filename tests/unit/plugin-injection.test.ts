@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { z } from "zod";
-import { actionEnumValues, categoryTool, bp, type ToolDef } from "../../src/types.js";
-import { mergeInjectionsIntoTool, type InjectionPlan } from "../../src/plugin/injection.js";
-import { looksLikeBaseTask, nativeHandlerSurface } from "../../src/plugin/loader.js";
-import { PluginManifestSchema } from "../../src/plugin/manifest.js";
+import type { ToolDef } from "../../src/core/types.js";
+import { actionEnumValues, categoryTool, bp } from "../../src/surface/category-tool.js";
+import { mergeInjectionsIntoTool, type InjectionPlan } from "../../src/extensions/injection.js";
+import { looksLikeBaseTask, nativeHandlerSurface } from "../../src/extensions/loader.js";
+import { PluginManifestSchema } from "../../src/extensions/manifest.js";
+import { buildProvidedTool } from "../../src/extensions/provision.js";
+import { requiringParams } from "../../src/extensions/manifest-params.js";
 
 function fakePcg(): ToolDef {
   return categoryTool(
@@ -13,7 +16,6 @@ function fakePcg(): ToolDef {
       list_graphs: bp("read", "pcg_list_graphs"),
       add_node: bp("read", "Add a node", "pcg_add_node"),
     },
-    undefined,
     { graphPath: z.string().optional() },
   );
 }
@@ -145,9 +147,9 @@ describe("nativeHandlerSurface", () => {
     // Plan actions are keyed by the BARE handler name; the prefix is applied
     // by mergeInjectionsIntoTool, matching the rest of the inject pipeline.
     expect(Object.keys(plan.actions).sort()).toEqual(["apply_damage", "record_arm"]);
-    // required is forced false (see the optional-params test below).
+    // The plan keeps the author's required flag; the merge lifts the key optional.
     expect(plan.actions.apply_damage.schema).toEqual({
-      amount: { type: "number", required: false },
+      amount: { type: "number", required: true },
     });
     // Dispatch tasks register under `<category>.<prefix>_<handler>`.
     expect(taskRegistrations.map((r) => r.name).sort()).toEqual([
@@ -184,7 +186,7 @@ describe("nativeHandlerSurface", () => {
     ]);
   });
 
-  it("forces surfaced params optional so they can't be required across a shared category", () => {
+  it("lifts surfaced params optional in the shared category and keeps required on the action (#1270)", () => {
     const manifest = manifestWith({
       uePluginName: "PIE_Studio",
       minBridgeApi: 1,
@@ -198,7 +200,11 @@ describe("nativeHandlerSurface", () => {
     });
     const result = nativeHandlerSurface(manifest, "pie-studio", BUILTINS);
     if (result?.kind !== "inject") throw new Error("expected inject");
-    expect(result.plan.actions.inject_input.schema?.action_path.required).toBe(false);
+    const { tool } = mergeInjectionsIntoTool(fakePcg(), [result.plan]);
+    expect(tool.schema.action_path.isOptional()).toBe(true);
+    expect(tool.actions.pie_inject_input.paramSpec).toEqual([
+      { name: "action_path", type: "string", required: true, description: "" },
+    ]);
   });
 
   it("inject plan merges into the host built-in category as pie_-prefixed", () => {
@@ -261,5 +267,62 @@ describe("looksLikeBaseTask", () => {
     expect(looksLikeBaseTask(null)).toBe(false);
     expect(looksLikeBaseTask(undefined)).toBe(false);
     expect(looksLikeBaseTask("class")).toBe(false);
+  });
+});
+
+describe("required plugin params (#1270)", () => {
+  const plan: InjectionPlan = {
+    category: "pcg",
+    prefix: "vpp",
+    pluginName: "x",
+    actions: {
+      scatter: {
+        task: "vpp.scatter",
+        description: "Scatter meshes",
+        schema: { meshPath: { type: "string", required: true }, density: { type: "number" } },
+      },
+    },
+  };
+
+  it("lifts a required field optional, so other actions in the category do not need it", () => {
+    const { tool } = mergeInjectionsIntoTool(fakePcg(), [plan]);
+    expect(tool.schema.meshPath.isOptional()).toBe(true);
+    expect(z.object(tool.schema).safeParse({ action: "list_graphs" }).success).toBe(true);
+  });
+
+  it("keeps the field required on its own action's spec and Params clause", () => {
+    const { tool } = mergeInjectionsIntoTool(fakePcg(), [plan]);
+    const spec = tool.actions.vpp_scatter;
+    expect(spec.description).toBe("Scatter meshes Params: meshPath, density?");
+    expect(spec.paramSpec?.map((p) => [p.name, p.required])).toEqual([["meshPath", true], ["density", false]]);
+  });
+
+  it("does the same for a provided category", () => {
+    const tool = buildProvidedTool({
+      category: "vox",
+      pluginName: "x",
+      spec: {
+        actions: {
+          stamp: { task: "t", schema: { shape: { type: "string", required: true } } },
+          clear: { task: "t" },
+        },
+      },
+    });
+    expect(tool.schema.shape.isOptional()).toBe(true);
+    expect(tool.actions.stamp.paramSpec?.[0]).toMatchObject({ name: "shape", required: true });
+    expect(tool.actions.clear.paramSpec).toBeUndefined();
+  });
+
+  it("refuses a dispatch missing the required field and runs one that has it", async () => {
+    class Task {
+      constructor(_ctx: unknown, readonly options: Record<string, unknown>) {}
+      async run() {
+        return { success: true, data: this.options };
+      }
+    }
+    const Wrapped = requiringParams(Task as never, "pcg.vpp_scatter", ["meshPath"]) as unknown as typeof Task;
+    await expect(new Wrapped({}, { density: 1 }).run()).rejects.toThrow(/pcg.vpp_scatter needs meshPath/);
+    await expect(new Wrapped({}, { meshPath: "/Game/M" }).run()).resolves.toMatchObject({ success: true });
+    expect(requiringParams(Task as never, "x", [])).toBe(Task);
   });
 });

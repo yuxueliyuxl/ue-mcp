@@ -16,7 +16,8 @@
  * no entry in the effects file stops this script rather than being guessed at.
  *
  * What comes out is an ordinary category action record: `bp("read", "...",
- * "epic_call_tool", mapParams)` plus the zod parameters those actions accept.
+ * "epic_call_tool")` carrying the wrapped tool as `epicTool` and its input
+ * schema as `epicSchema`, plus the zod parameters those actions accept.
  * Nothing about the result is special-cased downstream. It goes through the
  * same union, the same task factory, the same guards, locks, path repair,
  * `describe_action` and parameter audits as an action written by hand, because
@@ -33,7 +34,7 @@ import { fileURLToPath } from "node:url";
 // The dispatcher's own parameter names, imported from the module that
 // declares them. Run under tsx, so this reads the real export rather than
 // parsing the file.
-import { ROUTING_PARAMS } from "../src/action-schema.js";
+import { ROUTING_PARAMS } from "../src/surface/action-schema.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CATALOG = path.join(ROOT, "tests", "golden", "epic-catalog.json");
@@ -183,12 +184,29 @@ function kindOf(prop) {
 function minifySchema(input) {
   const props = input?.properties ?? {};
   const out = { properties: {} };
-  for (const [name, prop] of Object.entries(props)) {
-    out.properties[name] = isAssetRef(prop)
-      ? { type: "object", properties: { refPath: {} } }
-      : (prop?.type ? { type: prop.type } : {});
-  }
+  for (const [name, prop] of Object.entries(props)) out.properties[name] = minifyProp(prop, 0);
   if (Array.isArray(input?.required) && input.required.length > 0) out.required = input.required;
+  return out;
+}
+
+/**
+ * One property, keeping what a caller needs to build a valid value: its type,
+ * its enum, and the item and field shapes of an array or struct (#1281).
+ */
+function minifyProp(prop, depth) {
+  if (isAssetRef(prop)) return { type: "object", properties: { refPath: {} } };
+  if (!prop || typeof prop !== "object" || !prop.type) return {};
+  const out = { type: prop.type };
+  if (Array.isArray(prop.enum) && prop.enum.length > 0) out.enum = prop.enum;
+  if (depth >= 4) return out;
+  if (prop.type === "array" && prop.items && typeof prop.items === "object") {
+    const items = minifyProp(prop.items, depth + 1);
+    if (Object.keys(items).length > 0) out.items = items;
+  }
+  if (prop.type === "object" && prop.properties && typeof prop.properties === "object") {
+    const fields = Object.entries(prop.properties).map(([k, v]) => [k, minifyProp(v, depth + 1)]);
+    if (fields.length > 0) out.properties = Object.fromEntries(fields);
+  }
   return out;
 }
 
@@ -306,9 +324,10 @@ function emitCategory(category, bucket) {
 // These are ordinary actions. They carry a declared effect, real parameters and
 // a Params: clause, they are in ALL_TOOLS, and they dispatch through the same
 // task factory, guards and locks as every hand-written action in this package.
+// Each also carries its input schema, which the compact signatures read (#1172).
 import { z } from "zod";
-import { bp, type ActionSpec } from "../../types.js";
-import { epicToolCall } from "../../epic-input.js";
+import type { ActionSpec } from "../../core/types.js";
+import { bp } from "../../surface/category-tool.js";
 
 `;
 
@@ -340,12 +359,11 @@ import { epicToolCall } from "../../epic-input.js";
     .map((a) => {
       const schemaConst = `const ${constName(a.key)} = ${JSON.stringify(minifySchema(a.input))} as const;`;
       return { schemaConst, entry:
-`  ${safeKey(a.key)}: bp(
-    ${q(a.effect)},
-    ${q(a.description)},
-    "epic_call_tool",
-    (p) => epicToolCall(${q(a.toolset)}, ${q(a.tool)}, ${constName(a.key)}, p),
-  ),` };
+`  ${safeKey(a.key)}: {
+    epicSchema: ${constName(a.key)},
+    epicTool: { toolset: ${q(a.toolset)}, name: ${q(a.tool)} },
+    ...bp(${q(a.effect)}, ${q(a.description)}, "epic_call_tool"),
+  },` };
     });
 
   return header

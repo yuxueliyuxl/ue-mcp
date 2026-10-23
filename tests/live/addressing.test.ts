@@ -20,10 +20,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { EditorBridge } from "../../src/bridge.js";
-import { SessionRegistry } from "../../src/session.js";
+import { EditorBridge } from "../../src/bridge/bridge.js";
+import { SessionRegistry } from "../../src/sessions/session.js";
 import { LiveServer, resultJson, servingEditor } from "./server.js";
 import { closeLiveBridges, liveTarget, makeTempProject } from "./harness.js";
+import { covers } from "../helpers/covers.js";
 
 const target = await liveTarget();
 
@@ -56,6 +57,7 @@ afterAll(async () => {
 
 describe("two sessions, one of them a live editor", () => {
   it("registers the project whose editor is not running, and reports both", async () => {
+    covers("server.multi-project");
     const result = await server.call("project", { action: "list_editors", editor: LIVE });
     expect(result.isError).toBe(false);
     const body = resultJson<{ editors: Array<{ name: string; connected: boolean; port: number }> }>(result);
@@ -80,7 +82,6 @@ describe("two sessions, one of them a live editor", () => {
     const result = await server.call("asset", {
       action: "list_textures",
       directory: "/Game",
-      recursive: false,
       editor: LIVE,
     });
     expect(result.isError).toBe(false);
@@ -90,6 +91,7 @@ describe("two sessions, one of them a live editor", () => {
 
 describe("gating beyond one editor", () => {
   it("refuses an untargeted change and names both editors", async () => {
+    covers("sessions.gating");
     const result = await server.call("asset", {
       action: "delete",
       assetPath: "/Game/LiveTierNoSuchAsset",
@@ -111,13 +113,14 @@ describe("gating beyond one editor", () => {
     const result = await server.call("asset", {
       action: "list_textures",
       directory: "/Game",
-      recursive: false,
     });
     expect(result.isError).toBe(false);
     expect(servingEditor(result)).toBe(LIVE);
   }, 120_000);
 
   it("runs a targeted change in the editor that was named", async () => {
+
+    covers("sessions.targeting");
     // A delete of a path that does not exist: the editor answers, nothing is
     // removed, and the assertion is about where the call went.
     const result = await server.call("asset", {
@@ -135,8 +138,9 @@ describe("the union surface", () => {
     try {
       const search = resultJson<any>(await lean.call("catalog", { action: "search", query: "niagara", editor: SECOND }));
       expect(search.results.some((hit: any) => hit.category === "niagara")).toBe(false);
-      const schema = resultJson<any>(await lean.call("catalog", { action: "describe", category: "niagara", editor: SECOND }));
-      expect(schema.error).toContain("Unknown category");
+      const schema = await lean.call("catalog", { action: "describe", category: "niagara", editor: SECOND });
+      expect(schema.isError).toBe(true);
+      expect(schema.text).toContain("Unknown category");
     } finally { await lean.close(); }
   }, 240_000);
 
@@ -165,7 +169,6 @@ describe("the union surface", () => {
 
     const refused = await server.call("niagara", {
       action: "list",
-      directory: "/Game",
       editor: SECOND,
     });
     expect(refused.isError).toBe(true);
@@ -176,7 +179,6 @@ describe("the union surface", () => {
   it("keeps the same category working for the editor that did not disable it", async () => {
     const allowed = await server.call("niagara", {
       action: "list",
-      directory: "/Game",
       editor: LIVE,
     });
     // The editor answers it: what matters is that this is not the config
@@ -285,6 +287,7 @@ describe("two editors of one project", () => {
 
 describe("the no-project default bridge", () => {
   it("dispatches bridge actions with no project argument at all", async () => {
+    covers("server.no-project");
     // The documented "attach to whatever answers the port" mode: one
     // session-less default bridge, every bridge-backed action working against
     // whatever is there. Here that is the live editor.
@@ -293,7 +296,6 @@ describe("the no-project default bridge", () => {
       const result = await bare.call("asset", {
         action: "list_textures",
         directory: "/Game",
-        recursive: false,
       });
       expect(result.isError).toBe(false);
       // One session, so nothing is attributed and nothing is gated: the

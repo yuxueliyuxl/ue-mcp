@@ -29,7 +29,7 @@ import {
   environmentTimeoutMs,
   registeredTimeoutMs,
   resolveBridgeTimeout,
-} from "../../src/bridge-timeouts.js";
+} from "../../src/bridge/bridge-timeouts.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_SOURCE = path.join(HERE, "..", "..", "plugin");
@@ -53,7 +53,9 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
 function registrationsInPlugin(): { found: Record<string, number>; unresolved: string[] } {
   const found: Record<string, number> = {};
   const unresolved: string[] = [];
-  const CALL = /RegisterHandlerWithTimeout\(\s*TEXT\("([a-z0-9_]+)"\)\s*,\s*&?[A-Za-z0-9_:]+\s*,\s*([A-Za-z0-9_.]+)f?\s*\)/g;
+  // The call ends at its closing parenthesis, or at the opening brace of a
+  // parameter spec (#1057).
+  const CALL = /RegisterHandlerWithTimeout\(\s*TEXT\("([a-z0-9_]+)"\)\s*,\s*&?[A-Za-z0-9_:]+\s*,\s*([A-Za-z0-9_.]+)f?\s*(?:\)|,\s*\{)/g;
   const CONST = /constexpr\s+(?:float|double)\s+([A-Za-z0-9_]+)\s*=\s*([0-9.]+)f?\s*;/g;
 
   for (const file of sourceFiles(PLUGIN_SOURCE)) {
@@ -90,7 +92,7 @@ describe("registered handler timeouts mirror the plugin (#989)", () => {
     const { found } = registrationsInPlugin();
     expect(
       REGISTERED_HANDLER_TIMEOUT_SECONDS,
-      "src/bridge-timeouts.ts is a hand mirror of the RegisterHandlerWithTimeout "
+      "src/bridge/bridge-timeouts.ts is a hand mirror of the RegisterHandlerWithTimeout "
         + "calls in plugin/. Update the table to match, in alphabetical order.",
     ).toEqual(found);
   });

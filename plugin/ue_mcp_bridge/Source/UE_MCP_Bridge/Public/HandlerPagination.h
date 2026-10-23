@@ -221,18 +221,22 @@ namespace MCPPagination
 		Out.CollectionKey = CollectionKey;
 		Out.Limit = DefaultLimit;
 
+		// Read before the limit check can refuse, so a spec'd handler reads both (#1057).
+		const FString Cursor = Params.IsValid() ? OptionalString(Params, TEXT("cursor")) : FString();
+
 		// 'maxResults' is the older spelling of 'limit'. The tool layer already
 		// translates one into the other, but the bridge is also called directly,
 		// and there a page cap that is read by nobody is a silent wrong answer:
 		// the caller asks for one row and is handed the default page.
+
 		const TCHAR* LimitField = nullptr;
-		if (Params.IsValid() && Params->HasField(TEXT("limit"))) LimitField = TEXT("limit");
-		else if (Params.IsValid() && Params->HasField(TEXT("maxResults"))) LimitField = TEXT("maxResults");
+		if (HasParam(Params, TEXT("limit"))) LimitField = TEXT("limit");
+		else if (HasParam(Params, TEXT("maxResults"))) LimitField = TEXT("maxResults");
 
 		if (LimitField)
 		{
 			double Raw = 0.0;
-			if (!Params->TryGetNumberField(LimitField, Raw) ||
+			if (!MCPTryReadNumberField(Params, LimitField, Raw) ||
 				!FMath::IsFinite(Raw) || FMath::TruncToDouble(Raw) != Raw ||
 				Raw < 1.0 || Raw > static_cast<double>(MaxLimit))
 			{
@@ -243,7 +247,6 @@ namespace MCPPagination
 			Out.Limit = static_cast<int32>(Raw);
 		}
 
-		const FString Cursor = Params.IsValid() ? OptionalString(Params, TEXT("cursor")) : FString();
 		if (Cursor.IsEmpty())
 		{
 			return nullptr;

@@ -3,10 +3,10 @@
  *
  * The C++ handler reads sourceAssetPath / sourceWidgetName /
  * destinationAssetPath / destinationParentClass / destinationRootName /
- * dryRun. The action declares an explicit mapParams, so a rename on either
- * side silently drops the value instead of failing. Pin the wire shape here.
+ * dryRun, and declares them in its parameter spec (#1057), so the action has
+ * no mapParams and forwards the bag as sent. Pin the wire shape here.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { widgetTool } from "../../src/tools/widget.js";
 
 const action = widgetTool.actions.extract_subtree;
@@ -16,8 +16,16 @@ describe("widget(extract_subtree)", () => {
     expect(action.bridge).toBe("extract_widget_subtree");
   });
 
-  it("forwards every param the C++ handler reads, under the same names", () => {
-    const sent = action.mapParams!({
+  async function send(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const call = vi.fn().mockResolvedValue({ success: true });
+    await widgetTool.handler({ bridge: { call } } as never, { action: "extract_subtree", ...params });
+    expect(call.mock.calls[0][0]).toBe("extract_widget_subtree");
+    return call.mock.calls[0][1] as Record<string, unknown>;
+  }
+
+  it("forwards every param the C++ handler reads, under the same names", async () => {
+    expect(action.mapParams).toBeUndefined();
+    const sent = await send({
       sourceAssetPath: "/Game/UI/WBP_Window",
       sourceWidgetName: "ResultsRowPreview",
       destinationAssetPath: "/Game/UI/Rows/WBP_ResultsRow",
@@ -36,8 +44,8 @@ describe("widget(extract_subtree)", () => {
     });
   });
 
-  it("leaves dryRun unset so the handler applies its own default", () => {
-    const sent = action.mapParams!({
+  it("leaves dryRun unset so the handler applies its own default", async () => {
+    const sent = await send({
       sourceAssetPath: "/Game/UI/WBP_Window",
       sourceWidgetName: "Row",
       destinationAssetPath: "/Game/UI/Rows/WBP_Row",

@@ -1,0 +1,4 @@
+{
+  "note": "Bridge actions that had no behavioural test when the coverage gate landed (#1223), grandfathered so the gate could start green. This list only shrinks: the gate fails on an entry that has gained a test (run npm run coverage:behavioural -- --shrink-ratchet) and the release gate fails on any entry that was not here at the merge base. A new action never goes here; it gets a test or a reasoned exemption in behavioural-exemptions.json.",
+  "gaps": []
+}

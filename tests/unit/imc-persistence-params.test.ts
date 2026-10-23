@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { assetTool } from "../../src/tools/asset.js";
 import { gameplayTool } from "../../src/tools/gameplay.js";
-import type { ToolDef } from "../../src/types.js";
+import type { ToolDef } from "../../src/core/types.js";
 
 type RouteCase = {
   tool: ToolDef;
@@ -20,8 +20,9 @@ const cases: RouteCase[] = [
   { tool: gameplayTool, input: { action: "set_imc_mapping_key", imcPath: IMC, mappingIndex: 1, newKey: "Enter" }, bridge: "set_imc_mapping_key", expected: { imcPath: IMC, mappingIndex: 1, newKey: "Enter" } },
   { tool: gameplayTool, input: { action: "set_imc_mapping_action", imcPath: IMC, mappingIndex: 1, newInputActionPath: IA }, bridge: "set_imc_mapping_action", expected: { imcPath: IMC, mappingIndex: 1, newInputActionPath: IA } },
   { tool: gameplayTool, input: { action: "set_mapping_modifiers", imcPath: IMC, mappingIndex: 1, modifiers: [] }, bridge: "set_mapping_modifiers", expected: { imcPath: IMC, mappingIndex: 1, modifiers: [] } },
-  { tool: assetTool, input: { action: "add_input_mapping", mappingContext: IMC, inputAction: IA, key: "SpaceBar" }, bridge: "add_imc_mapping", expected: { imcPath: IMC, inputActionPath: IA, key: "SpaceBar" } },
-  { tool: assetTool, input: { action: "remove_input_mapping", mappingContext: IMC, mappingIndex: 1 }, bridge: "remove_imc_mapping", expected: { imcPath: IMC, mappingIndex: 1 } },
+  // The asset spellings reach the editor as sent; the spec aliases resolve them there.
+  { tool: assetTool, input: { action: "add_input_mapping", mappingContext: IMC, inputAction: IA, key: "SpaceBar" }, bridge: "add_imc_mapping", expected: { mappingContext: IMC, inputAction: IA, key: "SpaceBar" } },
+  { tool: assetTool, input: { action: "remove_input_mapping", mappingContext: IMC, mappingIndex: 1 }, bridge: "remove_imc_mapping", expected: { mappingContext: IMC, mappingIndex: 1 } },
 ];
 
 describe("IMC persistence parameters", () => {

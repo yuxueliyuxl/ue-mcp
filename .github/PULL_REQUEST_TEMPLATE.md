@@ -4,7 +4,7 @@
 
 ## Why
 
-<!-- The problem. Link the issue: Closes #NNN. Delete if the title says it. -->
+<!-- The problem. Link the issue: Refs #NNN (issues close at release, not at merge). Delete if the title says it. -->
 
 ## Verification
 
@@ -17,6 +17,10 @@
 - [ ] `npm run test:smoke`
 - [ ] `npm run test:live`
 - [ ] `npm run audit` (prose, config, flows, unity, docs, params)
+
+<!-- A handler change with no docs/ change fails the docs-freshness gate. If a
+     reader cannot see this change, keep this line and give the reason:
+Docs: not needed - <reason> -->
 
 ## Notes for the release
 

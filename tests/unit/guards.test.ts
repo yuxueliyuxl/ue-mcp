@@ -16,9 +16,9 @@ import { assertNoLegacyGuardTasks, buildGuards } from "../../src/flow/guards.js"
 import { GuardsSchema } from "../../src/flow/guard-schema.js";
 import { GuardRegistry, makeCallContext, type CallContext } from "../../src/flow/guard.js";
 import { GuardedBridge } from "../../src/flow/guarded-bridge.js";
-import { ErrorCode, McpError } from "../../src/errors.js";
-import type { IBridge } from "../../src/bridge.js";
-import type { ToolContext } from "../../src/types.js";
+import { ErrorCode, McpError } from "../../src/core/errors.js";
+import type { IBridge } from "../../src/bridge/bridge.js";
+import type { ToolContext } from "../../src/core/types.js";
 
 const target = { projectPath: null, port: 0, portSource: "default" as const, verified: true };
 
@@ -90,8 +90,8 @@ describe("options are what the file says now", () => {
     let enabled = true;
     const guards = await buildGuards(
       declare({ freeze: { before: { class_path: "check", options: { enabled: true } } } }),
-      { ...deps(registry), liveOptions: () => ({ enabled }) },
-      SOURCE,
+      deps(registry),
+      { ...SOURCE, liveOptions: () => ({ enabled }) },
     );
 
     await guards[0].before!(callCtx("set_asset_property"));
@@ -114,14 +114,14 @@ describe("options are what the file says now", () => {
           after: { class_path: "audit", options: { which: "declared-after" } },
         },
       }),
+      deps(registry),
       {
-        ...deps(registry),
+        ...SOURCE,
         liveOptions: (name: string, phase: string) => {
           asked.push([name, phase]);
           return { which: `live-${phase}` };
         },
       },
-      SOURCE,
     );
 
     await guards[0].before!(callCtx("set_asset_property"));
@@ -136,8 +136,8 @@ describe("options are what the file says now", () => {
     const registry = registryWith({ check: ALLOW });
     const guards = await buildGuards(
       declare({ fromPlugin: { before: { class_path: "check", options: { enabled: true } } } }),
-      { ...deps(registry), liveOptions: () => undefined },
-      SOURCE,
+      deps(registry),
+      { ...SOURCE, liveOptions: () => undefined },
     );
 
     await guards[0].before!(callCtx("set_asset_property"));

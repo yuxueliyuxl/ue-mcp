@@ -39,7 +39,7 @@ one road landed on a road at the other end of the map and reported success
 (#983).
 
 Every actor-targeting handler therefore resolves its target through
-`MCPResolveActor` in `Public/HandlerUtils.h`, and never through a loop of its
+`MCPResolveActor` in `Public/HandlerActorResolve.h`, and never through a loop of its
 own:
 
 ```cpp
@@ -131,7 +131,7 @@ Where the answer genuinely is a failure, as with the lifecycle actions above, th
 
 ## Helpers
 
-`HandlerUtils.h` provides:
+`HandlerUtils.h` includes every shared helper header; among them:
 
 ```cpp
 MCPSuccess()                                  // { success: true }
@@ -185,6 +185,11 @@ MCPCheckClassUsable(Spec, Class, Base?, bConcrete?) // abstract / deprecated /
 // Parameter extraction (Vec3 / Rotator / Color / Transform helpers)
 RequireString, OptionalString, OptionalNumber, OptionalInt, OptionalBool
 OptionalVec3, RequireVec3, OptionalRotator, RequireRotator, OptionalTransform
+
+// `args` in any of its forms: a UFUNCTION's name -> value map, or a script's
+// positional strings. Return an error value for a form the kind cannot use.
+MCPReadFunctionArgs(Params, Key, OutMap), MCPNormalizeFunctionArgs(Value, Label, OutMap)
+MCPReadPythonArgs(Params, Key, OutStrings), MCPNormalizePythonArgs(Value, Label, OutStrings)
 MCPVec3ToJsonObject, MCPRotatorToJsonObject, MCPLinearColorToJsonObject
 ```
 
@@ -381,6 +386,21 @@ unchanged call with `save=true` saves pending edits, including edits from an
 earlier `save=false` call, and skips the write when nothing is pending. Rollback
 preserves the original call's `save` choice, so undoing a deferred edit does not
 save other pending edits.
+
+## Declaring parameters with a spec
+
+A handler can declare its parameters at registration instead of having them written again in TypeScript (#1057). The mechanism, and how the TS surface is generated from it, is in [Architecture: parameter specs](architecture.md#parameter-specs). What it asks of the handler:
+
+- **Read the declared names, and only those.** The registry renames each alias to its parameter before the handler runs, so a spec'd handler calls `RequireString(Params, TEXT("assetPath"), ...)`, never `RequireStringAlt` with the alias. A second spelling belongs in the spec as `.Alias(TEXT("path"))`.
+- **Read every parameter before anything can fail.** `UE.MCP.Bridge.HandlerSpec.Contract` calls each spec'd handler with every declared parameter pointing at an asset that does not exist, and asserts the read set equals the spec. A parameter read after the asset load is never reached, and fails the test as a declared parameter the handler does not read.
+- **Exempt a handler the contract call could let write.** Every string the contract test sends is the same missing asset path, so a create handler is only safe to call when something those values fail (an unresolvable class or struct, a name holding `/`, an invalid package name, a missing source file) refuses the call before anything is created. A handler that would create a folder, a package or a file from them, spawn an actor, save, or run something, registers with `MCPSpec::ContractExempt(TEXT("reason"))` as its last argument. It is still spec'd and generates its surface, and `tests/unit/handler-spec-exempt.test.ts` reads its source instead of calling it, so it has to read every parameter through a `HandlerUtils.h` helper with a literal key (or through a function it hands `Params` to that does), and read nothing else.
+- **A required choice is a choice, not two optionals.** `actorLabel OR actorPath` is `MCPSpec::ExactlyOne({ { TEXT("actorLabel") }, { TEXT("actorPath") } })`, and `settings OR propertyName + propertyValue` puts the pair in one branch. Every name in a choice is declared optional; the choice is what is required. The contract test calls the handler once per branch, sending only that branch's names, so each branch has to be read on its own path. `MCPSpec::AtLeastOne` is for selector sets where several may combine; declare a required parameter before its first member, since the clause lists the group's names with slashes.
+- **Declare the value's real shape.** A colour is `EMCPParamType::Color`. A number that may also be a colour is `.Or(EMCPParamType::Color)`, a reference that null clears is `.Nullable()`, a flag with one legal value is `.Literal(false)`, and an array of objects declares its element with `.Items(EMCPParamType::Object).WithFields({ MCPParam::RequiredField(...), MCPParam::OptionalField(...) })`. Elements of several shapes picked by one field are `.Tagged(TEXT("op"), { MCPParam::Variant(...), ... })`, and an `Any` value that takes a map, an entry list, a string list or a string is `.OneOfForms({ ... })`, read through `MCPReadFunctionArgs` or `MCPReadPythonArgs`. The contract test sends a literal's own value and a union's first type.
+- **Declare what the handler reads, not what the old surface documented.** Migrating `add_curve` dropped `curveType?`, which the TS side advertised and the handler never read.
+- **A key a shared helper reads only on some paths is read ahead.** `MCPReadParamsAhead(Params, { ... })` at the top of the handler names every declared key, so the read set is the spec whatever path a call takes; the helpers still read each key where they use it.
+- **A timeout override takes the spec too.** `RegisterHandlerWithTimeout(name, fn, seconds, { ... })` registers both, and the TS action spreads `specBp(...)` and adds its `timeoutMs`.
+- **Never a routing name.** `action`, `timeoutMs`, `select`, `omit`, `editor` and `toEditor` are refused at registration and again by the generator.
+- **Change a spec, then re-record.** `npm run specs:record` against `tests/ue_mcp`, then `npm run specs:generate`, and commit the recording and the generated module together with the C++.
 
 ## Where the conversion stands
 

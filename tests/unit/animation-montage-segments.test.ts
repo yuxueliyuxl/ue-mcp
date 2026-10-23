@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { animationTool } from "../../src/tools/animation.js";
+import { handlerSpecs } from "../../src/tools/specs/animation.generated.js";
 import { classifyWrite } from "../../src/flow/write-methods.js";
-import type { ToolContext } from "../../src/types.js";
+import type { ToolContext } from "../../src/core/types.js";
 
 describe("animation montage segment actions (#826)", () => {
   it("exposes the three segment actions", () => {
@@ -11,7 +12,10 @@ describe("animation montage segment actions (#826)", () => {
     }
   });
 
-  it("forwards every add_montage_segment param under the name the C++ handler reads", async () => {
+  it("declares every add_montage_segment param in its C++ spec, and forwards the bag as sent (#1057)", async () => {
+    expect(handlerSpecs.add_montage_segment.params.map((p) => p.name).sort()).toEqual([
+      "animSequencePath", "assetPath", "endPos", "insertIndex", "loopCount", "playRate", "slotIndex", "slotName", "startPos",
+    ]);
     const call = vi.fn().mockResolvedValue({ success: true });
     const ctx = { bridge: { call } } as unknown as ToolContext;
 
@@ -26,7 +30,6 @@ describe("animation montage segment actions (#826)", () => {
       playRate: 1.5,
       loopCount: 2,
       insertIndex: 1,
-      sectionName: "ShouldNotLeak",
     });
 
     expect(call).toHaveBeenCalledWith(
@@ -46,7 +49,9 @@ describe("animation montage segment actions (#826)", () => {
     );
   });
 
-  it("forwards the removal target and slot selector only", async () => {
+  it("declares the removal target and slot selector only (#1057)", async () => {
+    expect(handlerSpecs.remove_montage_segment.params.map((p) => p.name).sort())
+      .toEqual(["assetPath", "segmentIndex", "slotIndex", "slotName"]);
     const call = vi.fn().mockResolvedValue({ success: true });
     const ctx = { bridge: { call } } as unknown as ToolContext;
 
@@ -55,7 +60,6 @@ describe("animation montage segment actions (#826)", () => {
       assetPath: "/Game/Animations/AM_HitReact",
       segmentIndex: 2,
       slotName: "DefaultSlot",
-      animSequencePath: "/Game/ShouldNotLeak",
     });
 
     expect(call).toHaveBeenCalledWith(

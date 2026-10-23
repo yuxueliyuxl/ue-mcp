@@ -183,6 +183,14 @@ The C++ bridge links against many UE modules. If compilation fails:
 
 3. **Rebuild from clean.** Delete `<Project>/Plugins/UE_MCP_Bridge/Binaries/` and `<Project>/Plugins/UE_MCP_Bridge/Intermediate/`, then rebuild.
 
+### build_project fails with LNK1104 and no editor is running
+
+**Symptom:** `editor(build_project)` fails, the output has `LINK : fatal error LNK1104: cannot open file '...UnrealEditor-<Module>.dll'`, and the accelerator line before it says the file is `being used by another process. - ...CrashReportClientEditor.exe`.
+
+**Cause:** an editor of this project crashed, and its crash reporter is still running with the project's module DLLs open.
+
+**Fix:** run `editor(action="stop_editor")`, then build again. With no editor of this project running, the stop ends the crash reporter that holds the project's binaries and reports it under `crashReporters`. The build's own error names the file and the process holding it, under `lockedOutputs`, so a holder that is something else is named too.
+
 ### Plugin not loading
 
 If the editor starts but the bridge doesn't appear in the Output Log:
@@ -207,6 +215,32 @@ If the editor starts but the bridge doesn't appear in the Output Log:
 - **"Handler not found"** - the action name might be wrong. Check the [Tool Reference](tool-reference.md) for valid action names.
 - **"Asset not found"** - asset paths should use the `/Game/` prefix (e.g., `/Game/Blueprints/BP_Player`), not filesystem paths.
 - **Timeout** - the default timeout is 30 seconds, and some actions set their own (`widget(add_widget)` allows 120s, project builds 300s). A timeout is not a failed call: see [A call timed out - did it happen or not?](#a-call-timed-out-did-it-happen-or-not) before retrying.
+
+## Line Traces From a Python Script
+
+A script run with `editor(run_python_file)` cannot use the engine's trace functions the way the docs suggest. `unreal.SystemLibrary.line_trace_single` takes a `TraceTypeQuery` (`unreal.TraceTypeQuery.TRACE_TYPE_QUERY1` and so on), not a `CollisionChannel`, so passing `unreal.CollisionChannel.ECC_WORLD_STATIC` fails with "Failed to convert parameter 'trace_channel'", and `unreal.World` has no trace methods at all.
+
+The bridge plugin exposes the same query `level(line_trace)` runs, callable from Python:
+
+```python
+import unreal
+
+hit = unreal.MCPTraceLibrary.line_trace(
+    unreal.Vector(0, 0, 10000),   # start
+    unreal.Vector(0, 0, -10000),  # end
+    "pie",                        # world: pie (default), editor or auto
+    0,                            # pie_instance: -1 for the first PIE world
+    "WorldStatic",                # channel: the project's channel names
+    False,                        # trace_complex
+)
+if hit.error:
+    raise RuntimeError(hit.error)
+if hit.hit:
+    ground_z = hit.impact_point.z
+    print(hit.actor_path, hit.component_name, hit.physical_material)
+```
+
+The result carries `hit`, `location`, `impact_point`, `impact_normal`, `distance`, `actor_path`, `actor_label`, `component_name`, `physical_material`, `world` and `error` (empty when the trace ran). The class exists once the plugin's editor module is loaded, which is the case whenever the bridge is connected.
 
 ## Asset Path Issues
 
@@ -280,9 +314,9 @@ Then quit and relaunch your MCP client so it spawns the updated server.
 
 Different from the case above. Here the version is correct - `ue-mcp doctor` shows latest, the server is up to date - but a fix that changes **editor behavior** (a dialog being auto-cancelled, an actor placed wrong, anything the C++ plugin does) still happens.
 
-Cause: the bridge's editor-side half is a C++ plugin shipped as source. Your editor runs the **compiled** version of it, and a plain `ue-mcp update` neither deploys the new source into your project nor recompiles it. The version `doctor` reports is the npm/server half, so it looks up to date while the loaded plugin is stale. The fix never reaches the editor.
+Cause: the bridge's editor-side half is a C++ plugin shipped as source. Your editor runs the **compiled** version of it, and `ue-mcp update` run outside the project directory, or run by a version older than 1.3.10, neither deploys the new source into your project nor recompiles it. The version `doctor` reports is the npm/server half, so it looks up to date while the loaded plugin is stale. The fix never reaches the editor.
 
-Fix: rebuild the plugin, then restart the editor so the new binary loads.
+Fix: from the project directory, with the editor closed, rebuild the plugin, then restart the editor so the new binary loads.
 
 ```bash
 ue-mcp update --build

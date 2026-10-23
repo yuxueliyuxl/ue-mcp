@@ -5,7 +5,7 @@ import {
   extractProjectPath,
   selectEditorsForProject,
   type EditorProcess,
-} from "../../src/engine-observer.js";
+} from "../../src/editor/engine-observer.js";
 
 const GAME_A = path.resolve(path.join("C:", "work", "GameA", "GameA.uproject"));
 const GAME_B = path.resolve(path.join("C:", "work", "GameB", "GameB.uproject"));
@@ -120,6 +120,18 @@ describe("selectEditorsForProject", () => {
       GAME_A,
     );
     expect(selected.map((p) => p.pid)).toEqual([2]);
+  });
+
+  it("keeps headless editors of the project when asked to, for stop and ownership (#1150)", () => {
+    const selected = selectEditorsForProject(
+      [
+        proc({ pid: 1, projectPath: GAME_A, headless: true }),
+        proc({ pid: 2, projectPath: GAME_B, headless: true }),
+      ],
+      GAME_A,
+      { includeHeadless: true },
+    );
+    expect(selected.map((p) => p.pid)).toEqual([1]);
   });
 
   it("reports nothing when only other projects are running", () => {

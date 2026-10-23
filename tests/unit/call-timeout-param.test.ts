@@ -12,29 +12,14 @@
  * unexpected key would be the next defect.
  */
 import { describe, expect, it } from "vitest";
-import { categoryTool, bp, takeTimeout, type ToolContext, type ToolDef } from "../../src/types.js";
-import { MAX_BRIDGE_TIMEOUT_MS } from "../../src/bridge-timeouts.js";
-import { buildMicroGateway } from "../../src/lean-context.js";
-import type { IBridge } from "../../src/bridge.js";
-
-interface Recorded {
-  method: string;
-  params?: Record<string, unknown>;
-  timeoutMs?: number;
-}
-
-function recordingBridge(): IBridge & { calls: Recorded[] } {
-  const calls: Recorded[] = [];
-  return {
-    calls,
-    isConnected: true,
-    connect: async () => {},
-    call: async (method: string, params?: Record<string, unknown>, timeoutMs?: number) => {
-      calls.push({ method, params, timeoutMs });
-      return { success: true };
-    },
-  } as unknown as IBridge & { calls: Recorded[] };
-}
+import type { ToolContext, ToolDef } from "../../src/core/types.js";
+import { categoryTool, bp } from "../../src/surface/category-tool.js";
+import { takeTimeout } from "../../src/dispatch/call-pipeline.js";
+import { MAX_BRIDGE_TIMEOUT_MS } from "../../src/bridge/bridge-timeouts.js";
+import { buildMicroGateway } from "../../src/surface/context/micro-context.js";
+import { encodeRequest, type IBridge } from "../../src/bridge/bridge.js";
+import { editorTool } from "../../src/tools/editor.js";
+import { recordingBridge } from "../fake-bridge.js";
 
 function fixture(): ToolDef {
   return categoryTool("demo", "Demo", {
@@ -83,7 +68,7 @@ describe("timeoutMs on a category call (#989)", () => {
       local: { kind: "handler", effect: "read", description: "Local handler", handler: async (_ctx, p) => { seen = p; return { ok: true }; } },
     });
     await tool.handler!(ctxFor(recordingBridge()), { action: "local", name: "x", timeoutMs: 600_000 });
-    expect(seen).toEqual({ action: "local", name: "x" });
+    expect(seen).toEqual({ name: "x" });
   });
 
   it("is honoured through the micro-context gateway, beside args or inside them", async () => {
@@ -101,6 +86,42 @@ describe("timeoutMs on a category call (#989)", () => {
     });
     expect(bridge.calls[1].timeoutMs).toBe(450_000);
     expect(bridge.calls[1].params).toEqual({ path: "/Game/B" });
+  });
+});
+
+describe("timeoutMs on in-process handlers (#1339)", () => {
+  it("is the default budget of every bridge call a handler makes", async () => {
+    const tool = categoryTool("demo", "Demo", {
+      local: {
+        kind: "handler", effect: "read", description: "Local handler",
+        handler: async (ctx) => {
+          await ctx.bridge.call("first", {});
+          await ctx.bridge.call("second", {}, 5_000);
+          return { ok: true, connected: ctx.bridge.isConnected };
+        },
+      },
+    });
+    const bridge = recordingBridge();
+    await tool.handler!(ctxFor(bridge), { action: "local", timeoutMs: 120_000 });
+    expect(bridge.calls.map((c) => c.timeoutMs)).toEqual([120_000, 5_000]);
+  });
+
+  it("reaches the execute_python bridge call", async () => {
+    const bridge = recordingBridge();
+    const ctx = { ...ctxFor(bridge), getToolGraph: () => [] } as unknown as ToolContext;
+    await editorTool.handler!(ctx, {
+      action: "execute_python", code: "import time; time.sleep(40)", taskSummary: "zz qq nothing matches this", timeoutMs: 120_000,
+    });
+    const call = bridge.calls.find((c) => c.method === "execute_python");
+    expect(call?.timeoutMs).toBe(120_000);
+    expect(call?.params).not.toHaveProperty("timeoutMs");
+  });
+
+  it("travels in the request frame so the plugin waits as long", () => {
+    expect(JSON.parse(encodeRequest("1", "execute_python", { code: "x" }, 120_000))).toEqual({
+      id: "1", method: "execute_python", params: { code: "x" }, timeoutMs: 120_000,
+    });
+    expect(JSON.parse(encodeRequest("2", "execute_python", {}))).not.toHaveProperty("timeoutMs");
   });
 });
 

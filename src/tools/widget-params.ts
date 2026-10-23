@@ -1,5 +1,5 @@
-import { McpError, ErrorCode } from "../errors.js";
-import { coerceAssetPathValue, normalizeUnrealAssetPath, splitAssetPath, PATH_FORMAT_HELP } from "../asset-path.js";
+import { McpError, ErrorCode } from "../core/errors.js";
+import { coerceAssetPathValue, normalizeUnrealAssetPath, splitAssetPath, PATH_FORMAT_HELP } from "../surface/asset-path.js";
 
 /**
  * One parameter contract for the whole `widget` category (#798).
@@ -34,11 +34,18 @@ const WIDGET_NAME_ALIASES = ["widgetName", "widgetDisplayName"] as const;
 /** Legacy or engine-side spellings of the canonical `parentWidgetName`. */
 const PARENT_WIDGET_ALIASES = ["parentWidgetName", "parentWidget"] as const;
 
+/** Each group is one parameter after normalization, so the editor reading any member is enough. */
+export const WIDGET_PARAM_GROUPS: readonly (readonly string[])[] = [
+  [...ASSET_PATH_ALIASES, "name", "packagePath"],
+  WIDGET_NAME_ALIASES,
+  PARENT_WIDGET_ALIASES,
+];
+
 /**
- * Actions whose bridge handler is addressed by asset name plus package path
- * rather than by one asset path. They accept the canonical `assetPath` like
- * every other action; this list is what lets the normalizer split it back
- * apart for the handler, and recombine the older spelling into it.
+ * Actions that also take the older asset name plus package path spelling.
+ * Their handlers accept either (assetPath wins); this list is what lets the
+ * normalizer compose the older spelling into assetPath, and refuse a name
+ * that contradicts it.
  */
 const NAME_AND_PACKAGE_ACTIONS = new Set([
   "create",

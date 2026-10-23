@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import fsSync from "node:fs";
-// @ts-expect-error - plain ESM script, no types
-import { parseVersion, versionDeltaProblem, docsFreshnessProblem } from "../../scripts/check-release-gates.mjs";
+import { parseVersion, versionDeltaProblem, docsFreshnessProblem, docsExemptionReason, ratchetGrowthProblem, INTEGRATION_RATCHET } from "../../scripts/check-release-gates.mjs";
 
 const problem = (from: string, to: string): string | null =>
   versionDeltaProblem(from, to) as string | null;
@@ -99,7 +98,7 @@ describe("a surface change has to reach the docs", () => {
   });
 
   it("says nothing about a change that touches no surface", () => {
-    expect(say(["src/dialog-guard.ts", "tests/unit/dialog-guard.test.ts"])).toBeNull();
+    expect(say(["src/editor/dialog-guard.ts", "tests/unit/dialog-guard.test.ts"])).toBeNull();
     expect(say(["README.md"])).toBeNull();
   });
 
@@ -118,13 +117,13 @@ describe("every gate is reachable from the entry point", () => {
     const src = await import("node:fs").then((fs) =>
       fs.readFileSync(new URL("../../scripts/check-release-gates.mjs", import.meta.url), "utf8"),
     );
-    for (const gate of ["version-delta", "count-markers", "docs-freshness"]) {
+    for (const gate of ["version-delta", "count-markers", "docs-freshness", "behavioural-coverage", "integration-coverage"]) {
       expect(src, gate).toContain(`"${gate}"`);
     }
     // Each one has to be wired into the table `all` iterates, not merely
     // defined somewhere in the file.
     const table = src.slice(src.indexOf("const GATES = {"), src.indexOf("function main("));
-    for (const gate of ["version-delta", "count-markers", "docs-freshness"]) {
+    for (const gate of ["version-delta", "count-markers", "docs-freshness", "behavioural-coverage", "integration-coverage"]) {
       expect(table, `${gate} is not in the gate table`).toContain(gate);
     }
   });
@@ -138,5 +137,57 @@ describe("every gate is reachable from the entry point", () => {
     );
     expect(src).toContain("no baseline commit to compare against");
     expect(src).not.toContain('console.log("version-delta   - no main to compare against, skipped")');
+  });
+});
+
+describe("behavioural-coverage gap list", () => {
+  const list = (gaps: string[]) => JSON.stringify({ note: "", gaps });
+
+  it("passes when the list shrank or held", () => {
+    expect(ratchetGrowthProblem(list(["a", "b"]), ["a"])).toBeNull();
+    expect(ratchetGrowthProblem(list(["a", "b"]), ["a", "b"])).toBeNull();
+  });
+
+  it("names every entry added since the baseline", () => {
+    const problem = ratchetGrowthProblem(list(["a"]), ["a", "new_one", "new_two"]);
+    expect(problem).toMatch(/grew by 2/);
+    expect(problem).toMatch(/new_one, new_two/);
+  });
+
+  it("accepts the commit that introduces the list", () => {
+    expect(ratchetGrowthProblem(null, ["a", "b"])).toBeNull();
+  });
+
+  it("names the integration files when it guards the integration list", () => {
+    const problem = ratchetGrowthProblem(list(["cli.a"]), ["cli.a", "cli.b"], INTEGRATION_RATCHET);
+    expect(problem).toMatch(/integration-gaps\.json grew by 1: cli\.b/);
+    expect(problem).toMatch(/integration-exemptions\.json/);
+  });
+});
+
+describe("docs-freshness exemption", () => {
+  it("takes a stated reason from the PR body", () => {
+    const body = ["Fix.", "", "Docs: not needed - a GC lifetime fix, no surface change", ""].join("\n");
+    expect(docsExemptionReason(body)).toBe("a GC lifetime fix, no surface change");
+  });
+  it("refuses an exemption without a reason", () => {
+    expect(docsExemptionReason("Docs: not needed -")).toBeNull();
+    expect(docsExemptionReason("Docs: not needed")).toBeNull();
+  });
+  it("ignores a body without the line", () => {
+    expect(docsExemptionReason("nothing here")).toBeNull();
+    expect(docsExemptionReason(null)).toBeNull();
+  });
+});
+
+describe("an owner sign-off", () => {
+  it("allows a minor move to exactly the version named", () => {
+    expect(versionDeltaProblem("1.3.10-beta.16", "1.4.0-beta.1", ["1.4.0-beta.1"])).toBeNull();
+  });
+  it("does not cover any other version", () => {
+    expect(versionDeltaProblem("1.3.10-beta.16", "1.4.0-beta.2", ["1.4.0-beta.1"])).toMatch(/MINOR/);
+  });
+  it("never allows a move backwards", () => {
+    expect(versionDeltaProblem("1.4.0", "1.3.11", ["1.3.11"])).not.toBeNull();
   });
 });

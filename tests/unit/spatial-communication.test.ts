@@ -1,18 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { levelTool } from "../../src/tools/level.js";
-import { actionSchema } from "../../src/action-schema.js";
-import { buildMicroGateway } from "../../src/lean-context.js";
-import type { ToolContext } from "../../src/types.js";
+import { actionSchema } from "../../src/surface/action-schema.js";
+import { buildMicroGateway } from "../../src/surface/context/micro-context.js";
+import type { ToolContext } from "../../src/core/types.js";
 import { editorTool } from "../../src/tools/editor.js";
 import { projectTool } from "../../src/tools/project.js";
+import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
 describe("spatial request contract", () => {
-  it("rejects invalid capture margins at the wire boundary", () => {
+  it("rejects invalid capture margins: a non-number at the wire, a non-positive one in the handler", () => {
+    // The C++ spec declares focusMargin a number (#1057); the range is the handler's to refuse.
     const wire = z.object(editorTool.schema);
-    for (const focusMargin of [-1, 0, Infinity, NaN]) {
+    for (const focusMargin of [NaN, "1.5"]) {
       expect(wire.safeParse({ action: "capture_scene_png", outputPath: "capture.png", focusMargin }).success).toBe(false);
     }
+    const source = readHandlerFile("EditorHandlers.cpp");
+    expect(source).toContain("if (!FMath::IsFinite(FocusMargin) || FocusMargin <= 0.0)");
+    expect(source).toContain("focusMargin must be finite and greater than zero");
   });
 
   it("uses the addressed graph for project search and schemas, including an empty graph", async () => {
@@ -49,10 +54,12 @@ describe("spatial request contract", () => {
   it("publishes the nested viewpoint vocabulary and rejects malformed wire values", () => {
     const schema = actionSchema(levelTool, "nudge_component");
     const rotation = schema.params.find((p) => p.name === "viewRotation")!;
-    expect(rotation.properties!.viewFrom.enumValues).toEqual(["front", "back", "right", "left", "above", "below"]);
-    expect(rotation.properties!.direction.enumValues).toEqual(["clockwise", "counterclockwise"]);
+    // The spec publishes the vocabulary in each field's description; the handler
+    // refuses anything outside it, and a degrees value that is not above zero.
+    expect(rotation.properties!.viewFrom.description).toBe("front | back | right | left | above | below");
+    expect(rotation.properties!.direction.description).toBe("clockwise | counterclockwise");
     const wire = z.object(levelTool.schema);
-    for (const invalid of [null, { viewFrom: "above", degrees: 15 }, { ...request.viewRotation, degrees: -1 }, { ...request.viewRotation, degrees: Infinity }]) {
+    for (const invalid of [null, { viewFrom: "above", degrees: 15 }, { ...request.viewRotation, degrees: "15" }]) {
       expect(wire.safeParse({ ...request, viewRotation: invalid }).success).toBe(false);
     }
     expect(wire.safeParse({ ...request, dryRun: "true" }).success).toBe(false);

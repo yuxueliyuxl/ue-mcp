@@ -18,6 +18,10 @@
  *   --record-golden   Re-record tests/golden/editor-connected.json instead of
  *                     asserting against it. Reviews the diff yourself.
  *   --only <file>     Run one file under tests/live.
+ *   --lifecycle       Run only tests/live/editor-lifecycle.test.ts, which stops,
+ *                     crashes, builds and restarts the tests/ue_mcp editor and
+ *                     leaves one running at the end (#1223). Part of the
+ *                     release check, never of the default run.
  */
 import { spawnSync } from "node:child_process";
 import * as path from "node:path";
@@ -39,8 +43,10 @@ const argv = process.argv.slice(2);
 const RECORD_GOLDEN = argv.includes("--record-golden");
 const onlyIndex = argv.indexOf("--only");
 const ONLY = onlyIndex !== -1 ? argv[onlyIndex + 1] : null;
+const LIFECYCLE = argv.includes("--lifecycle");
+const LIFECYCLE_FILE = "tests/live/editor-lifecycle.test.ts";
 
-const HOST = process.env.UE_MCP_LIVE_HOST ?? "127.0.0.1";
+const HOST = process.env.UE_MCP_LIVE_HOST ?? process.env.UE_MCP_TEST_HOST ?? "127.0.0.1";
 const CONNECT_TIMEOUT_MS = 5000;
 const CALL_TIMEOUT_MS = 60_000;
 
@@ -111,9 +117,13 @@ if (capabilities.paramEcho !== true) {
       "Relaunch the editor with UE_MCP_PARAM_ECHO=1 in its environment to include them.",
   );
 }
-console.error("[live] nothing below starts or stops an editor.\n");
+console.error(
+  LIFECYCLE
+    ? "[live] --lifecycle: the cases below stop, crash, build and restart this editor, and leave it running.\n"
+    : "[live] nothing below starts or stops an editor.\n",
+);
 
-const targets = ONLY ? [ONLY] : ["tests/live"];
+const targets = LIFECYCLE ? [LIFECYCLE_FILE] : ONLY ? [ONLY] : ["tests/live"];
 const result = spawnSync(
   process.execPath,
   [path.join(REPO_ROOT, "node_modules", "vitest", "vitest.mjs"), "run", ...targets],
@@ -126,6 +136,7 @@ const result = spawnSync(
       UE_MCP_LIVE_PORT: String(target.port),
       UE_MCP_LIVE_PROJECT_DIR: target.projectDir,
       ...(RECORD_GOLDEN ? { UE_MCP_RECORD_GOLDEN: "1" } : {}),
+      ...(LIFECYCLE ? { UE_MCP_LIVE_LIFECYCLE: "1" } : {}),
     },
   },
 );

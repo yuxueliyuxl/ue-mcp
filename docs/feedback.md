@@ -182,7 +182,9 @@ If that service is unreachable or turned off, nothing is lost: the call returns 
 npx ue-mcp auth
 ```
 
-Runs the GitHub device flow: prompts you to open a URL, enter a code, and authorize the `ue-mcp-feedback` GitHub App. On success the token is cached at `~/.ue-mcp/auth.json` (mode 600) and every subsequent `feedback(submit)` defaults to authoring as your user.
+Runs the GitHub device flow: prompts you to open a URL, enter a code, and authorize the `ue-mcp-feedback` GitHub App. On success the token is cached at `~/.ue-mcp/auth.json` (mode 600, or in `UE_MCP_AUTH_DIR` when set) and every subsequent `feedback(submit)` defaults to authoring as your user. The command exits non-zero when authorization is denied, expires or fails.
+
+`UE_MCP_GITHUB_OAUTH` (default `https://github.com`) and `UE_MCP_GITHUB_API` (default `https://api.github.com`) point the device flow and the issue posts at another origin, such as GitHub Enterprise or a local test server.
 
 This same step is offered inside `npx ue-mcp init` when you opt into the feedback prompt hook. Run `auth` standalone if you skipped that and want to authorize later.
 

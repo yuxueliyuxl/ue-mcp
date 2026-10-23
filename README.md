@@ -5,9 +5,12 @@
 [![stars](https://img.shields.io/github/stars/db-lyon/ue-mcp)](https://github.com/db-lyon/ue-mcp/stargazers)
 [![MIT](https://img.shields.io/npm/l/ue-mcp)](LICENSE)
 
-**Unreal Engine Model Context Protocol Server** - gives AI assistants deep read/write access to the Unreal Editor through <!-- count:tools -->26<!-- /count --> category tools covering <!-- count:actions -->1933+<!-- /count --> actions, plus a YAML flow engine for multi-step workflows and an npm plugin system for extending the surface.
+<img width="1354" height="586" alt="{6F52BA62-D736-454E-AD30-A1C98F9EEBAA}" src="https://github.com/user-attachments/assets/9380e080-c608-4609-ba21-90e6b0a3ba7f" />
 
-That total is <!-- count:ownActions -->1103+<!-- /count --> actions of ue-mcp's own plus Epic's entire native AI Toolset Registry: on UE 5.8+ its <!-- count:nativeToolActions -->830<!-- /count --> official Unreal tools are called in-process and surfaced as `epic_*` actions in the matching category, Sequencer in `animation`, PCG in `pcg`, static meshes in `asset`.
+
+**Unreal Engine Model Context Protocol Server** - gives AI assistants deep read/write access to the Unreal Editor through <!-- count:tools -->29<!-- /count --> category tools covering <!-- count:actions -->2049+<!-- /count --> actions, plus a YAML flow engine for multi-step workflows and an npm plugin system for extending the surface.
+
+That total is <!-- count:ownActions -->1219+<!-- /count --> actions of ue-mcp's own plus Epic's entire native AI Toolset Registry: on UE 5.8+ its <!-- count:nativeToolActions -->830<!-- /count --> official Unreal tools are called in-process and surfaced as `epic_*` actions in the matching category, Sequencer in `animation`, PCG in `pcg`, static meshes in `asset`.
 
 ```mermaid
 flowchart LR
@@ -35,7 +38,7 @@ The interactive setup will:
 4. Enable required UE plugins (Niagara, PCG, GAS, etc.)
 5. Detect and configure your MCP client (Claude Code, Claude Desktop, Cursor, Codex)
 
-Restart the editor once after setup to load the bridge plugin. To update later: `npx ue-mcp update`
+Restart the editor once after setup to load the bridge plugin. To update later, run `npx ue-mcp update` from the project directory. It updates the npm package, redeploys the C++ plugin and rebuilds it.
 
 Then talk to your AI in plain English:
 
@@ -65,7 +68,7 @@ If you prefer to configure manually, add to your MCP client config:
   "mcpServers": {
     "ue-mcp": {
       "command": "npx",
-      "args": ["ue-mcp", "C:/path/to/MyGame.uproject"]
+      "args": ["-y", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
     }
   }
 }
@@ -139,7 +142,7 @@ flows:
 flow(action="run", flowName="build_and_check")
 ```
 
-Every one of the <!-- count:actions -->1933+<!-- /count --> actions is also a flow task. Flows support step references, retries, rollback, custom tasks in your own `.js`/`.ts`, and shell steps. See [Flows](https://ue-mcp.com/docs/flows/).
+Every one of the <!-- count:actions -->2049+<!-- /count --> actions is also a flow task. Flows support step references, retries, rollback, custom tasks in your own `.js`/`.ts`, and shell steps. See [Flows](https://ue-mcp.com/docs/flows/).
 
 ## Plugins
 
@@ -194,8 +197,6 @@ Editor process control (`editor(start_editor)` / `stop_editor` / `restart_editor
 - [Tool Reference](https://ue-mcp.com/docs/tool-reference/) - Every tool, action, and parameter
 - [Architecture](https://ue-mcp.com/docs/architecture/) - How the server, bridge, and editor fit together
 - [Flows](https://ue-mcp.com/docs/flows/) - Multi-step YAML workflows, custom tasks, rollback
-- [Journal](https://ue-mcp.com/docs/journal/) - The per-project record of what a session did, produced, and how it ended
-- [Skill Packs](https://ue-mcp.com/docs/skill-packs/) - Written workflows an agent reads, and checking that the calls they teach still exist
 - [Plugins](https://ue-mcp.com/docs/plugins/) - Extending the surface through npm
 - [Configuration](https://ue-mcp.com/docs/configuration/) - `ue-mcp.yml` and MCP client config
 - [Troubleshooting](https://ue-mcp.com/docs/troubleshooting/) - Connection, build, and asset path issues

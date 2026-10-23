@@ -33,8 +33,20 @@ async function requestEditorShutdown() {
     extractReportedProjectDir,
     PROJECT_IDENTITY_PYTHON,
     TEST_PROJECT_DIR,
+    readPortLockfile,
+    isProcessAlive,
   } = await import("./bridge-target.mjs");
   const { candidates } = bridgePortCandidates({ projectDir: TEST_PROJECT_DIR });
+  // The test project's own lockfile names its editor process.
+  const lock = readPortLockfile();
+  const editorPid = lock.pidAlive ? lock.pid : null;
+  const waitForExit = async (pid, seconds) => {
+    for (let i = 0; i < seconds; i++) {
+      if (!isProcessAlive(pid)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return !isProcessAlive(pid);
+  };
 
   // Every candidate is asked WHICH PROJECT it has open before it is asked to
   // close anything. The candidate list includes a port derived from the path
@@ -96,6 +108,12 @@ async function requestEditorShutdown() {
       }
     }
     if (!stillUp) {
+      // The bridge stops answering before the process exits, and UBT refuses to
+      // build while the exiting editor still holds Live Coding.
+      if (editorPid !== null && !(await waitForExit(editorPid, 60))) {
+        log(`Editor process ${editorPid} is still exiting after 60s, so the build stopped.`, 'red');
+        return false;
+      }
       log('Unreal Editor closed', 'yellow');
       return true;
     }

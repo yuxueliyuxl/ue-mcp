@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { editorTool } from "../../src/tools/editor.js";
-import { classifyActionClass } from "../../src/action-class.js";
-import type { ToolContext } from "../../src/types.js";
+import { declaredActionEffect } from "../../src/surface/action-effects.js";
+import { RECORDED_HANDLER_SPECS } from "../../src/tools/specs/index.js";
+import type { ToolContext } from "../../src/core/types.js";
 
 /**
  * #881: the playhead has to be movable to an exact frame, or a capture of the
@@ -34,7 +35,7 @@ describe("editor.scrub_sequence", () => {
     }, undefined);
   });
 
-  it("falls back to assetPath, the way the other sequencer actions do", async () => {
+  it("accepts assetPath, the way the other sequencer actions do", async () => {
     const call = vi.fn().mockResolvedValue({ success: true });
     const ctx = { bridge: { call } } as unknown as ToolContext;
 
@@ -44,12 +45,14 @@ describe("editor.scrub_sequence", () => {
       seconds: 2.5,
     });
 
+    // #1057: the bag goes to the bridge as sent, and the registry renames the
+    // alias to sequencePath before the handler runs.
     expect(call).toHaveBeenCalledWith("scrub_sequence", {
-      sequencePath: "/Game/Cinematics/LS_Opening",
+      assetPath: "/Game/Cinematics/LS_Opening",
       seconds: 2.5,
-      frame: undefined,
-      timeUnit: undefined,
     }, undefined);
+    const sequencePath = RECORDED_HANDLER_SPECS.scrub_sequence.params.find((p) => p.name === "sequencePath");
+    expect(sequencePath?.aliases).toContain("assetPath");
   });
 
   it("advertises the two time units and leaves the refusal to the handler", () => {
@@ -72,9 +75,6 @@ describe("editor.scrub_sequence", () => {
   });
 
   it("classifies as a mutation, so it cannot land in an unnamed editor", () => {
-    expect(classifyActionClass("editor", "scrub_sequence")).toEqual({
-      class: "mutate",
-      source: "lexicon",
-    });
+    expect(declaredActionEffect("editor", "scrub_sequence")).toBe("mutate");
   });
 });

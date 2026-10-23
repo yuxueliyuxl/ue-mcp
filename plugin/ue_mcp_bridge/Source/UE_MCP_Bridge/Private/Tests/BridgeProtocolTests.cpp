@@ -126,6 +126,9 @@ namespace
 		Record.ProtocolVersion = UEMCP_BRIDGE_PROTOCOL_VERSION;
 		Record.HandlerApiVersion = UEMCP_BRIDGE_API_VERSION;
 		Record.State = State;
+		Record.PluginDir = TEXT("c:/projects/example/Plugins/UE_MCP_Bridge");
+		Record.InstallKind = TEXT("binary");
+		Record.PluginVersion = TEXT("1.2.3");
 		return Record;
 	}
 }
@@ -468,6 +471,23 @@ bool FMCPBridgeInstanceRecordTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("engine version survives"), ReadBack.EngineVersion, Written.EngineVersion);
 	TestEqual(TEXT("state survives"), ReadBack.State, Written.State);
 	TestEqual(TEXT("protocol version survives"), ReadBack.ProtocolVersion, (int32)UEMCP_BRIDGE_PROTOCOL_VERSION);
+	TestEqual(TEXT("plugin dir survives"), ReadBack.PluginDir, Written.PluginDir);
+	TestEqual(TEXT("install kind survives"), ReadBack.InstallKind, Written.InstallKind);
+	TestEqual(TEXT("plugin version survives"), ReadBack.PluginVersion, Written.PluginVersion);
+
+	// Install kind: the marker wins, a Source tree is the fallback.
+	{
+		const FString PluginDir = FPaths::Combine(Dir, TEXT("plugin"));
+		IFileManager::Get().MakeDirectory(*PluginDir, /*Tree*/ true);
+		TestEqual(TEXT("no marker and no Source reads as binary"),
+			FMCPBridgeStateFiles::InstallKindFor(PluginDir), FString(TEXT("binary")));
+		IFileManager::Get().MakeDirectory(*FPaths::Combine(PluginDir, TEXT("Source")), /*Tree*/ true);
+		TestEqual(TEXT("a Source tree without a marker reads as source"),
+			FMCPBridgeStateFiles::InstallKindFor(PluginDir), FString(TEXT("source")));
+		FFileHelper::SaveStringToFile(TEXT("{\"kind\":\"binary\"}"), *FPaths::Combine(PluginDir, TEXT(".ue-mcp-install.json")));
+		TestEqual(TEXT("the marker's kind wins over a Source tree"),
+			FMCPBridgeStateFiles::InstallKindFor(PluginDir), FString(TEXT("binary")));
+	}
 
 	// Two editors of one project write two files, so neither can lose to the
 	// other. This is the whole point of the per-pid name.
@@ -621,6 +641,20 @@ bool FMCPBridgeCapabilitiesTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("instance records are advertised"), Named.Contains(TEXT("instance-records")));
 		TestTrue(TEXT("the requested-port file is advertised"), Named.Contains(TEXT("requested-port-file")));
 		TestTrue(TEXT("the parameter echo is advertised"), Named.Contains(TEXT("param-echo")));
+		TestTrue(TEXT("handler parameter specs are advertised"), Named.Contains(TEXT("handler-specs")));
+	}
+
+	// #1057: the declared parameter contracts, which the server's generated
+	// surface is recorded from.
+	const TSharedPtr<FJsonObject>* HandlerSpecs = nullptr;
+	TestTrue(TEXT("handler parameter specs are reported"), Payload->TryGetObjectField(TEXT("handlerSpecs"), HandlerSpecs));
+	const TSharedPtr<FJsonObject>* PluginHandlerSpecs = nullptr;
+	TestTrue(TEXT("plugin handler specs are reported apart"), Payload->TryGetObjectField(TEXT("pluginHandlerSpecs"), PluginHandlerSpecs));
+	if (HandlerSpecs && HandlerSpecs->IsValid())
+	{
+		const TSharedPtr<FJsonObject>* Spec = nullptr;
+		TestTrue(TEXT("a spec'd animation handler is among them"),
+			(*HandlerSpecs)->TryGetObjectField(TEXT("read_blendspace"), Spec));
 	}
 
 	// The action list from the running binary is the only answer to "does the

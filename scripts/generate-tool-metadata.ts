@@ -24,6 +24,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ALL_TOOLS, enumerateBridgeActions } from "../src/tools.js";
+import { actionSignature } from "../src/surface/action-signature.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
@@ -188,7 +189,9 @@ function regenerateToolReference(counts: Counts): string {
     lines.push("|--------|-------------|");
     for (const [actionName, spec] of Object.entries(t.actions)) {
       const { desc, params } = splitDescription(spec.description);
-      const left = "`" + actionName + "`";
+      // The signature is the one the server advertises (#1172), built from the
+      // recorded spec or schema rather than parsed out of the prose clause.
+      const left = "`" + cell(actionSignature(t, actionName)) + "`";
       // Escape each part exactly once. Escaping the already-escaped `merged`
       // again double-escaped pipes (`\\|`) and broke the MDX table renderer.
       const merged = params ? `${cell(desc)}. Params: \`${cell(params)}\`` : cell(desc);

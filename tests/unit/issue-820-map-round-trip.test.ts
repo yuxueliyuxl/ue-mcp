@@ -10,7 +10,8 @@
  */
 import { describe, it, expect } from "vitest";
 import { ALL_TOOLS } from "../../src/tools.js";
-import type { ToolDef } from "../../src/types.js";
+import type { ToolDef } from "../../src/core/types.js";
+import { handlerSpecs } from "../../src/tools/specs/asset.generated.js";
 
 function tool(name: string): ToolDef {
   const found = ALL_TOOLS.find((t) => t.name === name);
@@ -56,19 +57,21 @@ describe("#820 read actions advertise the round-trip signal", () => {
 describe("#820 asset(force_reload) parameter mapping", () => {
   const spec = tool("asset").actions.force_reload;
 
+  // #1057: force_reload_asset declares its parameters in C++, and the action
+  // forwards the bag as sent rather than rebuilding it.
+  const declared = handlerSpecs.force_reload_asset.params;
+
   it("passes discardUnsaved through to the bridge", () => {
-    const mapped = spec.mapParams?.({ action: "force_reload", assetPath: "/Game/Foo", discardUnsaved: true });
-    expect(mapped).toEqual({ assetPath: "/Game/Foo", discardUnsaved: true });
+    expect(spec.mapParams).toBeUndefined();
+    expect(declared.find((p) => p.name === "discardUnsaved")?.type).toBe("boolean");
   });
 
   it("still accepts `path` as an alias for assetPath", () => {
-    const mapped = spec.mapParams?.({ action: "force_reload", path: "/Game/Foo" });
-    expect(mapped?.assetPath).toBe("/Game/Foo");
+    expect(declared.find((p) => p.name === "assetPath")?.aliases).toContain("path");
   });
 
-  it("leaves discardUnsaved undefined when the caller omits it, so the bridge default (false) holds", () => {
-    const mapped = spec.mapParams?.({ action: "force_reload", assetPath: "/Game/Foo" });
-    expect(mapped?.discardUnsaved).toBeUndefined();
+  it("leaves discardUnsaved optional, so the bridge default (false) holds when it is omitted", () => {
+    expect(declared.find((p) => p.name === "discardUnsaved")?.required).toBe(false);
   });
 
   it("declares discardUnsaved as an optional boolean in the tool schema", () => {

@@ -20,24 +20,26 @@
  */
 import { describe, it, expect } from "vitest";
 import { z } from "zod";
-import { categoryTool, bp} from "../../src/types.js";
+import { categoryTool, bp } from "../../src/surface/category-tool.js";
 import { ALL_TOOLS } from "../../src/tools.js";
-import { requiresExplicitEditor } from "../../src/action-class.js";
+import { requiresExplicitEditor } from "../../src/surface/action-class.js";
 import {
   actionSchema,
-  allActionSchemas,
+
   forwardedParams,
   nearestActions,
+  unknownActionMessage,
   parseParams,
-  parseParamsClause,
   resolveActionRef,
   similarity,
   suggestActions,
-} from "../../src/action-schema.js";
+} from "../../src/surface/action-schema.js";
+
+const surfaceSchemas = () => ALL_TOOLS.flatMap((tool) => Object.keys(tool.actions).map((action) => actionSchema(tool, action)));
 
 describe("action parameter schema", () => {
   it("declares every parameter it documents or forwards", () => {
-    const offenders = allActionSchemas(ALL_TOOLS)
+    const offenders = surfaceSchemas()
       .filter((a) => a.drift.length > 0)
       .map((a) => `${a.tool}.${a.action}: ${a.drift.join(", ")}`);
 
@@ -170,7 +172,6 @@ describe("action parameter schema", () => {
       "probe",
       "Probe.",
       { alpha: bp("read", "Alpha. Params: none", "probe_alpha") },
-      undefined,
       {
         action: z.string().optional().describe("hostile"),
         timeoutMs: z.string().optional().describe("hostile"),
@@ -210,7 +211,7 @@ describe("action parameter schema", () => {
     // A parameter the description marks required must not be declared with a
     // schema default, which would silently make it optional.
     const contradictions: string[] = [];
-    for (const schema of allActionSchemas(ALL_TOOLS)) {
+    for (const schema of surfaceSchemas()) {
       for (const param of schema.params) {
         if (param.required && param.default !== undefined) {
           contradictions.push(`${schema.tool}.${schema.action}.${param.name}`);
@@ -221,9 +222,9 @@ describe("action parameter schema", () => {
   });
 });
 
-describe("parseParamsClause", () => {
+describe("parseParams", () => {
   it("reads a plain list, with optionality from the ? marker", () => {
-    expect(parseParamsClause("Does a thing. Params: assetPath, propertyName, save?")).toEqual([
+    expect(parseParams("Does a thing. Params: assetPath, propertyName, save?").params).toEqual([
       { name: "assetPath", optional: false },
       { name: "propertyName", optional: false },
       { name: "save", optional: true },
@@ -231,48 +232,48 @@ describe("parseParamsClause", () => {
   });
 
   it("treats a parenthesised aside as commentary, not as parameters", () => {
-    expect(parseParamsClause("Params: query (space-separated keywords), limit? (default 20)")).toEqual([
+    expect(parseParams("Params: query (space-separated keywords), limit? (default 20)").params).toEqual([
       { name: "query", optional: false },
       { name: "limit", optional: true },
     ]);
   });
 
   it("stops at the Returns clause, whose names are result fields", () => {
-    const names = parseParamsClause("Params: assetPath. Returns min, max, boxExtent, meshKind").map((p) => p.name);
+    const names = parseParams("Params: assetPath. Returns min, max, boxExtent, meshKind").params.map((p) => p.name);
     expect(names).toEqual(["assetPath"]);
   });
 
   it("stops where the description resumes prose", () => {
-    const names = parseParamsClause(
+    const names = parseParams(
       "Params: path (relative to Source/), content. After editing, call live_coding_compile.",
-    ).map((p) => p.name);
+    ).params.map((p) => p.name);
     expect(names).toEqual(["path", "content"]);
   });
 
   it("reads both sides of an OR alternative", () => {
-    const names = parseParamsClause("Params: assetPaths? (string[]) OR directory?, classNames?").map((p) => p.name);
+    const names = parseParams("Params: assetPaths? (string[]) OR directory?, classNames?").params.map((p) => p.name);
     expect(names).toEqual(["assetPaths", "directory", "classNames"]);
   });
 
   it("reads a nested (+ ...) group as further parameters", () => {
-    const names = parseParamsClause("Params: directory? (+ recursive?, default true), limit?").map((p) => p.name);
+    const names = parseParams("Params: directory? (+ recursive?, default true), limit?").params.map((p) => p.name);
     expect(names).toEqual(["directory", "recursive", "limit"]);
   });
 
   it("reads a slash alias as both spellings, since the resolver accepts both", () => {
-    const names = parseParamsClause("Params: target/targetLabel (actor label) OR targetPath").map((p) => p.name);
+    const names = parseParams("Params: target/targetLabel (actor label) OR targetPath").params.map((p) => p.name);
     expect(names).toEqual(["target", "targetLabel", "targetPath"]);
   });
 
   it("looks past an 'at least one of' quantifier to the parameters behind it", () => {
-    const names = parseParamsClause("Params: properties, at least one of actorLabels/labelPrefix, dryRun?").map((p) => p.name);
+    const names = parseParams("Params: properties, at least one of actorLabels/labelPrefix, dryRun?").params.map((p) => p.name);
     expect(names).toContain("actorLabels");
     expect(names).toContain("labelPrefix");
     expect(names).not.toContain("at");
   });
 
   it("reads `Params: none` as no parameters rather than as a parameter named none", () => {
-    expect(parseParamsClause("Reads the thing. Params: none (#204)")).toEqual([]);
+    expect(parseParams("Reads the thing. Params: none (#204)").params).toEqual([]);
   });
 
   it("keeps reading past `none` when the clause carries on", () => {
@@ -280,7 +281,7 @@ describe("parseParamsClause", () => {
     // including `none`. Treating `none` as a terminator hid the paging
     // parameters of every paged action that documents no others, which left
     // page two of pcg(list_graphs) unreachable from the advertised schema.
-    expect(parseParamsClause("Lists them. Params: none, cursor?, limit?").map((p) => p.name))
+    expect(parseParams("Lists them. Params: none, cursor?, limit?").params.map((p) => p.name))
       .toEqual(["cursor", "limit"]);
   });
 
@@ -290,29 +291,29 @@ describe("parseParamsClause", () => {
     // required field from the schema an agent is handed, and the agent then
     // makes a call the handler rejects - or, where the handler reads the field
     // unguarded, one that writes an empty string and reports success.
-    expect(parseParamsClause("Params: assetPath, parameterName, value, association?").map((p) => p.name))
+    expect(parseParams("Params: assetPath, parameterName, value, association?").params.map((p) => p.name))
       .toEqual(["assetPath", "parameterName", "value", "association"]);
-    expect(parseParamsClause("Params: foliageTypePath, center?, radius?, all?").map((p) => p.name))
+    expect(parseParams("Params: foliageTypePath, center?, radius?, all?").params.map((p) => p.name))
       .toContain("all");
   });
 
   it("reads every separator the descriptions actually use", () => {
-    expect(parseParamsClause("Params: widgetName? | className?, childName?").map((p) => p.name))
+    expect(parseParams("Params: widgetName? | className?, childName?").params.map((p) => p.name))
       .toEqual(["widgetName", "className", "childName"]);
-    expect(parseParamsClause("Params: actorLabels[] and/or actorPaths[]").map((p) => p.name))
+    expect(parseParams("Params: actorLabels[] and/or actorPaths[]").params.map((p) => p.name))
       .toEqual(["actorLabels", "actorPaths"]);
-    expect(parseParamsClause("Params: assetPaths (string[]) or assetPath").map((p) => p.name))
+    expect(parseParams("Params: assetPaths (string[]) or assetPath").params.map((p) => p.name))
       .toEqual(["assetPaths", "assetPath"]);
-    expect(parseParamsClause("Params: systemPath, scaleX?/scaleY?/scaleZ? (separate keys)").map((p) => p.name))
+    expect(parseParams("Params: systemPath, scaleX?/scaleY?/scaleZ? (separate keys)").params.map((p) => p.name))
       .toEqual(["systemPath", "scaleX", "scaleY", "scaleZ"]);
   });
 
   it("stops where the prose resumes inside an item", () => {
     // `where each entry is ...` describes the shape of `renames`, and the
     // names behind it are fields of that shape, not parameters.
-    expect(parseParamsClause("Params: renames[] where each entry is {sourcePath, destinationPath}").map((p) => p.name))
+    expect(parseParams("Params: renames[] where each entry is {sourcePath, destinationPath}").params.map((p) => p.name))
       .toEqual(["renames"]);
-    expect(parseParamsClause("Params: dryRun? to preview").map((p) => p.name)).toEqual(["dryRun"]);
+    expect(parseParams("Params: dryRun? to preview").params.map((p) => p.name)).toEqual(["dryRun"]);
   });
 
   it("reports alternatives as one choice rather than as several required names", () => {
@@ -346,14 +347,14 @@ describe("parseParamsClause", () => {
     // what tells the two apart, so a name is only read out of one when the
     // wire would accept every name in it.
     const known = new Set(["sourceString", "value"]);
-    expect(parseParamsClause("Params: sourceString (or value)", known).map((p) => p.name))
+    expect(parseParams("Params: sourceString (or value)", known).params.map((p) => p.name))
       .toEqual(["sourceString", "value"]);
-    expect(parseParamsClause("Params: boneName (or socket name)", new Set(["boneName", "name"])).map((p) => p.name))
+    expect(parseParams("Params: boneName (or socket name)", new Set(["boneName", "name"])).params.map((p) => p.name))
       .toEqual(["boneName"]);
   });
 
   it("returns nothing when there is no clause at all", () => {
-    expect(parseParamsClause("Just a description.")).toEqual([]);
+    expect(parseParams("Just a description.").params).toEqual([]);
   });
 });
 
@@ -372,6 +373,8 @@ describe("forwardedParams", () => {
     // `arr.length` and `Array.isArray` are not parameters, and reporting them
     // would put permanent false entries in the drift guard above.
     const names = forwardedParams({
+      kind: "bridge",
+      effect: "read",
       bridge: "x",
       mapParams: (p) => ({ n: Array.isArray(p.items) ? (p.items as unknown[]).length : 0 }),
     });
@@ -386,13 +389,33 @@ describe("forwardedParams", () => {
   it("is empty for an action that takes no parameters", () => {
     expect(forwardedParams({ kind: "bridge", effect: "read", bridge: "x" })).toEqual([]);
   });
+
+  it("reads a wrapped engine tool's parameters off its declared schema", () => {
+    const names = forwardedParams({
+      kind: "bridge",
+      effect: "read",
+      bridge: "epic_call_tool",
+      epicTool: { toolset: "T", name: "T.Get" },
+      epicSchema: { properties: { widgetBlueprint: { type: "object" }, depth: { type: "integer" } } },
+    });
+    expect(names.sort()).toEqual(["depth", "widgetBlueprint"]);
+  });
 });
 
 describe("actionSchema", () => {
+  it("still reads an alias in a hand-written clause as a choice", () => {
+    const tool = categoryTool("example", "Example", {
+      pick: bp("read", "Pick. Params: actorLabel (or actorPath)", "pick"),
+    }, { actorLabel: z.string().optional(), actorPath: z.string().optional() });
+    const schema = actionSchema(tool, "pick");
+    expect(schema.alternatives).toEqual([{ branches: [["actorLabel"], ["actorPath"]], required: true }]);
+    expect(schema.params.every((p) => p.aliases === undefined)).toBe(true);
+  });
+
   it("preserves nested fields, array items, enums, defaults and required nullable values", () => {
     const tool = categoryTool("example", "Example", {
       inspect: bp("read", "Inspect. Params: request", "inspect"),
-    }, undefined, {
+    }, {
       request: z.object({
         targets: z.array(z.object({
           name: z.string().nullable(),
@@ -414,7 +437,7 @@ describe("actionSchema", () => {
   it("bounds nested discovery and explicitly marks omitted detail", () => {
     let nested: z.ZodTypeAny = z.string();
     for (let i = 0; i < 10; i++) nested = z.object({ child: nested });
-    const tool = categoryTool("example", "Example", { inspect: bp("read", "Inspect. Params: request", "inspect") }, undefined, { request: nested });
+    const tool = categoryTool("example", "Example", { inspect: bp("read", "Inspect. Params: request", "inspect") }, { request: nested });
     let result = actionSchema(tool, "inspect").params.find((p) => p.name === "request")!;
     for (let i = 0; i < 6; i++) result = result.properties!.child as typeof result;
     expect(result.truncated).toBe(true);
@@ -430,19 +453,27 @@ describe("actionSchema", () => {
     expect(schema.drift).toEqual([]);
 
     const byName = new Map(schema.params.map((p) => [p.name, p]));
-    expect(byName.get("assetPath")?.required).toBe(true);
-    expect(byName.get("propertyName")?.required).toBe(true);
-    expect(byName.get("save")?.required).toBe(false);
-    expect(byName.get("save")?.type).toBe("boolean");
+    // #1057: a spec'd action reports its C++ spec. `path` is an alias the
+    // registry renames to assetPath, so it rides on assetPath, which stays
+    // required, rather than turning the two into an optional choice.
+    expect(byName.get("assetPath")).toMatchObject({ required: true, type: "string", aliases: ["path"] });
+    expect(byName.get("assetPath")?.alternativeGroup).toBeUndefined();
+    expect(byName.has("path")).toBe(false);
+    expect(byName.get("propertyName")).toMatchObject({ required: true, type: "string" });
+    expect(byName.get("value")).toMatchObject({ required: true, type: "any" });
+    expect(byName.get("save")).toMatchObject({ required: false, type: "boolean" });
+    expect(schema.alternatives).toBeUndefined();
   });
 
   it("reports a parameter the description names with an ordinary English word", () => {
-    // material(set_parameter) hard-requires `value` and the description says
-    // so. Reporting the schema without it had an agent call the action with
-    // no value at all.
+    // material(set_parameter) needs `value` (or color / texturePath in its
+    // place). Reporting the schema without it had an agent call the action
+    // with no value at all.
     const material = ALL_TOOLS.find((t) => t.name === "material")!;
-    const byName = new Map(actionSchema(material, "set_parameter").params.map((p) => [p.name, p]));
-    expect(byName.get("value")?.required).toBe(true);
+    const schema = actionSchema(material, "set_parameter");
+    const byName = new Map(schema.params.map((p) => [p.name, p]));
+    expect(byName.get("value")?.alternativeGroup).toBe(0);
+    expect(schema.alternatives?.[0]).toEqual({ branches: [["value"], ["color"], ["texturePath"]], required: true });
   });
 
   it("reports the paging parameters of an action that documents no others", () => {
@@ -532,6 +563,18 @@ describe("suggestions", () => {
     expect(nearestActions("scul", ["sculpt", "paint_layer", "create"])).toEqual(["sculpt"]);
   });
 
+  it("points a miss that is not a typo at the native-module route (#1105)", () => {
+    const miss = unknownActionMessage("zzzz", "gas", ["sculpt"]);
+    expect(miss).toContain("UEMCP::RegisterExternalHandler");
+    expect(miss).toContain("handlers:");
+    expect(miss).toContain("docs/plugins-native-modules.md");
+    expect(miss).toContain("overwritten");
+    // A typo gets its spellings, not the plugin lecture.
+    const typo = unknownActionMessage("scul", "landscape", ["sculpt"]);
+    expect(typo).toContain("Did you mean: sculpt?");
+    expect(typo).not.toContain("RegisterExternalHandler");
+  });
+
   it("returns nothing rather than noise for an empty reference", () => {
     expect(nearestActions("", ["sculpt"])).toEqual([]);
     expect(suggestActions("", ALL_TOOLS)).toEqual([]);
@@ -549,7 +592,7 @@ describe("action class", () => {
   it("labels every action on the surface", () => {
     // `unknown` is a real answer for an action whose effect a parameter
     // decides, but it must be a deliberate one, not a gap.
-    for (const schema of allActionSchemas(ALL_TOOLS)) {
+    for (const schema of surfaceSchemas()) {
       expect(["read", "mutate", "unknown"], `${schema.tool}.${schema.action}`).toContain(schema.class);
     }
   });

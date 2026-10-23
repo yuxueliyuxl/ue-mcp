@@ -120,7 +120,10 @@ describe("simulation stages", () => {
   }, 240_000);
 
   it("reports the stage in the emitter's stack", async () => {
-    const body = await niagara("get_emitter_info", { assetPath: EMITTER_ASSET, emitterName: EMITTER });
+    // get_emitter_info reads the emitter asset alone, so no systemPath rides along.
+    const body = resultJson<Record<string, any>>(
+      await call("niagara", { action: "get_emitter_info", assetPath: EMITTER_ASSET }),
+    );
     expect(body.success).not.toBe(false);
   });
 

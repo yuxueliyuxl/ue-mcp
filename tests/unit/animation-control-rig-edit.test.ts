@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { animationTool } from "../../src/tools/animation.js";
-import type { ToolContext } from "../../src/types.js";
+import { handlerSpecs } from "../../src/tools/specs/animation.generated.js";
+import type { ToolContext } from "../../src/core/types.js";
+import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
 const workflowActions = [
   "begin_control_rig_edit",
@@ -13,13 +15,7 @@ const workflowActions = [
 
 describe("animation Control Rig edit workflow", () => {
   it("filters read metadata without narrowing begin, skip, or unfiltered session responses", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
     const readHandler = source.slice(
       source.indexOf("FAnimationHandlers::ReadControlRigEdit"),
       source.indexOf("FAnimationHandlers::ApplyControlRigEdits"),
@@ -34,13 +30,7 @@ describe("animation Control Rig edit workflow", () => {
   });
 
   it("keeps the source animation active when layered conversion clears baked rig keys", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
 
     expect(source).toContain('SetBoolField(TEXT("layered"), Session.ControlRig->IsAdditive())');
     expect(source).toContain("SetControlRigLayeredMode(RigTrack, true)");
@@ -48,13 +38,7 @@ describe("animation Control Rig edit workflow", () => {
   });
 
   it("keeps a support frame for the exporter's exact-end sample", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
 
     expect(source).toContain("FFrameNumber(EndFrameExclusive + 1)");
     expect(source).toContain("RigSections[0]->SetEndFrame");
@@ -62,13 +46,7 @@ describe("animation Control Rig edit workflow", () => {
   });
 
   it("cancels AnimSequence RateScale so a session maps the raw timeline once", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
     const nativeTest = readFileSync(
       new URL(
         "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Tests/AnimationControlRigTimelineTests.cpp",
@@ -85,13 +63,7 @@ describe("animation Control Rig edit workflow", () => {
   });
 
   it("validates offset ranges before expanding them into frames", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
 
     const validation = source.indexOf("Start < RangeStart || End >= RangeEndExclusive");
     const expansion = source.indexOf("for (int64 Frame = Start; Frame <= End; ++Frame)");
@@ -104,13 +76,7 @@ describe("animation Control Rig edit workflow", () => {
   });
 
   it("keeps validation artifacts inside their native root and never overwrites a run", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_Validation.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_Validation.cpp");
 
     expect(source).toContain("FPaths::IsUnderDirectory(Candidate, NormalizedRoot)");
     expect(source).toContain("outputDirectory already contains animation validation artifacts");
@@ -120,13 +86,7 @@ describe("animation Control Rig edit workflow", () => {
   });
 
   it("reports asset-rate-scaled duration and notify timing from the native analyzer", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_Validation.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_Validation.cpp");
 
     expect(source).toContain("const double RateScale = static_cast<double>(Sequence->RateScale)");
     expect(source).toContain("const double PlaybackRateMagnitude = FMath::Abs(RateScale)");
@@ -140,13 +100,7 @@ describe("animation Control Rig edit workflow", () => {
   });
 
   it("routes scalar controls through native Sequencer APIs with metadata and readback", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
 
     expect(source).toContain("GetLocalControlRigBools(");
     expect(source).toContain("SetLocalControlRigBools(");
@@ -167,13 +121,7 @@ describe("animation Control Rig edit workflow", () => {
   });
 
   it("implements component-space contact locking with transactional key QA", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
 
     expect(source).toContain('Op == TEXT("contact_lock")');
     expect(source).toContain("ControlRigSequencerSmoothStep");
@@ -200,14 +148,94 @@ describe("animation Control Rig edit workflow", () => {
     expect(animationTool.actions.contact_lock).toBeUndefined();
   });
 
-  it("makes partial IK retarget mappings explicit in batch results", () => {
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_StateMachine.cpp",
-        import.meta.url,
-      ),
-      "utf8",
+  it("keys batched operations in call order, each sampled after the ones before it landed", () => {
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
+    const commit = source.slice(
+      source.indexOf("TSharedPtr<FJsonValue> ControlRigEditsCommit("),
+      source.indexOf("TSharedPtr<FJsonObject> ControlRigEditsBuildResult("),
     );
+
+    // A child's component-space offset batched after its parent's was sampled
+    // before the parent was keyed, which erased the parent's edit. The commit
+    // re-prepares each operation through the ordering seam the native
+    // UE.MCP.Animation.ControlRig.BatchedOffsetsComposeLikeSequentialCalls test drives.
+    expect(commit).toContain("ControlRigEditsKeyInCallOrder(Operations.Num(),");
+    expect(commit.indexOf("ControlRigEditsPrepareOperation(*Step, Operations, OperationIndex)")).toBeGreaterThan(
+      commit.indexOf("FScopedTransaction"),
+    );
+    expect(commit.indexOf("ControlRigEditsApplyWrite(Session, Write, ApplyError)")).toBeGreaterThan(
+      commit.indexOf("ControlRigEditsPrepareOperation(*Step, Operations, OperationIndex)"),
+    );
+    expect(commit).not.toContain("for (const FControlRigPreparedWrite& Write : Plan.Prepared)");
+    expect(source).toContain('"UE.MCP.Animation.ControlRig.BatchedOffsetsComposeLikeSequentialCalls"');
+
+    // Operations are undone last-first, so each restore meets the parent pose it was sampled under.
+    expect(source).toContain("InverseOperations.Insert(MakeShared<FJsonValueObject>(Operation), InsertAt++)");
+    expect(source).not.toContain("InverseOperations.Add(");
+  });
+
+  it("rechecks every keyed contact after later operations and before the transaction closes", () => {
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
+    const commit = source.slice(
+      source.indexOf("TSharedPtr<FJsonValue> ControlRigEditsCommit("),
+      source.indexOf("TSharedPtr<FJsonObject> ControlRigEditsBuildResult("),
+    );
+
+    // A contact_lock can pass its immediate QA, then a later clavicle offset
+    // moves the locked hand. Verify the accumulated contacts after the ordered
+    // callbacks finish, inside the transaction, and route failure to undo.
+    expect(commit).toMatch(
+      /KeyedContacts\.Append\(MoveTemp\(Step->PreparedContacts\)\);\s*return bKeyed;\s*\}\);\s*(?:\/\/[^\n]*\n\s*)*if \(!bApplyFailed\)\s*\{\s*bApplyFailed = !ControlRigEditsVerifyContacts\(Session, KeyedContacts, ApplyError\);\s*\}\s*\}\s*if \(bApplyFailed\)\s*\{\s*const bool bRolledBack = GEditor && GEditor->UndoTransaction\(\);/,
+    );
+    expect(commit.match(/ControlRigEditsVerifyContacts\(Session, KeyedContacts, ApplyError\)/g)).toHaveLength(1);
+    expect(commit.indexOf("Plan.PreparedContacts = MoveTemp(KeyedContacts)")).toBeGreaterThan(
+      commit.indexOf("return MCPError(ApplyError);"),
+    );
+    expect(commit.indexOf("SaveAssetPackageChecked(")).toBeGreaterThan(
+      commit.indexOf("Plan.PreparedContacts = MoveTemp(KeyedContacts)"),
+    );
+  });
+
+  it("checks driven contact component poses after the whole batch", () => {
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
+    const verify = source.slice(
+      source.indexOf("bool ControlRigEditsVerifyContacts("),
+      source.indexOf("TSharedPtr<FJsonValue> ControlRigEditsPrepareOperation("),
+    );
+    expect(source).toContain("ContactQA.ReadbackControl = FkChainControls.Last()");
+    expect(source).toContain("ContactQA.ExpectedControl[FrameIndex] = TargetEnd");
+    expect(source).toContain("ContactQA.ExpectedControl = Write.After");
+    expect(verify).not.toContain("if (!Contact.bHasDrivenReference)");
+    expect(verify).toContain("Contact.bHasDrivenReference ? Contact.ReadbackControl : Contact.Control");
+    expect(verify).toContain("Contact.bHasDrivenReference ? Contact.ExpectedControl : Contact.ExpectedSubject");
+    expect(verify).toContain("Contact.Frames, Expected, Actual[0].Transforms");
+    expect(verify).toContain("contact_constraint_tolerance_exceeded");
+  });
+
+  it("refuses later contacts that would mix keyed poses with raw animation references", () => {
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
+    const prepare = source.slice(
+      source.indexOf("TSharedPtr<FJsonValue> ControlRigEditsPrepareContactLock("),
+      source.indexOf("TSharedPtr<FJsonValue> ControlRigEditsPrepareTransformValues("),
+    );
+    expect(prepare).toContain("OperationIndex > 0 && (bHasTargetReference || (bHasDrivenReference && !bUseFkRotationChain))");
+    const refusal = prepare.indexOf("contact_lock_reference_batch_unsupported");
+    expect(refusal).toBeGreaterThan(-1);
+    expect(refusal).toBeLessThan(prepare.indexOf("ControlRigSequencerSampleReferenceTransforms("));
+  });
+
+  it("requires bake analysis for target references even without a driven reference", () => {
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
+    const result = source.slice(
+      source.indexOf("TSharedPtr<FJsonObject> ControlRigEditsBuildResult("),
+      source.indexOf("void ControlRigEditsAttachInverse("),
+    );
+    expect(result).toMatch(/if \(Contact\.bHasDrivenReference \|\| Contact\.bHasTargetReference\)\s*\{\s*Object->SetStringField\(TEXT\("verification"\), TEXT\("bake_and_analyze_required"\)\);\s*\}\s*else\s*\{\s*Object->SetBoolField\(TEXT\("passed"\), true\);/);
+    expect(result).not.toContain('if (!Contact.bHasDrivenReference) Object->SetBoolField(TEXT("passed"), true)');
+  });
+
+  it("makes partial IK retarget mappings explicit in batch results", () => {
+    const source = readHandlerFile("AnimationHandlers_StateMachine.cpp");
 
     expect(source).toContain('SetArrayField(TEXT("unmappedTargetChains"), UnmappedTargetChains)');
     expect(source).toContain('SetBoolField(TEXT("mappingComplete"), UnmappedTargetChains.IsEmpty())');
@@ -239,14 +267,8 @@ describe("animation Control Rig edit workflow", () => {
     expect(analysis.description).toContain("Cross-version");
     expect(analysis.description).not.toContain("unsupported_engine_version");
 
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_Validation.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
-    expect(source).toContain("ENGINE_MINOR_VERSION >= 6");
+    const source = readHandlerFile("AnimationHandlers_Validation.cpp");
+    expect(source).toContain("UE_MCP_HAS_5_6_API");
     expect(source).toContain("static_cast<UObject&>(*SkeletalMesh)");
   });
 
@@ -378,50 +400,52 @@ describe("animation Control Rig edit workflow", () => {
       },
     ]).success).toBe(true);
 
+    // What the spec's shapes refuse before anything is sent: an unknown op, a
+    // missing or mistyped field, and a field that belongs to another op.
     const completeTransform = {
       translation: { x: 0, y: 0, z: 0 },
       rotationDegrees: { pitch: 0, yaw: 0, roll: 0 },
       scale: { x: 1, y: 1, z: 1 },
     };
-    expect(operations.safeParse([{ op: "set", control: "root_ctrl", transform: completeTransform }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "set", control: "root_ctrl", frame: 0, frames: [0], transform: completeTransform }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "offset", control: "root_ctrl", startFrame: 10, endFrame: 2, translationCm: { x: 1, y: 0, z: 0 } }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "offset", control: "root_ctrl", startFrame: 0, endFrame: 2 }]).success).toBe(false);
     const contactTarget = { translation: { x: 0, y: 0, z: 0 } };
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4 }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "rotate", control: "root_ctrl", frame: 0 }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "set", frame: 0, transform: completeTransform }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "set", control: "root_ctrl", frame: 0 }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "set", control: "root_ctrl", frame: 0, transform: completeTransform, startFrame: 0 }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: contactTarget, space: "local" }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "offset", control: "root_ctrl", startFrame: 0.5, endFrame: 2, translationCm: { x: 1, y: 0, z: 0 } }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "set_bool", control: "arm_r_fk_ik_switch", frame: 0, value: 1 }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "set_int", control: "space", frame: 0, value: 1.5 }]).success).toBe(false);
+    expect(operations.safeParse([{ op: "propagate_pose", control: "finger_ctrl" }]).success).toBe(false);
+    expect(animationTool.schema.createLink.safeParse(true).success).toBe(false);
     expect(operations.safeParse([{ op: "contact_lock", control: "hand_l_ik", startFrame: 0, endFrame: 4, targetReference: "hand_r" }]).success).toBe(true);
     expect(operations.safeParse([{ op: "contact_lock", control: "hand_l_ik", startFrame: 0, endFrame: 4, targetReference: "hand_r", target: contactTarget }]).success).toBe(true);
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 10, endFrame: 2, target: contactTarget }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: contactTarget, blendInFrames: 3, blendOutFrames: 2 }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: contactTarget, stabilizeControls: ["pole", "POLE"] }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: contactTarget, stabilizeControls: ["FOOT_IK"] }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 50_000, target: contactTarget, stabilizeControls: ["pole"] }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: { ...contactTarget, rotationQuaternion: { x: 0, y: 0, z: 0, w: 2 } } }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: { ...contactTarget, scale: { x: 1, y: 1, z: 1 } } }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "contact_lock", control: "foot_ik", startFrame: 0, endFrame: 4, target: contactTarget, positionToleranceCm: 0 }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "set_bool", control: "arm_r_fk_ik_switch", frame: 0, value: 1 }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "set_bool", control: "arm_r_fk_ik_switch", frame: 0, frames: [0], value: true }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "set_float", control: "blend", frame: 0, value: Number.POSITIVE_INFINITY }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "set_int", control: "space", frame: 0, value: 1.5 }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "set_int", control: "space", frame: 0, frames: [0], value: 1 }]).success).toBe(false);
-    expect(animationTool.schema.createLink.safeParse(true).success).toBe(false);
-    const quaternionTransform = {
-      translation: { x: 0, y: 0, z: 0 },
-      rotationQuaternion: { x: 0, y: 0, z: 0, w: 1 },
-      scale: { x: 1, y: 1, z: 1 },
-    };
-    expect(operations.safeParse([{ op: "set_keys", control: "hand_r_ik_ctrl", keys: [
-      { frame: 2, transform: quaternionTransform },
-      { frame: 2, transform: quaternionTransform },
-    ] }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "set_keys", control: "hand_r_ik_ctrl", keys: [{
-      frame: 2,
-      transform: { ...quaternionTransform, rotationQuaternion: { x: 0, y: 0, z: 0, w: 2 } },
-    }] }]).success).toBe(false);
-    expect(operations.safeParse([{ op: "set_keys", control: "hand_r_ik_ctrl", keys: [{
-      frame: 2,
-      transform: { translation: { x: 0, y: 0, z: 0 }, rotationQuaternion: { x: 0, y: 0, z: 0, w: 1 } },
-    }] }]).success).toBe(false);
+
+    // The rules between fields are the handler's (#1057): the spec declares
+    // each op's fields, and the handler refuses what the fields cannot say
+    // before it samples or keys anything.
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
+    for (const refusal of [
+      "requires exactly one of frame or frames",
+      "Specify 'frame' or a non-empty 'frames' array",
+      "endFrame must be at least startFrame",
+      "Transform must specify translation, rotation/rotationDegrees, or scale",
+      "blendInFrames and blendOutFrames must be non-negative",
+      "requires target or targetReference",
+      "blends must leave at least one fully constrained frame",
+      "stabilizers must be unique and cannot include the driver control",
+      "supports at most 8 stabilizer controls",
+      "contact control-frame cells",
+      "must be normalized within",
+      "target must contain translation and optional rotationQuaternion only",
+      "must be a positive finite number",
+      "value must be a finite number",
+      "value must be a 32-bit integer",
+      "keys frames must be strictly increasing and unique",
+      "transform must contain exactly translation, rotationQuaternion and scale",
+    ]) {
+      expect(source, refusal).toContain(refusal);
+    }
     expect(animationTool.schema.rigMode.safeParse("fk").success).toBe(true);
     expect(animationTool.schema.rigMode.safeParse("asset").success).toBe(true);
     // begin_control_rig_edit refuses a third mode and names both it takes. The
@@ -473,18 +497,15 @@ describe("animation Control Rig edit workflow", () => {
       controls: [{ control: "finger_ctrl", mode: "fixed", donorFrames: [0, 12, 24] }],
     };
     expect(animationTool.schema.operations.safeParse([operation]).success).toBe(true);
-    expect(animationTool.schema.operations.safeParse([{ ...operation, baseline: { ...snapshot, currentFrame: Number.NaN } }]).success).toBe(false);
     expect(animationTool.schema.operations.safeParse([{ ...operation, accepted: { ...operation.accepted, bindingGuid: "other" } }]).success).toBe(true);
-    expect(animationTool.schema.operations.safeParse([{ ...operation, controls: [{ ...operation.controls[0], donorFrames: [12, 12] }] }]).success).toBe(false);
-    expect(animationTool.schema.operations.safeParse([{ ...operation, controls: [operation.controls[0], operation.controls[0]] }]).success).toBe(false);
 
-    const source = readFileSync(
-      new URL(
-        "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/AnimationHandlers_ControlRigSequencer.cpp",
-        import.meta.url,
-      ),
-      "utf8",
-    );
+    const source = readHandlerFile("AnimationHandlers_ControlRigSequencer.cpp");
+    // A snapshot is an object the handler reads field by field, and the
+    // rules over its contents and the donor frames are the handler's (#1057).
+    expect(animationTool.schema.operations.safeParse([{ ...operation, baseline: undefined }]).success).toBe(false);
+    expect(source).toContain("Snapshot frame identity must contain finite currentFrame and currentSubFrame values");
+    expect(source).toContain("donorFrames must be strictly increasing within");
+    expect(source).toContain("contains duplicate propagation control");
     expect(source).toContain("Baseline.ControlRigObjectId != Session.ControlRig->GetUniqueID()");
     expect(source).toContain("BaselineValue->ValueType != ExpectedValueType");
     expect(source).toContain("Snapshot selection is provenance metadata");
@@ -496,8 +517,29 @@ describe("animation Control Rig edit workflow", () => {
     const call = vi.fn().mockResolvedValue({ success: true });
     const ctx = { bridge: { call } } as unknown as ToolContext;
 
-    await animationTool.handler(ctx, {
-      action: "begin_control_rig_edit",
+    // Spec'd (#1057): begin, read, capture and apply forward the bag as sent,
+    // and the spec is the contract.
+    for (const action of ["begin_control_rig_edit", "read_control_rig_edit", "capture_control_rig_pose", "apply_control_rig_edits"] as const) {
+      expect(animationTool.actions[action].mapParams, action).toBeUndefined();
+    }
+    expect(handlerSpecs.begin_control_rig_edit.params.map((p) => p.name)).toEqual([
+      "sequencePath", "skeletalMeshPath", "sourceAnimationPath", "rigMode", "controlRigPath", "layered",
+      "startFrame", "endFrame", "displayRate", "bindingTag", "onConflict",
+    ]);
+    expect(handlerSpecs.read_control_rig_edit.params.map((p) => p.name)).toEqual([
+      "sequencePath", "bindingTag", "controlNames", "frame", "frames", "space",
+    ]);
+    expect(handlerSpecs.capture_control_rig_pose.params.map((p) => p.name)).toEqual([
+      "sequencePath", "bindingTag", "controlNames",
+    ]);
+    expect(handlerSpecs.apply_control_rig_edits.params.map((p) => p.name)).toEqual([
+      "sequencePath", "bindingTag", "operations",
+    ]);
+    expect(handlerSpecs.apply_control_rig_edits.params[2].oneOf?.variants.map((v) => v.tag)).toEqual([
+      "set", "set_keys", "offset", "contact_lock", "set_bool", "set_float", "set_int", "propagate_pose",
+    ]);
+
+    const begin = {
       sequencePath: "/Game/MCP/LS_Wave_Edit",
       skeletalMeshPath: "/Game/Characters/Mannequins/Meshes/SKM_Manny",
       sourceAnimationPath: "/Game/Characters/Mannequins/Animations/ABP_Manny/MM_Unarmed_Idle_Ready",
@@ -509,51 +551,27 @@ describe("animation Control Rig edit workflow", () => {
       displayRate: 30,
       bindingTag: "mcp.manny.wave",
       onConflict: "skip",
-      assetPath: "/Game/ShouldNotLeak",
-    });
-    expect(call).toHaveBeenLastCalledWith("begin_control_rig_edit", {
-      sequencePath: "/Game/MCP/LS_Wave_Edit",
-      skeletalMeshPath: "/Game/Characters/Mannequins/Meshes/SKM_Manny",
-      sourceAnimationPath: "/Game/Characters/Mannequins/Animations/ABP_Manny/MM_Unarmed_Idle_Ready",
-      rigMode: "asset",
-      controlRigPath: "/Game/Characters/Mannequins/Rigs/CR_Mannequin_Body",
-      layered: true,
-      startFrame: 0,
-      endFrame: 60,
-      displayRate: 30,
-      bindingTag: "mcp.manny.wave",
-      onConflict: "skip",
-    }, undefined);
+    };
+    await animationTool.handler(ctx, { action: "begin_control_rig_edit", ...begin });
+    expect(call).toHaveBeenLastCalledWith("begin_control_rig_edit", begin, undefined);
 
-    await animationTool.handler(ctx, {
-      action: "read_control_rig_edit",
+    const read = {
       sequencePath: "/Game/MCP/LS_Wave_Edit",
       bindingTag: "mcp.manny.wave",
       controlNames: ["hand_r_ctrl", "foot_l_ctrl"],
       frames: [0, 12, 30],
       space: "global",
-      sourceAnimationPath: "/Game/ShouldNotLeak",
-    });
-    expect(call).toHaveBeenLastCalledWith("read_control_rig_edit", {
-      sequencePath: "/Game/MCP/LS_Wave_Edit",
-      bindingTag: "mcp.manny.wave",
-      controlNames: ["hand_r_ctrl", "foot_l_ctrl"],
-      frames: [0, 12, 30],
-      space: "global",
-    }, undefined);
+    };
+    await animationTool.handler(ctx, { action: "read_control_rig_edit", ...read });
+    expect(call).toHaveBeenLastCalledWith("read_control_rig_edit", read, undefined);
 
-    await animationTool.handler(ctx, {
-      action: "capture_control_rig_pose",
+    const capture = {
       sequencePath: "/Game/MCP/LS_Wave_Edit",
       bindingTag: "mcp.manny.wave",
       controlNames: ["hand_r_ctrl", "foot_l_ctrl"],
-      frames: [999],
-    });
-    expect(call).toHaveBeenLastCalledWith("capture_control_rig_pose", {
-      sequencePath: "/Game/MCP/LS_Wave_Edit",
-      bindingTag: "mcp.manny.wave",
-      controlNames: ["hand_r_ctrl", "foot_l_ctrl"],
-    }, undefined);
+    };
+    await animationTool.handler(ctx, { action: "capture_control_rig_pose", ...capture });
+    expect(call).toHaveBeenLastCalledWith("capture_control_rig_pose", capture, undefined);
 
     const operations = [{
       op: "set",
@@ -571,7 +589,6 @@ describe("animation Control Rig edit workflow", () => {
       sequencePath: "/Game/MCP/LS_Wave_Edit",
       bindingTag: "mcp.manny.wave",
       operations,
-      frames: [999],
     });
     expect(call).toHaveBeenLastCalledWith("apply_control_rig_edits", {
       sequencePath: "/Game/MCP/LS_Wave_Edit",
@@ -579,6 +596,12 @@ describe("animation Control Rig edit workflow", () => {
       operations,
     }, undefined);
 
+    // Spec'd (#1057): the bag goes through as sent, and the spec is the contract.
+    expect(animationTool.actions.bake_control_rig_edit.mapParams).toBeUndefined();
+    expect(handlerSpecs.bake_control_rig_edit.params.map((p) => p.name)).toEqual([
+      "sequencePath", "bindingTag", "outputAssetPath", "frameRate", "reduceKeys", "tolerance", "createLink", "onConflict",
+    ]);
+    expect(animationTool.schema.reduceKeys.safeParse(true).success).toBe(false);
     await animationTool.handler(ctx, {
       action: "bake_control_rig_edit",
       sequencePath: "/Game/MCP/LS_Wave_Edit",
@@ -589,7 +612,6 @@ describe("animation Control Rig edit workflow", () => {
       tolerance: 0.001,
       createLink: false,
       onConflict: "error",
-      operations,
     });
     expect(call).toHaveBeenLastCalledWith("bake_control_rig_edit", {
       sequencePath: "/Game/MCP/LS_Wave_Edit",
@@ -603,7 +625,15 @@ describe("animation Control Rig edit workflow", () => {
     }, undefined);
   });
 
-  it("maps the AnimSequence-only analysis contract without leaking edit-session fields", async () => {
+  it("declares the AnimSequence-only analysis contract in its C++ spec, without edit-session fields (#1057)", async () => {
+    expect(animationTool.actions.analyze_animation.mapParams).toBeUndefined();
+    const declared = handlerSpecs.analyze_animation.params.map((p) => p.name);
+    expect(declared.sort()).toEqual([
+      "assetPath", "boneNames", "facingBones", "frames", "loop", "outputDirectory", "sampleRate", "skeletalMeshPath",
+    ]);
+    expect(declared).not.toContain("sequencePath");
+    expect(declared).not.toContain("bindingTag");
+
     const call = vi.fn().mockResolvedValue({ success: true });
     const ctx = { bridge: { call } } as unknown as ToolContext;
 
@@ -616,8 +646,6 @@ describe("animation Control Rig edit workflow", () => {
       sampleRate: 30,
       loop: true,
       outputDirectory: "manny_idle_ready",
-      sequencePath: "/Game/ShouldNotLeak",
-      bindingTag: "should-not-leak",
     });
 
     expect(call).toHaveBeenCalledWith("analyze_animation", {

@@ -20,16 +20,20 @@ import * as path from "node:path";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
-import type { EditorProcess } from "../../src/engine-observer.js";
-import type { ElicitFn, ElicitParams, ElicitResult } from "../../src/types.js";
+import type { EditorProcess } from "../../src/editor/engine-observer.js";
+import type { ElicitFn, ElicitParams, ElicitResult } from "../../src/core/types.js";
+import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
-vi.mock("../../src/engine-observer.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../src/engine-observer.js")>();
+vi.mock("../../src/editor/engine-observer.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/editor/engine-observer.js")>();
   return {
     ...actual,
     listEditorProcesses: vi.fn(async () => []),
     findInteractiveEditors: vi.fn(async () => []),
+    findProjectEditors: vi.fn(async () => []),
     findEditorByPid: vi.fn(async () => null),
+    // No crash reporter probe: it would query the real process table.
+    listCrashReporterProcesses: vi.fn(async () => []),
     readEngineState: vi.fn(async () => ({
       running: true,
       processes: [],
@@ -42,12 +46,15 @@ vi.mock("../../src/engine-observer.js", async (importOriginal) => {
   };
 });
 
-const observer = await import("../../src/engine-observer.js");
-const { stopEditor, resolveDialogMode, clientAdvertisesElicitation } = await import("../../src/editor-control.js");
-const { bridgeLockfilePath } = await import("../../src/editor-target.js");
-const { setDialogMode } = await import("../../src/user-state.js");
+const observer = await import("../../src/editor/engine-observer.js");
+const { stopEditor } = await import("../../src/editor/editor-control.js");
+const { resolveDialogMode, clientAdvertisesElicitation } = await import("../../src/editor/dialog-mode.js");
+const { bridgeLockfilePath } = await import("../../src/bridge/editor-target.js");
+const { setDialogMode } = await import("../../src/config/user-state.js");
 
 const findInteractiveEditors = vi.mocked(observer.findInteractiveEditors);
+// Stop and ownership also see headless editors; one list stands in for both here.
+vi.mocked(observer.findProjectEditors).mockImplementation((p) => findInteractiveEditors(p));
 const findEditorByPid = vi.mocked(observer.findEditorByPid);
 
 const EDITOR_PID = 4242;
@@ -271,18 +278,24 @@ describe("stop_editor never presses a button and never arms one", () => {
     bridge = await startFakeBridge((method) => {
       if (method === "list_dialogs") return NO_DIALOGS;
       if (method === "request_editor_shutdown") {
-        setTimeout(() => bridge.goQuiet(), 50);
+        setTimeout(() => {
+          bridge.goQuiet();
+          findInteractiveEditors.mockResolvedValue([]);
+        }, 50);
         return { success: true, scheduled: true, dirtyContentPackages: [], dirtyMapPackages: [] };
       }
       return { success: true };
     });
     openBridges.push(bridge);
 
-    const result = await stopEditor(makeProject(bridge.port));
+    const result = await stopEditor(makeProject(bridge.port), { confirmPollMs: 20 });
 
     expect(result.success).toBe(true);
     // The quit and nothing else: the gate decides the dialog question.
     expect(bridge.methods()).toEqual(["request_editor_shutdown"]);
+    // The editor it stopped is named, so a wrong target is visible (#1278).
+    expect(result.stopped?.project).toMatch(/\.uproject$/);
+    expect(result.message).toContain(result.stopped!.project!);
   });
 
   it("arms no dialog policy and presses nothing when a dialog is already blocking", async () => {
@@ -414,17 +427,20 @@ describe("the plugin arms no policy and invents no answer", () => {
   });
 
   it("offers no way for the module to add a policy at all", () => {
-    expect(read("Private/Handlers/DialogHandlers.h")).not.toContain("AddDefaultPolicy");
-    expect(read("Private/Handlers/DialogHandlers.cpp")).not.toContain("AddDefaultPolicy");
+    expect(readHandlerFile("DialogHandlers.h")).not.toContain("AddDefaultPolicy");
+    expect(readHandlerFile("DialogHandlers.cpp")).not.toContain("AddDefaultPolicy");
   });
 
   it("hands an unarmed dialog back to the user instead of synthesizing a reply", () => {
-    const source = read("Private/Handlers/DialogHandlers.cpp");
+    const source = readHandlerFile("DialogHandlers.cpp");
     const handler = source.slice(
-      source.indexOf("EAppReturnType::Type FDialogHandlers::HandleModalDialog(EAppMsgType::Type"),
+      source.indexOf("EAppReturnType::Type FDialogHandlers::HandleModalDialog(EAppMsgCategory"),
       source.indexOf("TSharedPtr<FJsonValue> FDialogHandlers::SetDialogPolicy"),
     );
-    expect(handler).toContain("FMessageDialog::Open(MsgType, Text, Title)");
+    // The editor's own binding shows it as a Slate modal the dialog actions can
+    // reach; unbinding first fell through to a native box nothing could (#1272).
+    expect(handler).toContain("PreviousModalMessageDialog.Execute(Category, MsgType, Text, Title)");
+    expect(handler).not.toContain("ModalMessageDialog.Unbind()");
     // The old fallback picked an answer from the message type. Every branch of
     // it returned a button nobody had chosen.
     expect(handler).not.toContain("switch (MsgType)");
@@ -432,7 +448,7 @@ describe("the plugin arms no policy and invents no answer", () => {
   });
 
   it("reports a dialog's message whole", () => {
-    const source = read("Private/Handlers/DialogHandlers.cpp");
+    const source = readHandlerFile("DialogHandlers.cpp");
     const listDialogs = source.slice(
       source.indexOf("TSharedPtr<FJsonValue> FDialogHandlers::ListDialogs"),
       source.indexOf("TSharedPtr<FJsonValue> FDialogHandlers::RespondToDialog"),
@@ -584,5 +600,61 @@ describe("a state.json that parses to something that is not a state object", () 
 
     expect(result.success).toBe(false);
     expect(typeof result.message).toBe("string");
+  });
+});
+
+/**
+ * The bridge port closes early in shutdown and the process lingers for seconds
+ * after (#1179). A stop that reported success at the port let the next launch
+ * find the old editor still holding the project.
+ */
+describe("stop_editor waits for the editor's process to exit", () => {
+  function quittingBridge(onQuit: () => void): Promise<FakeBridge> {
+    let bridge: FakeBridge;
+    const started = startFakeBridge((method) => {
+      if (method === "request_editor_shutdown") {
+        setTimeout(() => {
+          bridge.goQuiet();
+          onQuit();
+        }, 20);
+        return { success: true, scheduled: true, dirtyContentPackages: [], dirtyMapPackages: [] };
+      }
+      return { success: true };
+    });
+    return started.then((b) => {
+      bridge = b;
+      openBridges.push(b);
+      return b;
+    });
+  }
+
+  it("reports success only once the process has left the process table", async () => {
+    let lingering = 0;
+    let exited = false;
+    const bridge = await quittingBridge(() => {
+      // Still listed for three polls after the port closes, as a real editor
+      // stays listed while it unloads its modules.
+      const listed = findInteractiveEditors.getMockImplementation();
+      findInteractiveEditors.mockImplementation(async (p) => {
+        if (lingering++ < 3) return listed ? listed(p) : [];
+        exited = true;
+        return [];
+      });
+    });
+
+    const result = await stopEditor(makeProject(bridge.port), { confirmPollMs: 10 });
+
+    expect(result.success).toBe(true);
+    expect(exited).toBe(true);
+  });
+
+  it("fails, naming the pid, when the process outlives the wait", async () => {
+    const bridge = await quittingBridge(() => {});
+
+    const result = await stopEditor(makeProject(bridge.port), { confirmPollMs: 1 });
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain(`pid ${EDITOR_PID}`);
+    expect(result.message).toContain("still running");
   });
 });

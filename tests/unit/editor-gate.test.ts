@@ -6,7 +6,7 @@ import {
   refuseUntargetedCall,
   editorAttribution,
   EDITOR_ATTRIBUTION_PREFIX,
-} from "../../src/editor-gate.js";
+} from "../../src/dispatch/editor-gate.js";
 
 const TWO = { editors: ["alpha", "beta"], activeEditor: "alpha", targetParam: "editor" };
 
@@ -31,6 +31,10 @@ describe("write gating beyond one editor", () => {
     expect(refuseUntargetedCall({ taskName: "asset.list", ...TWO })).toBeNull();
     expect(refuseUntargetedCall({ taskName: "project.get_status", ...TWO })).toBeNull();
     expect(refuseUntargetedCall({ taskName: "flow.plan", ...TWO })).toBeNull();
+  });
+
+  it("lets feedback(submit) through, which touches no editor (#1276)", () => {
+    expect(refuseUntargetedCall({ taskName: "feedback.submit", ...TWO })).toBeNull();
   });
 
   it("refuses an unclassifiable call rather than guessing it is a read", () => {

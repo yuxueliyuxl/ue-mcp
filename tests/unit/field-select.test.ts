@@ -7,8 +7,9 @@
  * editor returned nothing.
  */
 import { describe, it, expect } from "vitest";
-import { projectResult, takeFieldSelection, attachFieldReport } from "../../src/field-select.js";
-import { categoryTool, SELECT_PARAM, OMIT_PARAM, TIMEOUT_PARAM, type ToolContext } from "../../src/types.js";
+import { projectResult, takeFieldSelection, attachFieldReport } from "../../src/surface/context/field-select.js";
+import type { ToolContext } from "../../src/core/types.js";
+import { categoryTool, SELECT_PARAM, OMIT_PARAM, TIMEOUT_PARAM } from "../../src/surface/category-tool.js";
 import { ALL_TOOLS } from "../../src/tools.js";
 
 const TREE = {
@@ -127,6 +128,20 @@ describe("takeFieldSelection", () => {
     expect(rest).toEqual({ action: "go" });
   });
 
+  it("splits a comma-joined string into separate paths (#1335)", () => {
+    const { selection } = takeFieldSelection({
+      select: "components.name, components.class",
+      omit: ["world,actorLabel", "components.transform"],
+    });
+    expect(selection.select).toEqual(["components.name", "components.class"]);
+    expect(selection.omit).toEqual(["world", "actorLabel", "components.transform"]);
+    const projected = projectResult(TREE, { select: selection.select });
+    expect(projected.notFound).toEqual([]);
+    expect(projected.result).toEqual({
+      components: [{ name: "Root", class: "SceneComponent" }, { name: "Mesh", class: "SkeletalMeshComponent" }],
+    });
+  });
+
   it("strips both parameters so neither can reach a bridge call", () => {
     const { rest } = takeFieldSelection({ select: ["a"], omit: ["b"], assetPath: "/Game/X" });
     expect(rest).toEqual({ assetPath: "/Game/X" });
@@ -164,10 +179,10 @@ describe("dispatch integration", () => {
   });
 
   it("never forwards the routing parameters to the handler", async () => {
-    // `action` does reach a custom handler, which is long-standing behaviour;
-    // the three the dispatcher consumes must not.
+    // Nor does `action`: the task a live call runs is named by it, and the
+    // handler route runs the same path.
     const out = await tool.handler(ctx, { action: "echo", select: ["seen"], omit: ["nothing"], timeoutMs: 5 }) as { seen: string[] };
-    expect(out.seen).toEqual(["action"]);
+    expect(out.seen).toEqual([]);
   });
 
   it("keeps the path repair report visible through a narrow selection", async () => {

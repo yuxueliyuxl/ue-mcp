@@ -10,11 +10,14 @@
 #include "UObject/UnrealType.h"
 #include "UObject/PropertyPortFlags.h"
 #include "UObject/SoftObjectPtr.h"
+#include "Misc/PackageName.h"
 #include "MCPEngineCompat.h"
+#include "HandlerUtils.h"
 #include "GameplayTagContainer.h"
 #include "GameplayTagsManager.h"
 #include "Engine/Blueprint.h"
 #include "HandlerPropertyText.h"
+#include "HandlerClassResolve.h"
 
 // Shared recursive JSON→FProperty setter. Originally written for PCG
 // set_pcg_node_settings (#149); also used by set_component_property on
@@ -25,6 +28,111 @@
 namespace MCPJsonProperty
 {
 	inline bool SetJsonOnProperty(FProperty* Prop, void* ValueAddr, const TSharedPtr<FJsonValue>& InValue, FString& OutError);
+
+	// The object that owns the value being written, for the one write that
+	// needs it: creating an instanced subobject, which must be outered to it.
+	// Set by SetJsonOnPropertyWithOwner; null for every other caller.
+	inline UObject*& CurrentWriteOwner()
+	{
+		static thread_local UObject* Owner = nullptr;
+		return Owner;
+	}
+
+	struct FWriteOwnerScope
+	{
+		UObject* Previous;
+		explicit FWriteOwnerScope(UObject* Owner) : Previous(CurrentWriteOwner()) { CurrentWriteOwner() = Owner; }
+		~FWriteOwnerScope() { CurrentWriteOwner() = Previous; }
+	};
+
+	/** SetJsonOnProperty for a value Owner holds, so an Instanced or
+	 *  EditInlineNew property can take {instanceClass, properties}. */
+	inline bool SetJsonOnPropertyWithOwner(FProperty* Prop, void* ValueAddr, const TSharedPtr<FJsonValue>& InValue, UObject* Owner, FString& OutError)
+	{
+		FWriteOwnerScope Scope(Owner);
+		return SetJsonOnProperty(Prop, ValueAddr, InValue, OutError);
+	}
+
+	/** A struct or class member by its name, its display name (UserDefinedStruct
+	 *  members), or the Python spelling: snake_case, and a bool without its b
+	 *  prefix (display_name, in_cycle). Exact matches win. */
+	inline FProperty* FindMemberProperty(const UStruct* Struct, const FString& Name)
+	{
+		if (!Struct) return nullptr;
+		if (FProperty* Exact = Struct->FindPropertyByName(FName(*Name))) return Exact;
+		auto Fold = [](const FString& In) { return In.Replace(TEXT("_"), TEXT("")).ToLower(); };
+		const FString Wanted = Fold(Name);
+		FProperty* Loose = nullptr;
+		for (TFieldIterator<FProperty> It(Struct); It; ++It)
+		{
+			if (It->GetAuthoredName().Equals(Name, ESearchCase::IgnoreCase)) return *It;
+			if (Loose) continue;
+			const FString Authored = Fold(It->GetAuthoredName());
+			const bool bBool = It->IsA<FBoolProperty>();
+			if (Authored == Wanted || (bBool && Authored == TEXT("b") + Wanted)) Loose = *It;
+		}
+		return Loose;
+	}
+
+	// {instanceClass, properties} on an Instanced / EditInlineNew object
+	// property: a new object of that class outered to the owning object, its
+	// fields set from properties, then assigned.
+	inline bool SetInstancedSubobject(FObjectProperty* ObjProp, void* ValueAddr, const TSharedPtr<FJsonObject>& Spec, FString& OutError)
+	{
+		UClass* Base = ObjProp->PropertyClass;
+		const bool bInstanced = ObjProp->HasAnyPropertyFlags(CPF_InstancedReference | CPF_PersistentInstance)
+			|| (Base && Base->HasAnyClassFlags(CLASS_EditInlineNew));
+		if (!bInstanced)
+		{
+			OutError = FString::Printf(TEXT("'%s' is not an Instanced or EditInlineNew property; pass an object path instead of instanceClass"), *ObjProp->GetName());
+			return false;
+		}
+		UObject* Outer = CurrentWriteOwner();
+		if (!Outer)
+		{
+			OutError = FString::Printf(TEXT("'%s': this action does not know the owning object, so it cannot create an instanced subobject here"), *ObjProp->GetName());
+			return false;
+		}
+
+		const FString ClassName = Spec->GetStringField(TEXT("instanceClass"));
+		UClass* Cls = MCPResolveClassOfType(ClassName, Base ? Base : UObject::StaticClass());
+		if (!Cls)
+		{
+			OutError = FString::Printf(TEXT("instanceClass '%s' does not resolve to a subclass of %s"), *ClassName, Base ? *Base->GetName() : TEXT("Object"));
+			return false;
+		}
+		if (Cls->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+		{
+			OutError = FString::Printf(TEXT("instanceClass '%s' is abstract or deprecated"), *Cls->GetName());
+			return false;
+		}
+
+		UObject* NewObj = NewObject<UObject>(Outer, Cls, NAME_None, Outer->GetMaskedFlags(RF_PropagateToSubObjects) | RF_Transactional);
+		const TSharedPtr<FJsonObject>* Fields = nullptr;
+		if (Spec->TryGetObjectField(TEXT("properties"), Fields) && Fields)
+		{
+			FWriteOwnerScope Scope(NewObj);
+			for (const auto& Pair : (*Fields)->Values)
+			{
+				FProperty* Field = FindMemberProperty(Cls, FString(*Pair.Key));
+				FString E;
+				if (!Field)
+				{
+					E = FString::Printf(TEXT("%s has no property '%s'"), *Cls->GetName(), *Pair.Key);
+				}
+				else if (SetJsonOnProperty(Field, Field->ContainerPtrToValuePtr<void>(NewObj), Pair.Value, E))
+				{
+					continue;
+				}
+				NewObj->MarkAsGarbage();
+				OutError = FString::Printf(TEXT("%s.%s: %s"), *ObjProp->GetName(), *Pair.Key, *E);
+				return false;
+			}
+		}
+
+		ObjProp->SetObjectPropertyValue(ValueAddr, NewObj);
+		return true;
+	}
 
 	// The reference-property kinds, as one closed answer per property.
 	//
@@ -70,41 +178,21 @@ namespace MCPJsonProperty
 		return ERefKind::NotAReference;
 	}
 
-	// Resolve a class path the way a caller means it, without inventing a
-	// suffix the path did not ask for.
+	// The text that means "this reference points at nothing", in the forms the
+	// engine itself produces and reads.
 	//
-	// #489: a caller naming a Blueprint commonly passes the asset path
-	// (/Game/Foo/BP_GameMode.BP_GameMode) for a class-typed field, and the
-	// generated class is that path plus "_C".
-	// #928: the suffix used to be appended unconditionally on the soft-class
-	// path, so a native /Script/Module.ClassName reference was stored as
-	// /Script/Module.ClassName_C, which names no class at all, and the write
-	// still reported success. The suffix is now only ever used when the path
-	// as written does not name a class and the suffixed form does.
-	inline UClass* ResolveClassPath(const FString& Path)
+	// An empty soft path and a null object or class pointer all export as
+	// "None", which is what UDataTable::GetTableAsJSON writes for an unset
+	// Icon or Class cell, and FSoftObjectPath reads both "None" and "" back as
+	// the empty path. A row exported, edited and written back therefore
+	// carries "None" wherever a reference was never set. The match is
+	// case-sensitive, as it is in FSoftObjectPath: "none" is a path.
+	//
+	// Only meaningful for a property ClassifyReference answers as a
+	// reference. "None" is an ordinary value for a name or a string.
+	inline bool IsEmptyReferenceText(const FString& Text)
 	{
-		if (Path.IsEmpty()) return nullptr;
-
-		if (UClass* Direct = LoadClass<UObject>(nullptr, *Path))
-		{
-			return Direct;
-		}
-		// A native class lives at its /Script/ path and never carries "_C".
-		if (!Path.StartsWith(TEXT("/Script/")) && !Path.EndsWith(TEXT("_C")))
-		{
-			const FString WithSuffix = Path + TEXT("_C");
-			if (UClass* Generated = LoadClass<UObject>(nullptr, *WithSuffix))
-			{
-				return Generated;
-			}
-		}
-		// Last ditch: load the asset as a UBlueprint and take its generated
-		// class. Covers paths written without the .Name object suffix.
-		if (UBlueprint* BP = Cast<UBlueprint>(StaticLoadObject(UBlueprint::StaticClass(), nullptr, *Path)))
-		{
-			return BP->GeneratedClass;
-		}
-		return nullptr;
+		return Text.IsEmpty() || Text.Equals(TEXT("None"), ESearchCase::CaseSensitive);
 	}
 
 	// One (key, value) write for a TMap, in whichever JSON shape the caller
@@ -423,8 +511,15 @@ namespace MCPJsonProperty
 			{
 				for (const auto& Pair : (*SubObj)->Values)
 				{
-					FProperty* SubProp = StructProp->Struct->FindPropertyByName(FName(*Pair.Key));
-					if (!SubProp) { OutError = FString::Printf(TEXT("struct field '%s' not found"), *Pair.Key); return false; }
+					FProperty* SubProp = FindMemberProperty(StructProp->Struct, FString(*Pair.Key));
+					if (!SubProp)
+					{
+						TArray<FString> Fields;
+						for (TFieldIterator<FProperty> It(StructProp->Struct); It; ++It) Fields.Add(It->GetAuthoredName());
+						OutError = FString::Printf(TEXT("struct %s has no field '%s'. Fields: [%s]"),
+							*StructProp->Struct->GetName(), *Pair.Key, *FString::Join(Fields, TEXT(", ")));
+						return false;
+					}
 					void* SubAddr = SubProp->ContainerPtrToValuePtr<void>(ValueAddr);
 					FString E;
 					if (!SetJsonOnProperty(SubProp, SubAddr, Pair.Value, E))
@@ -433,6 +528,23 @@ namespace MCPJsonProperty
 					}
 				}
 				return true;
+			}
+		}
+
+		// {instanceClass, properties} creates an instanced subobject (#1292).
+		if (ClassifyReference(Prop) == ERefKind::Object)
+		{
+			TSharedPtr<FJsonValue> InstValue = Value;
+			if (InstValue->Type == EJson::String && InstValue->AsString().TrimStart().StartsWith(TEXT("{")))
+			{
+				TSharedPtr<FJsonValue> Reparsed;
+				const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(InstValue->AsString());
+				if (FJsonSerializer::Deserialize(Reader, Reparsed) && Reparsed.IsValid()) InstValue = Reparsed;
+			}
+			const TSharedPtr<FJsonObject>* InstSpec = nullptr;
+			if (InstValue->TryGetObject(InstSpec) && InstSpec && (*InstSpec)->HasField(TEXT("instanceClass")))
+			{
+				return SetInstancedSubobject(CastFieldChecked<FObjectProperty>(Prop), ValueAddr, *InstSpec, OutError);
 			}
 		}
 
@@ -447,11 +559,28 @@ namespace MCPJsonProperty
 		case ERefKind::Class:
 		{
 			FString Path;
-			if (Value->TryGetString(Path) && !Path.IsEmpty())
+			if (Value->TryGetString(Path))
 			{
-				UClass* Loaded = ResolveClassPath(Path);
-				if (!Loaded) { OutError = FString::Printf(TEXT("class not found: %s"), *Path); return false; }
-				CastFieldChecked<FClassProperty>(Prop)->SetObjectPropertyValue(ValueAddr, Loaded);
+				// The "None" an exported row carries for a null pointer used to
+				// be looked up as a class called None and refused, although the
+				// engine's own importer reads it as null. Both empty spellings
+				// clear, as JSON null does (#420).
+				if (IsEmptyReferenceText(Path))
+				{
+					CastFieldChecked<FClassProperty>(Prop)->SetObjectPropertyValue(ValueAddr, nullptr);
+					return true;
+				}
+				FClassProperty* ClassProp = CastFieldChecked<FClassProperty>(Prop);
+				UClass* Loaded = MCPResolveClassOfType(Path, ClassProp->MetaClass);
+				if (!Loaded)
+				{
+					UClass* Other = ClassProp->MetaClass ? MCPResolveClass(Path) : nullptr;
+					OutError = Other
+						? FString::Printf(TEXT("class %s does not derive from %s"), *Other->GetPathName(), *ClassProp->MetaClass->GetName())
+						: FString::Printf(TEXT("class not found: %s"), *Path);
+					return false;
+				}
+				ClassProp->SetObjectPropertyValue(ValueAddr, Loaded);
 				return true;
 			}
 			break;
@@ -459,10 +588,25 @@ namespace MCPJsonProperty
 		case ERefKind::Object:
 		{
 			FString Path;
-			if (Value->TryGetString(Path) && !Path.IsEmpty())
+			if (Value->TryGetString(Path))
 			{
 				FObjectProperty* ObjProp = CastFieldChecked<FObjectProperty>(Prop);
-				UObject* Loaded = StaticLoadObject(ObjProp->PropertyClass, nullptr, *Path);
+				// Same as the class case: "None" is null, not an asset name.
+				if (IsEmptyReferenceText(Path))
+				{
+					ObjProp->SetObjectPropertyValue(ValueAddr, nullptr);
+					return true;
+				}
+				// The shared resolver answers every asset path form; a subobject
+				// or /Script path it does not cover falls through to the engine load.
+				UObject* Loaded = MCPLoadAssetObject(Path);
+				if (Loaded && !Loaded->IsA(ObjProp->PropertyClass))
+				{
+					OutError = FString::Printf(TEXT("'%s' is a %s, not a %s"),
+						*Path, *Loaded->GetClass()->GetName(), *ObjProp->PropertyClass->GetName());
+					return false;
+				}
+				if (!Loaded) Loaded = StaticLoadObject(ObjProp->PropertyClass, nullptr, *Path);
 				if (!Loaded) { OutError = FString::Printf(TEXT("asset not found: %s"), *Path); return false; }
 				ObjProp->SetObjectPropertyValue(ValueAddr, Loaded);
 				return true;
@@ -475,7 +619,10 @@ namespace MCPJsonProperty
 			if (Value->TryGetString(Path))
 			{
 				FSoftClassProperty* SoftClassProp = CastFieldChecked<FSoftClassProperty>(Prop);
-				if (Path.IsEmpty())
+				// "None" used to go through the class resolver, which tried to
+				// load a class called None (and None_C) before storing a path
+				// the engine then read as empty anyway.
+				if (IsEmptyReferenceText(Path))
 				{
 					SoftClassProp->SetPropertyValue(ValueAddr, FSoftObjectPtr());
 					return true;
@@ -487,7 +634,7 @@ namespace MCPJsonProperty
 				// stored verbatim: a soft reference to an asset that does not
 				// exist yet is legitimate, and silently rewriting it was how a
 				// native /Script/ reference got corrupted.
-				if (UClass* Resolved = ResolveClassPath(Path))
+				if (UClass* Resolved = MCPResolveClass(Path))
 				{
 					SoftClassProp->SetPropertyValue(ValueAddr, FSoftObjectPtr(FSoftObjectPath(Resolved)));
 					return true;
@@ -502,7 +649,17 @@ namespace MCPJsonProperty
 			FString Path;
 			if (Value->TryGetString(Path))
 			{
-				FSoftObjectPath PathObj(Path);
+				// The empty spellings are cleared by name rather than left to
+				// the path parser, so the stored value is the empty path on
+				// every engine version the verifier below has to agree with.
+				// A bare package path names a package, not an object, and nothing loads through it; an existing
+				// asset package is completed to Pkg.Name, the form the editor stores (#1256).
+				if (!IsEmptyReferenceText(Path) && !Path.Contains(TEXT(".")) && FPackageName::IsValidLongPackageName(Path)
+					&& (FindPackage(nullptr, *Path) || FPackageName::DoesPackageExist(Path)))
+				{
+					Path = Path + TEXT(".") + FPackageName::GetShortName(Path);
+				}
+				const FSoftObjectPath PathObj = IsEmptyReferenceText(Path) ? FSoftObjectPath() : FSoftObjectPath(Path);
 				FSoftObjectPtr Ptr(PathObj);
 				CastFieldChecked<FSoftObjectProperty>(Prop)->SetPropertyValue(ValueAddr, Ptr);
 				return true;
@@ -710,7 +867,14 @@ namespace MCPJsonProperty
 		if (Value->TryGetString(Str)) {}
 		else if (Value->Type == EJson::Number) Str = FString::SanitizeFloat(Value->AsNumber());
 		else if (Value->Type == EJson::Boolean) Str = Value->AsBool() ? TEXT("true") : TEXT("false");
-		else Str = Value->AsString();
+		else if (Value->Type == EJson::Null) Str.Reset();
+		else
+		{
+			// An array or object has no text form here; AsString would log a JSON type error and import "".
+			OutError = FString::Printf(TEXT("%s takes a %s value, not a JSON %s"), *Prop->GetName(), *Prop->GetCPPType(),
+				Value->Type == EJson::Array ? TEXT("array") : TEXT("object"));
+			return false;
+		}
 
 		return MCPPropertyText::ImportTextIntoProperty(Prop, ValueAddr, Str, nullptr, OutError);
 	}
@@ -870,7 +1034,12 @@ namespace MCPJsonProperty
 
 	/** Read the stored value back and answer whether it is what was asked for.
 	 *
-	 *  Three checks, because they fail on different things.
+	 *  Four checks, because they fail on different things.
+	 *
+	 *  A reference asked to be empty, as "", or as the "None" the engine
+	 *  exports for an unset one, must be stored empty. It is compared as
+	 *  empty or not, never as text, since the two spellings store the same
+	 *  thing (see IsEmptyReferenceText).
 	 *
 	 *  A soft reference is never resolved at write time, so its stored text is
 	 *  whatever the setter chose to write. Comparing that text against the
@@ -905,8 +1074,31 @@ namespace MCPJsonProperty
 		FString RequestedPath;
 		const bool bRequestedPath = Requested->TryGetString(RequestedPath) && !RequestedPath.IsEmpty();
 		const ERefKind Kind = ClassifyReference(Prop);
+		const bool bSoftRef = Kind == ERefKind::SoftClass || Kind == ERefKind::SoftObject;
+		const bool bHardRef = Kind == ERefKind::Class || Kind == ERefKind::Object;
 
-		if (bRequestedPath && (Kind == ERefKind::SoftClass || Kind == ERefKind::SoftObject))
+		// An empty reference, asked for in any spelling the engine writes for
+		// one, is satisfied by an empty stored reference and by nothing else.
+		// The path comparison below used to see "None" against the empty path
+		// the setter correctly stored for it and report a mismatch, so a row
+		// exported with GetTableAsJSON could not be written back unchanged.
+		FString RequestedText;
+		if ((bSoftRef || bHardRef) && Requested->Type == EJson::String &&
+			Requested->TryGetString(RequestedText) && IsEmptyReferenceText(RequestedText))
+		{
+			const bool bStoredEmpty = bSoftRef
+				? CastFieldChecked<FSoftObjectProperty>(Prop)->GetPropertyValue(ValueAddr).ToString().IsEmpty()
+				: CastFieldChecked<FObjectProperty>(Prop)->GetObjectPropertyValue(ValueAddr) == nullptr;
+			if (!bStoredEmpty)
+			{
+				OutDetail = FString::Printf(
+					TEXT("requested '%s' (an empty reference), stored '%s'"), *RequestedText, *StoredText);
+				return false;
+			}
+			return true;
+		}
+
+		if (bRequestedPath && bSoftRef)
 		{
 			const FString Stored = CastFieldChecked<FSoftObjectProperty>(Prop)->GetPropertyValue(ValueAddr).ToString();
 			if (!NormalizeAssetPathForCompare(Stored).Equals(
@@ -918,7 +1110,7 @@ namespace MCPJsonProperty
 			return true;
 		}
 
-		if (bRequestedPath && (Kind == ERefKind::Class || Kind == ERefKind::Object))
+		if (bRequestedPath && bHardRef)
 		{
 			if (CastFieldChecked<FObjectProperty>(Prop)->GetObjectPropertyValue(ValueAddr) == nullptr)
 			{
@@ -953,49 +1145,417 @@ namespace MCPJsonProperty
 		return true;
 	}
 
-	// Resolve a dotted property path that may index arrays ("Traits[2]") and
-	// follow object references (instanced subobjects), e.g.
+	// One segment of a property path: a property name, optionally followed by
+	// one selector, either a numeric index ("Traits[2]") or a key
+	// ("WeaponProfiles[WeaponId=SGK_Stone_Axe]").
+	struct FPropertyPathSegment
+	{
+		FString Name;
+		bool bHasIndex = false;
+		int32 Index = INDEX_NONE;
+		bool bHasKey = false;
+		FString KeyField;
+		FString KeyValue;
+	};
+
+	// What ResolveDottedPath worked out beyond the leaf, for callers that ask.
+	struct FResolvedPathInfo
+	{
+		// The path with every [Field=Value] selector replaced by the index it
+		// matched, e.g. "WeaponProfiles[12].Presentation.Scale3D".
+		FString IndexedPath;
+		// True when at least one segment was addressed by key.
+		bool bUsedKeySelector = false;
+	};
+
+	// Split a property path on '.', except inside [...] and inside a quoted key
+	// value, so "Rows[Id=\"a.b\"].Value" is two segments rather than three.
+	// Empty segments are dropped, as ParseIntoArray did before selectors
+	// existed.
+	inline bool SplitPropertyPath(const FString& Path, TArray<FString>& OutParts, FString& OutError)
+	{
+		OutParts.Reset();
+		FString Current;
+		int32 BracketDepth = 0;
+		bool bInQuote = false;
+		for (int32 i = 0; i < Path.Len(); ++i)
+		{
+			const TCHAR Ch = Path[i];
+			if (bInQuote)
+			{
+				Current.AppendChar(Ch);
+				if (Ch == TEXT('\\') && i + 1 < Path.Len()) { Current.AppendChar(Path[++i]); continue; }
+				if (Ch == TEXT('"')) bInQuote = false;
+				continue;
+			}
+			if (Ch == TEXT('"') && BracketDepth > 0) bInQuote = true;
+			else if (Ch == TEXT('[')) ++BracketDepth;
+			else if (Ch == TEXT(']')) --BracketDepth;
+			else if (Ch == TEXT('.') && BracketDepth == 0)
+			{
+				if (!Current.IsEmpty()) OutParts.Add(Current);
+				Current.Reset();
+				continue;
+			}
+			if (BracketDepth < 0)
+			{
+				OutError = FString::Printf(TEXT("unmatched ']' in property path '%s'"), *Path);
+				return false;
+			}
+			Current.AppendChar(Ch);
+		}
+		if (bInQuote || BracketDepth != 0)
+		{
+			OutError = FString::Printf(TEXT("unterminated %s in property path '%s'"),
+				bInQuote ? TEXT("quoted key value") : TEXT("'['"), *Path);
+			return false;
+		}
+		if (!Current.IsEmpty()) OutParts.Add(Current);
+		return true;
+	}
+
+	// Parse one segment produced by SplitPropertyPath. The selector body is a
+	// number (an index) or Field=Value (a key). The value may be wrapped in
+	// double quotes, which is how a value holding ']' or leading spaces is
+	// written; \" and \\ escape inside the quotes.
+	inline bool ParsePropertyPathSegment(const FString& Token, FPropertyPathSegment& Out, FString& OutError)
+	{
+		Out = FPropertyPathSegment();
+		int32 OpenPos = INDEX_NONE;
+		if (!Token.FindChar(TEXT('['), OpenPos))
+		{
+			Out.Name = Token;
+			return true;
+		}
+		Out.Name = Token.Left(OpenPos);
+		if (Out.Name.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("'%s' has a selector but no property name before it"), *Token);
+			return false;
+		}
+		if (!Token.EndsWith(TEXT("]")))
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' has text after its closing ']'. One selector per segment: Name[index] or Name[Field=Value]"), *Token);
+			return false;
+		}
+		const FString Body = Token.Mid(OpenPos + 1, Token.Len() - OpenPos - 2).TrimStartAndEnd();
+
+		// A key: the first '=' separates field from value.
+		int32 EqPos = INDEX_NONE;
+		if (Body.FindChar(TEXT('='), EqPos))
+		{
+			Out.bHasKey = true;
+			Out.KeyField = Body.Left(EqPos).TrimStartAndEnd();
+			FString Value = Body.Mid(EqPos + 1).TrimStartAndEnd();
+			if (Out.KeyField.IsEmpty())
+			{
+				OutError = FString::Printf(TEXT("'%s' has no key field before '='. Write Name[Field=Value]"), *Token);
+				return false;
+			}
+			if (Value.Len() >= 2 && Value.StartsWith(TEXT("\"")) && Value.EndsWith(TEXT("\"")))
+			{
+				FString Unquoted;
+				for (int32 i = 1; i < Value.Len() - 1; ++i)
+				{
+					if (Value[i] == TEXT('\\') && i + 1 < Value.Len() - 1) ++i;
+					Unquoted.AppendChar(Value[i]);
+				}
+				Value = Unquoted;
+			}
+			Out.KeyValue = Value;
+			return true;
+		}
+
+		// An index. Anything else used to go through Atoi and land on element 0.
+		bool bNumeric = !Body.IsEmpty();
+		for (int32 i = 0; i < Body.Len() && bNumeric; ++i)
+		{
+			bNumeric = FChar::IsDigit(Body[i]) || (i == 0 && Body[i] == TEXT('-') && Body.Len() > 1);
+		}
+		if (!bNumeric)
+		{
+			OutError = FString::Printf(
+				TEXT("'[%s]' on '%s' is neither an index nor a key. Write %s[2] for an index or %s[Field=Value] for the one element whose Field equals Value"),
+				*Body, *Out.Name, *Out.Name, *Out.Name);
+			return false;
+		}
+		Out.bHasIndex = true;
+		Out.Index = FCString::Atoi(*Body);
+		return true;
+	}
+
+	// The text a key selector compares against, for the field types that can
+	// act as a key: name, string, text (its display string), enum (short
+	// enumerator name), integer, bool ("true"/"false") and gameplay tag (the tag
+	// name). Floats are left out on purpose: an exact float match is not a key.
+	// Returns false for any other type.
+	inline bool PropertyKeyText(const FProperty* Prop, const void* Addr, FString& Out)
+	{
+		if (const FNameProperty* NameProp = CastField<FNameProperty>(Prop)) { Out = NameProp->GetPropertyValue(Addr).ToString(); return true; }
+		if (const FStrProperty* StrProp = CastField<FStrProperty>(Prop)) { Out = StrProp->GetPropertyValue(Addr); return true; }
+		if (const FTextProperty* TextProp = CastField<FTextProperty>(Prop)) { Out = TextProp->GetPropertyValue(Addr).ToString(); return true; }
+		if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop)) { Out = BoolProp->GetPropertyValue(Addr) ? TEXT("true") : TEXT("false"); return true; }
+		if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+		{
+			const int64 Value = EnumProp->GetUnderlyingProperty()->GetSignedIntPropertyValue(Addr);
+			Out = EnumProp->GetEnum() ? EnumProp->GetEnum()->GetNameStringByValue(Value) : FString::Printf(TEXT("%lld"), Value);
+			return true;
+		}
+		if (const FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+		{
+			const uint8 Value = ByteProp->GetPropertyValue(Addr);
+			Out = ByteProp->Enum ? ByteProp->Enum->GetNameStringByValue(Value) : FString::FromInt(Value);
+			return true;
+		}
+		if (const FNumericProperty* NumProp = CastField<FNumericProperty>(Prop))
+		{
+			if (!NumProp->IsInteger()) return false;
+			Out.Reset();
+			NumProp->ExportTextItem_Direct(Out, Addr, nullptr, nullptr, PPF_None);
+			return true;
+		}
+		if (const FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+		{
+			// Derived tag structs too, as the setter accepts them (#820); the tag
+			// lives in the FGameplayTag base at offset 0.
+			if (StructProp->Struct && StructProp->Struct->IsChildOf(FGameplayTag::StaticStruct()))
+			{
+				Out = static_cast<const FGameplayTag*>(Addr)->GetTagName().ToString();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Exact, case-sensitive, except that a bool compares without case and an
+	// enum also answers to its qualified name ("EMySlot::Primary").
+	inline bool PropertyKeyMatches(const FProperty* Prop, const void* Addr, const FString& KeyText, const FString& Wanted)
+	{
+		if (Prop->IsA<FBoolProperty>()) return KeyText.Equals(Wanted, ESearchCase::IgnoreCase);
+		if (KeyText.Equals(Wanted, ESearchCase::CaseSensitive)) return true;
+		const UEnum* Enum = nullptr;
+		int64 Value = 0;
+		if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+		{
+			Enum = EnumProp->GetEnum();
+			Value = EnumProp->GetUnderlyingProperty()->GetSignedIntPropertyValue(Addr);
+		}
+		else if (const FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+		{
+			Enum = ByteProp->Enum;
+			Value = ByteProp->GetPropertyValue(Addr);
+		}
+		return Enum && Enum->GetNameByValue(Value).ToString().Equals(Wanted, ESearchCase::CaseSensitive);
+	}
+
+	// Pick the one element of a container whose key field equals the wanted
+	// value. Handles TArray and C-style fixed arrays of structs, of
+	// FInstancedStruct (the key is looked up on each element's payload) and of
+	// object references (the key is looked up on each referenced object). Zero
+	// or several matches is an error that lists the key values it saw, bounded,
+	// because the next thing a caller needs is the value it should have typed.
+	inline bool SelectElementByKey(FProperty* Prop, void* Container, void* ValueAddr,
+		const FPropertyPathSegment& Seg, const FString& DottedName,
+		int32& OutIndex, FString& OutError)
+	{
+		// Every element as (address, struct to find the key in, memory holding it).
+		struct FCandidate { void* ElementAddr; const UStruct* Struct; const void* Memory; };
+		TArray<FCandidate> Elements;
+		FProperty* ElementProp = nullptr;
+
+		if (FArrayProperty* ArrProp = CastField<FArrayProperty>(Prop))
+		{
+			ElementProp = ArrProp->Inner;
+			FScriptArrayHelper H(ArrProp, ValueAddr);
+			for (int32 i = 0; i < H.Num(); ++i) Elements.Add({ H.GetRawPtr(i), nullptr, nullptr });
+		}
+		else if (Prop->ArrayDim > 1)
+		{
+			ElementProp = Prop;
+			for (int32 i = 0; i < Prop->ArrayDim; ++i) Elements.Add({ Prop->ContainerPtrToValuePtr<void>(Container, i), nullptr, nullptr });
+		}
+		else if (CastField<FMapProperty>(Prop) || CastField<FSetProperty>(Prop))
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' is a %s. [Field=Value] selects an element of an array of structs or objects; map and set entries are not addressable by path, so read or write the whole '%s' instead (at '%s')"),
+				*Seg.Name, CastField<FMapProperty>(Prop) ? TEXT("TMap") : TEXT("TSet"), *Seg.Name, *DottedName);
+			return false;
+		}
+		else
+		{
+			OutError = FString::Printf(TEXT("'%s' is not an array but was selected by key [%s=%s] (at '%s')"),
+				*Seg.Name, *Seg.KeyField, *Seg.KeyValue, *DottedName);
+			return false;
+		}
+
+		FString ElementTypeName = ElementProp->GetCPPType();
+		if (FStructProperty* SP = CastField<FStructProperty>(ElementProp))
+		{
+			const bool bInstanced = SP->Struct == FInstancedStruct::StaticStruct();
+			for (FCandidate& E : Elements)
+			{
+				if (bInstanced)
+				{
+					const FInstancedStruct* IS = static_cast<const FInstancedStruct*>(E.ElementAddr);
+					E.Struct = IS->GetScriptStruct();
+					E.Memory = IS->GetMemory();
+				}
+				else
+				{
+					E.Struct = SP->Struct;
+					E.Memory = E.ElementAddr;
+				}
+			}
+		}
+		// FObjectProperty, not the base: descent only follows hard references,
+		// so matching a soft or weak one would select an element the rest of
+		// the path cannot enter.
+		else if (FObjectProperty* OP = CastField<FObjectProperty>(ElementProp))
+		{
+			for (FCandidate& E : Elements)
+			{
+				UObject* Obj = OP->GetObjectPropertyValue(E.ElementAddr);
+				E.Struct = Obj ? Obj->GetClass() : nullptr;
+				E.Memory = Obj;
+			}
+		}
+		else
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' holds %s elements, which have no fields to match [%s=%s] against. Select them by index instead (at '%s')"),
+				*Seg.Name, *ElementTypeName, *Seg.KeyField, *Seg.KeyValue, *DottedName);
+			return false;
+		}
+
+		constexpr int32 MaxListed = 20;
+		TArray<int32> Matches;
+		TArray<FString> SeenKeys;
+		int32 KeyedCount = 0;
+		FString CaseOnlyNearMiss;
+		for (int32 i = 0; i < Elements.Num(); ++i)
+		{
+			const FCandidate& E = Elements[i];
+			if (!E.Struct || !E.Memory) continue;
+			FProperty* KeyProp = E.Struct->FindPropertyByName(FName(*Seg.KeyField));
+			if (!KeyProp) continue;
+			const void* KeyAddr = KeyProp->ContainerPtrToValuePtr<void>(E.Memory);
+			FString KeyText;
+			if (!PropertyKeyText(KeyProp, KeyAddr, KeyText))
+			{
+				OutError = FString::Printf(
+					TEXT("'%s' on %s elements is a %s, which cannot be a key. A key field is a name, string, text, enum, integer, bool or gameplay tag directly on the element (at '%s')"),
+					*Seg.KeyField, *ElementTypeName, *KeyProp->GetCPPType(), *DottedName);
+				return false;
+			}
+			++KeyedCount;
+			if (SeenKeys.Num() < MaxListed) SeenKeys.Add(KeyText);
+			if (PropertyKeyMatches(KeyProp, KeyAddr, KeyText, Seg.KeyValue)) Matches.Add(i);
+			else if (CaseOnlyNearMiss.IsEmpty() && KeyText.Equals(Seg.KeyValue, ESearchCase::IgnoreCase)) CaseOnlyNearMiss = KeyText;
+		}
+
+		if (KeyedCount == 0)
+		{
+			// Name the fields that could have been meant, from the first element
+			// that has any.
+			TArray<FString> KeyFields;
+			for (const FCandidate& E : Elements)
+			{
+				if (!E.Struct || !E.Memory) continue;
+				for (TFieldIterator<FProperty> It(E.Struct); It && KeyFields.Num() < MaxListed; ++It)
+				{
+					FString Ignored;
+					if (PropertyKeyText(*It, It->ContainerPtrToValuePtr<void>(E.Memory), Ignored)) KeyFields.Add(It->GetName());
+				}
+				break;
+			}
+			OutError = Elements.Num() == 0
+				? FString::Printf(TEXT("'%s' is empty, so no element has %s == '%s' (at '%s')"),
+					*Seg.Name, *Seg.KeyField, *Seg.KeyValue, *DottedName)
+				: FString::Printf(TEXT("no element of '%s' (%s) has a field named '%s'. Fields usable as keys: [%s] (at '%s')"),
+					*Seg.Name, *ElementTypeName, *Seg.KeyField, *FString::Join(KeyFields, TEXT(", ")), *DottedName);
+			return false;
+		}
+
+		if (Matches.Num() == 1)
+		{
+			OutIndex = Matches[0];
+			return true;
+		}
+
+		if (Matches.Num() == 0)
+		{
+			const FString More = KeyedCount > SeenKeys.Num()
+				? FString::Printf(TEXT(", ... %d more"), KeyedCount - SeenKeys.Num()) : FString();
+			const FString NearMiss = CaseOnlyNearMiss.IsEmpty()
+				? FString()
+				: FString::Printf(TEXT(" '%s' differs only in case; keys match case-sensitively."), *CaseOnlyNearMiss);
+			OutError = FString::Printf(
+				TEXT("no element of '%s' (%d elements) has %s == '%s'.%s %s values: [%s%s] (at '%s')"),
+				*Seg.Name, Elements.Num(), *Seg.KeyField, *Seg.KeyValue, *NearMiss,
+				*Seg.KeyField, *FString::Join(SeenKeys, TEXT(", ")), *More, *DottedName);
+			return false;
+		}
+
+		TArray<FString> MatchIndices;
+		for (int32 m = 0; m < Matches.Num() && m < MaxListed; ++m) MatchIndices.Add(FString::FromInt(Matches[m]));
+		if (Matches.Num() > MaxListed) MatchIndices.Add(FString::Printf(TEXT("... %d more"), Matches.Num() - MaxListed));
+		OutError = FString::Printf(
+			TEXT("%s == '%s' matches %d elements of '%s' (indices %s), and a key must name exactly one. Address one by index, e.g. '%s[%d]' (at '%s')"),
+			*Seg.KeyField, *Seg.KeyValue, Matches.Num(), *Seg.Name, *FString::Join(MatchIndices, TEXT(", ")),
+			*Seg.Name, Matches[0], *DottedName);
+		return false;
+	}
+
+	// Resolve a dotted property path that may index arrays ("Traits[2]"),
+	// select an array element by key ("WeaponProfiles[WeaponId=SGK_Stone_Axe]")
+	// and follow object references (instanced subobjects), e.g.
 	// "Config.Traits[1].Params.RepresentationActorManagementClass" on a
 	// MassEntityConfigAsset. Descends through nested structs (in place), array
-	// elements (by index), and FObjectProperty pointers (switching the
+	// elements (by index or key), and FObjectProperty pointers (switching the
 	// container to the referenced UObject and its class). On success OutProp is
 	// the leaf property, OutValueAddr its value address, and OutOwner the
 	// UObject that ultimately owns the leaf (Root, or a followed subobject) so
 	// callers can Modify()/MarkPackageDirty the right object. (#527)
+	//
+	// A key selector resolves to an index and then behaves exactly as that
+	// index would; OutInfo, when given, reports the indexed form.
 	inline bool ResolveDottedPath(UObject* Root, const FString& DottedName,
-		FProperty*& OutProp, void*& OutValueAddr, UObject*& OutOwner, FString& OutError)
+		FProperty*& OutProp, void*& OutValueAddr, UObject*& OutOwner, FString& OutError,
+		FResolvedPathInfo* OutInfo = nullptr)
 	{
 		if (!Root) { OutError = TEXT("null root object"); return false; }
 
 		TArray<FString> Parts;
-		DottedName.ParseIntoArray(Parts, TEXT("."));
+		if (!SplitPropertyPath(DottedName, Parts, OutError)) return false;
 		if (Parts.Num() == 0) { OutError = TEXT("empty property name"); return false; }
 
 		void* Container = Root;
 		const UStruct* ContainerStruct = Root->GetClass();
 		UObject* Owner = Root;
+		TArray<FString> IndexedParts;
+		bool bUsedKeySelector = false;
 
 		for (int32 i = 0; i < Parts.Num(); ++i)
 		{
-			FString Token = Parts[i];
-			const FString PathToken = Token;
-			int32 Index = INDEX_NONE;
-			int32 BracketPos;
-			if (Token.FindChar(TEXT('['), BracketPos))
-			{
-				int32 ClosePos;
-				if (Token.FindChar(TEXT(']'), ClosePos) && ClosePos > BracketPos)
-				{
-					Index = FCString::Atoi(*Token.Mid(BracketPos + 1, ClosePos - BracketPos - 1));
-					Token = Token.Left(BracketPos);
-				}
-			}
+			FPropertyPathSegment Seg;
+			if (!ParsePropertyPathSegment(Parts[i], Seg, OutError)) return false;
+			const FString& Token = Seg.Name;
+			const FString& PathToken = Parts[i];
 
-			FProperty* Prop = ContainerStruct->FindPropertyByName(FName(*Token));
+			FProperty* Prop = FindMemberProperty(ContainerStruct, Token);
 			if (!Prop) { OutError = FString::Printf(TEXT("property '%s' not found at '%s'"), *Token, *DottedName); return false; }
 			void* ValueAddr = Prop->ContainerPtrToValuePtr<void>(Container);
 
-			if (Index != INDEX_NONE)
+			int32 Index = Seg.bHasIndex ? Seg.Index : INDEX_NONE;
+			if (Seg.bHasKey)
+			{
+				if (!SelectElementByKey(Prop, Container, ValueAddr, Seg, DottedName, Index, OutError)) return false;
+				bUsedKeySelector = true;
+			}
+			IndexedParts.Add(Seg.bHasIndex || Seg.bHasKey ? FString::Printf(TEXT("%s[%d]"), *Token, Index) : Token);
+
+			if (Seg.bHasIndex || Seg.bHasKey)
 			{
 				if (FArrayProperty* ArrProp = CastField<FArrayProperty>(Prop))
 				{
@@ -1036,6 +1596,11 @@ namespace MCPJsonProperty
 				OutProp = Prop;
 				OutValueAddr = ValueAddr;
 				OutOwner = Owner;
+				if (OutInfo)
+				{
+					OutInfo->IndexedPath = FString::Join(IndexedParts, TEXT("."));
+					OutInfo->bUsedKeySelector = bUsedKeySelector;
+				}
 				return true;
 			}
 
@@ -1086,6 +1651,6 @@ namespace MCPJsonProperty
 		void* ValueAddr = nullptr;
 		UObject* LeafOwner = nullptr;
 		if (!ResolveDottedPath(Owner, DottedName, Prop, ValueAddr, LeafOwner, OutError)) return false;
-		return SetJsonOnProperty(Prop, ValueAddr, Value, OutError);
+		return SetJsonOnPropertyWithOwner(Prop, ValueAddr, Value, LeafOwner ? LeafOwner : Owner, OutError);
 	}
 }

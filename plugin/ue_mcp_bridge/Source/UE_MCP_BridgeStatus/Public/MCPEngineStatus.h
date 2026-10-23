@@ -190,13 +190,23 @@ private:
 	/** Bind the slow-task events on whichever feedback context GWarn is now. */
 	void RebindFeedbackContextIfNeeded();
 
+	/** One feedback context the slow-task events were bound on. */
+	struct FContextBinding
+	{
+		class FFeedbackContext* Context = nullptr;
+		FDelegateHandle SlowTaskStartHandle;
+		FDelegateHandle SlowTaskFinalizeHandle;
+	};
+
 	/** Bound on UE 5.8+ only, where the heartbeat delegate exists. */
 	FDelegateHandle HeartbeatHandle;
 	FDelegateHandle ModulesChangedHandle;
-	FDelegateHandle SlowTaskStartHandle;
-	FDelegateHandle SlowTaskFinalizeHandle;
-	/** The context the two handles above belong to. GWarn is swapped during startup. */
-	class FFeedbackContext* BoundContext = nullptr;
+	/**
+	 * Contexts bound so far. A context is only dereferenced while it is GWarn:
+	 * code can install a stack-local GWarn (GatherTextFromAssets does), and a
+	 * pointer kept past its scope dangles (#1268).
+	 */
+	TArray<FContextBinding> Bindings;
 	FTSTicker::FDelegateHandle TickerHandle;
 
 	FRunnableThread* WriterThread = nullptr;

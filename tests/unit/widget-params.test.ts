@@ -9,8 +9,9 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { widgetTool } from "../../src/tools/widget.js";
-import { normalizeUnrealAssetPath } from "../../src/asset-path.js";
-import type { ToolContext } from "../../src/types.js";
+import { actionAccepts } from "../../src/surface/action-schema.js";
+import { normalizeUnrealAssetPath } from "../../src/surface/asset-path.js";
+import type { ToolContext } from "../../src/core/types.js";
 
 const ASSET = "/Game/_Project/UI/WBP_Example";
 
@@ -46,6 +47,8 @@ const ASSET_ACTIONS = [
   // They are listed here because what this list pins is that an action which
   // accepts assetPath accepts the canonical spelling and its legacy alias.
   "get_bind_widget_contract", "audit_commonui",
+  // Subtree authoring and the ownership check, each on one Widget Blueprint.
+  "build_tree", "check_structure",
 ];
 
 /**
@@ -59,6 +62,10 @@ const NON_ASSET_ACTIONS = [
   // Live Slate focus: a running PIE session, never an asset on disk.
   "get_runtime_focus_path", "set_runtime_focus",
 ];
+
+/** A widget name for the actions that take one; the rest refuse it (#1336). */
+const widgetNameIfTaken = (action: string): Record<string, string> =>
+  actionAccepts(widgetTool.actions[action])?.keys.has("widgetName") ? { widgetName: "Root" } : {};
 
 describe("widget category parameter contract", () => {
   it("classifies every action, so a new one cannot skip the contract", () => {
@@ -78,14 +85,14 @@ describe("widget category parameter contract", () => {
 
   it("every asset action accepts the canonical assetPath", async () => {
     for (const action of ASSET_ACTIONS) {
-      const params = await sent({ action, assetPath: ASSET, widgetName: "Root" });
+      const params = await sent({ action, assetPath: ASSET, ...widgetNameIfTaken(action) });
       expect(params.assetPath, `${action} dropped assetPath`).toBe(ASSET);
     }
   });
 
   it("every asset action accepts the legacy path alias", async () => {
     for (const action of ASSET_ACTIONS) {
-      const params = await sent({ action, path: ASSET, widgetName: "Root" });
+      const params = await sent({ action, path: ASSET, ...widgetNameIfTaken(action) });
       expect(params.assetPath, `${action} dropped the path alias`).toBe(ASSET);
     }
   });

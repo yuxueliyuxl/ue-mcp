@@ -14,30 +14,18 @@ describe("asset.bulk_set_properties", () => {
     expect(assetTool.schema.items.safeParse(items).success).toBe(true);
   });
 
-  it("rejects empty, oversized, and malformed batches", () => {
+  it("rejects empty and oversized batches", () => {
     expect(assetTool.schema.items.safeParse([]).success).toBe(false);
     expect(assetTool.schema.items.safeParse(
       Array.from({ length: 501 }, (_, i) => ({ assetPath: `/Game/A${i}`, properties: { Value: i } })),
     ).success).toBe(false);
-    expect(assetTool.schema.items.safeParse([{ assetPath: "/Game/A", properties: {} }]).success).toBe(false);
   });
 
-  it("routes only the bulk parameters to the native bridge", () => {
+  it("forwards its bag as sent, as its C++ spec declares (#1057)", () => {
     const action = assetTool.actions.bulk_set_properties;
     expect(action.bridge).toBe("bulk_set_asset_properties");
-    expect(action.mapParams?.({
-      action: "bulk_set_properties",
-      items: [{ assetPath: "/Game/A", properties: { Value: 3 } }],
-      save: false,
-      dryRun: true,
-      continueOnError: true,
-      unrelated: "ignored",
-    })).toEqual({
-      items: [{ assetPath: "/Game/A", properties: { Value: 3 } }],
-      save: false,
-      dryRun: true,
-      continueOnError: true,
-    });
+    expect(action.mapParams).toBeUndefined();
+    expect(action.description).toContain("Params: items, save?, dryRun?, continueOnError?");
   });
 
   it("exposes continueOnError so a partial batch is reachable", () => {

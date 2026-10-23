@@ -1,9 +1,7 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { loadConfig, deepMerge, type LoadedConfig } from "@db-lyon/flowkit";
+import { deepMerge, type LoadedConfig } from "@db-lyon/flowkit";
 import { FlowConfigSchema, type FlowConfig } from "./schema.js";
-import { readGlobalConfigDoc } from "../global-config.js";
-import type { ToolDef } from "../types.js";
+import { configLayerFiles, readConfigDoc, readGlobalConfigDoc, selectedOverlay } from "../config/ue-mcp-config.js";
+import type { ToolDef } from "../core/types.js";
 
 /**
  * Build the defaults object from tool definitions.
@@ -57,9 +55,14 @@ const M_PEDESTAL = `${PKG}/M_Pedestal`;
 function defaultFlows(): Record<string, unknown> {
   let s = 0;
   const steps: Record<string, unknown> = {};
-  const step = (task: string, options: Record<string, unknown>) => {
+  const step = (task: string, options: Record<string, unknown>): number => {
     steps[String(++s)] = { task, options };
+    return s;
   };
+  // set_expression_value addresses a node by its position in the material's
+  // expression list, and set_base_color adds a node of its own, so a literal
+  // index lands on the wrong one. Address the node add_expression created.
+  const createdIndex = (addStep: number) => `\${steps.${addStep}.expressionIndex}`;
 
   // ── 1. Create level & atmosphere ──────────────────────────────────
   step("level.create", { levelPath: `${PKG}/BeaconLevel` });
@@ -77,20 +80,20 @@ function defaultFlows(): Record<string, unknown> {
   // M_Pillar - brushed metallic blue-grey
   step("material.create", { name: "M_Pillar", packagePath: PKG });
   step("material.set_base_color", { assetPath: M_PILLAR, color: { r: 60, g: 65, b: 80 } });
-  step("material.add_expression", {
+  const pillarMetallic = step("material.add_expression", {
     materialPath: M_PILLAR, expressionType: "Constant", name: "Metallic",
   });
   step("material.set_expression_value", {
-    materialPath: M_PILLAR, expressionIndex: 0, value: 1.0,
+    materialPath: M_PILLAR, expressionIndex: createdIndex(pillarMetallic), value: 1.0,
   });
   step("material.connect_to_property", {
     materialPath: M_PILLAR, expressionName: "Metallic", property: "Metallic",
   });
-  step("material.add_expression", {
+  const pillarRoughness = step("material.add_expression", {
     materialPath: M_PILLAR, expressionType: "Constant", name: "Roughness",
   });
   step("material.set_expression_value", {
-    materialPath: M_PILLAR, expressionIndex: 1, value: 0.3,
+    materialPath: M_PILLAR, expressionIndex: createdIndex(pillarRoughness), value: 0.3,
   });
   step("material.connect_to_property", {
     materialPath: M_PILLAR, expressionName: "Roughness", property: "Roughness",
@@ -108,11 +111,11 @@ function defaultFlows(): Record<string, unknown> {
     materialPath: M_GLOW, expressionType: "VectorParameter",
     name: "GlowColor", parameterName: "GlowColor",
   });
-  step("material.add_expression", {
+  const glowStrength = step("material.add_expression", {
     materialPath: M_GLOW, expressionType: "Constant", name: "GlowStrength",
   });
   step("material.set_expression_value", {
-    materialPath: M_GLOW, expressionIndex: 1, value: 50,
+    materialPath: M_GLOW, expressionIndex: createdIndex(glowStrength), value: 50,
   });
   step("material.add_expression", {
     materialPath: M_GLOW, expressionType: "Multiply", name: "Multiply",
@@ -178,7 +181,7 @@ function defaultFlows(): Record<string, unknown> {
     actorLabel: "Sun", color: { r: 255, g: 160, b: 80 },
   });
   step("level.move_actor", {
-    actorLabel: "Sun", rotation: { pitch: -25, yaw: -135 },
+    actorLabel: "Sun", rotation: { pitch: -25, yaw: -135, roll: 0 },
   });
 
   // Colored point light at each pillar
@@ -208,7 +211,7 @@ function defaultFlows(): Record<string, unknown> {
     location: { x: 0, y: 0, z: 700 }, intensity: 300000,
   });
   step("level.move_actor", {
-    actorLabel: "OrbSpot", rotation: { pitch: -90, yaw: 0 },
+    actorLabel: "OrbSpot", rotation: { pitch: -90, yaw: 0, roll: 0 },
   });
 
   // Warm fill light from below
@@ -232,7 +235,7 @@ function defaultFlows(): Record<string, unknown> {
   // ── 5. Camera ─────────────────────────────────────────────────────
   step("editor.set_viewport", {
     location: { x: -900, y: -500, z: 400 },
-    rotation: { pitch: -15, yaw: 30 },
+    rotation: { pitch: -15, yaw: 30, roll: 0 },
   });
 
   // Neon Shrine - wraps the C++ demo handlers (demo.step / demo.cleanup /
@@ -435,17 +438,21 @@ export interface PluginContribution {
  * Layer order (lowest precedence first):
  *   built-in defaults
  *   plugin contributions
+ *   ~/.ue-mcp/config.yml (warn and ignore on read/parse errors)
  *   ue-mcp.yml
- *   ue-mcp.{env}.yml
+ *   ue-mcp.{env}.yml (UE_MCP_ENV, else the `env:` key)
  *   ue-mcp.local.yml
+ *
+ * onGlobalConfigError lets a live reader preserve an earlier valid snapshot;
+ * the default warns and ignores the optional user-global file.
  */
 export function loadFlowConfig(
   tools: ToolDef[],
   configDir?: string,
   pluginContribution?: PluginContribution,
+  onGlobalConfigError?: (file: string, error: unknown) => void,
 ): LoadedConfig<FlowConfig> {
   const dir = configDir ?? process.cwd();
-  const configPath = path.join(dir, "ue-mcp.yml");
   let defaults = buildDefaults(tools);
 
   if (pluginContribution) {
@@ -455,23 +462,19 @@ export function loadFlowConfig(
     defaults.flows = { ...baseFlows, ...(pluginContribution.flows ?? {}) };
   }
 
-  // User-global layer (~/.ue-mcp/config.yml): sits above built-in defaults and
-  // below the project file. Folding it into `defaults` gives flowkit's loader
-  // the right precedence for free - global < project < {env} < local.
-  const globalDoc = readGlobalConfigDoc();
+  // User-global layer (~/.ue-mcp/config.yml): above built-in defaults, below
+  // the project file.
+  const globalDoc = readGlobalConfigDoc(onGlobalConfigError);
   if (Object.keys(globalDoc).length > 0) {
     defaults = deepMerge(defaults, globalDoc) as Record<string, unknown>;
   }
 
-  if (!fs.existsSync(configPath)) {
-    return { config: FlowConfigSchema.parse(defaults), configDir: dir };
+  // The same files, in the same order, with the same overlay rule as the
+  // `ue-mcp:` block (config/project.ts). Any layer may be absent.
+  let merged: Record<string, unknown> = defaults;
+  for (const layer of configLayerFiles(dir, selectedOverlay(dir))) {
+    if (layer.target === "global") continue;
+    merged = deepMerge(merged, readConfigDoc(layer.file)) as Record<string, unknown>;
   }
-
-  return loadConfig({
-    filename: "ue-mcp.yml",
-    schema: FlowConfigSchema,
-    defaults,
-    envVar: "UE_MCP_ENV",
-    configDir: dir,
-  });
+  return { config: FlowConfigSchema.parse(merged), configDir: dir };
 }

@@ -57,11 +57,14 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Studio: studio.md
   - Architecture: architecture.md
   - Tool Reference: tool-reference.md
   - Control Rig Animation: control-rig-animation.md
   - Spatial Instructions: spatial-instructions.md
+  - Collection and Input Editing: collection-and-input-editing.md
   - Native Tools: native-tools.md
+  - Native Asset Pipeline: native-asset-pipeline.md
   - Handler Conventions: handler-conventions.md
   - Release Notes Style: release-notes-style.md
   - Widgets:
@@ -72,8 +75,6 @@ nav:
     - Layout Diagnostics: runtime-widget-layout-diagnostics.md
   - Flows:
     - flows.md
-    - Journal: journal.md
-    - Skill Packs: skill-packs.md
   - Plugins:
     - plugins.md
     - Registry (plugins.ue-mcp.com): https://plugins.ue-mcp.com

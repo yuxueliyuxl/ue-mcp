@@ -113,12 +113,20 @@ function recordingEnv(sandbox: string, host: string, port: number): NodeJS.Proce
   env.HOME = sandbox;
   env.USERPROFILE = sandbox;
   env.UE_MCP_HOST = host;
+  // The in-process server; tests/unit/daemon-shim.test.ts proves the daemon path advertises the same.
+  env.UE_MCP_SERVER_MODE = "in-process";
   env.UE_MCP_PORT = String(port);
   env.UE_MCP_GLOBAL_CONFIG = path.join(sandbox, "global-config.yml");
   env.UE_MCP_USER_STATE = path.join(sandbox, "state.json");
   env.UE_MCP_AUTH_DIR = path.join(sandbox, "auth");
   env.UE_MCP_DISABLE_UPDATE_CHECK = "1";
   env.UE_MCP_LOG_LEVEL = "error";
+  // The full strategy, pinned. Micro is the default since #1172, and it
+  // advertises one gateway whose schema names no action at all; full is the
+  // surface every category tool, action enum and signature line is on, so it
+  // is the one a baseline can guard. Lean and micro are projections of it,
+  // covered by tests/unit/lean-context.test.ts and the context-tax gate.
+  env.UE_MCP_CONTEXT_STRATEGY = "full";
   return env;
 }
 
@@ -386,13 +394,6 @@ export interface CaptureOptions {
   /** Bridge port the recorded server is pointed at. */
   port: number;
   host?: string;
-}
-
-/** What the startup log says about Epic enrichment, if anything. */
-function readEnrichment(log: string): { source: string | null; count: number } {
-  const match = /Epic 5\.8 toolsets \(([^)]+)\): surfaced (\d+) tools/.exec(log);
-  if (!match) return { source: null, count: 0 };
-  return { source: match[1], count: Number(match[2]) };
 }
 
 /**

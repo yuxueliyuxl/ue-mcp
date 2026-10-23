@@ -21,19 +21,22 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import * as http from "node:http";
-import { SessionRegistry, type EditorSession } from "../../src/session.js";
+import { SessionRegistry, type EditorSession } from "../../src/sessions/session.js";
 import { ALL_TOOLS } from "../../src/tools.js";
 import { assetTool } from "../../src/tools/asset.js";
 import { niagaraTool } from "../../src/tools/niagara.js";
-import { buildMicroGateway } from "../../src/lean-context.js";
+import { buildMicroGateway } from "../../src/surface/context/micro-context.js";
 import { buildFlowRegistry } from "../../src/flow/registry.js";
 import { loadFlowConfig } from "../../src/flow/loader.js";
 import { createFlowTool } from "../../src/flow/flow-tool.js";
 import { startFlowHttpServer } from "../../src/flow/http-server.js";
-import { routeEditorCall } from "../../src/editor-gate.js";
-import { cloneToolDef, injectEditorTarget, sessionContext, type ToolContext, type ToolDef } from "../../src/types.js";
-import type { EditorBridge } from "../../src/bridge.js";
+import { routeEditorCall } from "../../src/dispatch/editor-gate.js";
+import type { ToolContext, ToolDef } from "../../src/core/types.js";
+import { cloneToolDef } from "../../src/surface/category-tool.js";
+import { injectEditorTarget, sessionContext } from "../../src/surface/target-params.js";
+import type { EditorBridge } from "../../src/bridge/bridge.js";
 import { LiveServer } from "./server.js";
+import { covers } from "../helpers/covers.js";
 import {
   clearParamEcho,
   closeLiveBridges,
@@ -114,7 +117,6 @@ describe.skipIf(echoUnavailable !== null)("the client consumes the routing key, 
       const result = await server.call("asset", {
         action: "list_textures",
         directory: READ_DIRECTORY,
-        recursive: false,
         editor: LIVE,
       });
       expect(result.isError).toBe(false);
@@ -129,6 +131,8 @@ describe.skipIf(echoUnavailable !== null)("the client consumes the routing key, 
   }, 240_000);
 
   it("flows: neither the run's params nor a step's own options carry it through", async () => {
+
+    covers("flow.run.yaml");
     // The fixture flow in tests/ue_mcp/ue-mcp.yml writes `editor` into every
     // step's options by hand, which is the case the per-action bridge task,
     // the handler-backed task and the generic class_path task each have to
@@ -160,7 +164,7 @@ describe.skipIf(echoUnavailable !== null)("the client consumes the routing key, 
       action: "call",
       category: "asset",
       method: "list_textures",
-      args: { directory: READ_DIRECTORY, recursive: false, editor: LIVE },
+      args: { directory: READ_DIRECTORY, editor: LIVE },
     });
 
     const entries = await readParamEcho(echo);
@@ -191,7 +195,6 @@ describe.skipIf(echoUnavailable !== null)("the client consumes the routing key, 
     await tool.handler(ctx, {
       action: "list_textures",
       directory: READ_DIRECTORY,
-      recursive: false,
       editor: LIVE,
     });
 
@@ -201,6 +204,8 @@ describe.skipIf(echoUnavailable !== null)("the client consumes the routing key, 
   }, 120_000);
 
   it("the HTTP flow surface resolves the target instead of forwarding it", async () => {
+
+    covers("flow.http");
     const load = loadFlowConfig(ALL_TOOLS, live.project.projectDir ?? undefined);
     const registry = buildFlowRegistry(ALL_TOOLS);
     const flowTool = createFlowTool(registry, () => load.config);

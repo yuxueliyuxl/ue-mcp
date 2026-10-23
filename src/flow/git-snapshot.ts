@@ -6,12 +6,6 @@ interface CallableBridge {
   call(method: string, params: Record<string, unknown>): Promise<unknown>;
 }
 
-export interface GitSnapshotConfig {
-  enabled: boolean;
-  paths: string[];
-  snapshot_dir: string;
-}
-
 export interface Snapshot {
   treeHash: string;
   projectDir: string;
@@ -25,6 +19,7 @@ export interface Snapshot {
 function git(gitDir: string, workTree: string, args: string[], input?: string): string {
   const fullArgs = [`--git-dir=${gitDir}`, `--work-tree=${workTree}`, ...args];
   const res = execFileSync("git", fullArgs, {
+    windowsHide: true,
     input,
     encoding: "utf-8",
     stdio: input ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
@@ -36,10 +31,10 @@ function git(gitDir: string, workTree: string, args: string[], input?: string): 
 function ensureShadowRepo(gitDir: string): void {
   if (fs.existsSync(path.join(gitDir, "HEAD"))) return;
   fs.mkdirSync(path.dirname(gitDir), { recursive: true });
-  execFileSync("git", ["init", "--bare", "-q", gitDir], { stdio: "ignore" });
+  execFileSync("git", ["init", "--bare", "-q", gitDir], { windowsHide: true, stdio: "ignore" });
   // Set a permissive core.autocrlf so binary assets aren't mangled on Windows.
-  execFileSync("git", [`--git-dir=${gitDir}`, "config", "core.autocrlf", "false"], { stdio: "ignore" });
-  execFileSync("git", [`--git-dir=${gitDir}`, "config", "core.safecrlf", "false"], { stdio: "ignore" });
+  execFileSync("git", [`--git-dir=${gitDir}`, "config", "core.autocrlf", "false"], { windowsHide: true, stdio: "ignore" });
+  execFileSync("git", [`--git-dir=${gitDir}`, "config", "core.safecrlf", "false"], { windowsHide: true, stdio: "ignore" });
 }
 
 /**
@@ -140,15 +135,15 @@ export async function reloadAffectedPackages(
 export function pruneOldSnapshots(snapshotDir: string, maxAgeMs: number): void {
   if (!fs.existsSync(path.join(snapshotDir, "HEAD"))) return;
   try {
-    const refs = execFileSync("git", [`--git-dir=${snapshotDir}`, "for-each-ref", "--format=%(refname)", "refs/ue-mcp/snapshots"], { encoding: "utf-8" });
+    const refs = execFileSync("git", [`--git-dir=${snapshotDir}`, "for-each-ref", "--format=%(refname)", "refs/ue-mcp/snapshots"], { windowsHide: true, encoding: "utf-8" });
     const now = Date.now();
     for (const ref of refs.split("\n").map(s => s.trim()).filter(Boolean)) {
       const ts = Number(ref.split("/").pop());
       if (Number.isFinite(ts) && now - ts > maxAgeMs) {
-        execFileSync("git", [`--git-dir=${snapshotDir}`, "update-ref", "-d", ref], { stdio: "ignore" });
+        execFileSync("git", [`--git-dir=${snapshotDir}`, "update-ref", "-d", ref], { windowsHide: true, stdio: "ignore" });
       }
     }
-    execFileSync("git", [`--git-dir=${snapshotDir}`, "gc", "--prune=now", "--quiet"], { stdio: "ignore" });
+    execFileSync("git", [`--git-dir=${snapshotDir}`, "gc", "--prune=now", "--quiet"], { windowsHide: true, stdio: "ignore" });
   } catch {
     /* best effort */
   }

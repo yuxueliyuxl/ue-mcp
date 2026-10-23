@@ -32,20 +32,11 @@ That's it. The config is **hot-reloaded on every call** - edit the YAML and run 
 
 The response carries a `summary` line per step plus a `steps` array holding what each step answered, so an action called inside a flow returns the same data it returns when called directly.
 
-## The rest of the `flow` tool
-
-Running flows is three of the tool's seventeen actions: `run`, `plan` and `list`. The other fourteen are two surfaces that sit beside them.
-
-- **[Journal](journal.md)** - the nine `journal_*` actions, the record a run leaves behind: what was done, what it produced, and how it ended. Every `flow(action="run")` writes one automatically; open one by hand for work that is not a flow.
-- **[Skill packs](skill-packs.md)** - the five `skill_*` actions, covering the written workflows that say which calls to make in what order, including verifying that the calls they teach still exist.
-
-Neither surface reaches the editor, so both work with the editor down.
-
 ## Concepts
 
 ### Tasks
 
-A task is a named unit of work. UE-MCP ships with **<!-- count:actions -->1933+<!-- /count --> built-in tasks** across <!-- count:tools -->26<!-- /count --> categories - every action available through the MCP tools is also a flow task.
+A task is a named unit of work. UE-MCP ships with **<!-- count:actions -->2049+<!-- /count --> built-in tasks** across <!-- count:tools -->29<!-- /count --> categories - every action available through the MCP tools is also a flow task.
 
 Tasks are defined in the `tasks:` section of your config:
 
@@ -68,7 +59,7 @@ The fields:
 | `group` | No | Category for organization |
 | `options` | No | Default options passed to the task (can be overridden per-step) |
 
-You rarely need to define tasks yourself - the built-in defaults cover all <!-- count:actions -->1933+<!-- /count --> actions. You define tasks when you want to **override** or **add** custom ones.
+You rarely need to define tasks yourself - the built-in defaults cover all <!-- count:actions -->2049+<!-- /count --> actions. You define tasks when you want to **override** or **add** custom ones.
 
 ### Flows
 
@@ -351,7 +342,7 @@ steps[i].partialWriteRollback = {
 - **Armed.** The runner already ran the undo, ahead of every other inverse. `rollback.attempted` counts it, and `rollback.errors` says whether it worked.
 - **Not armed.** Nothing replayed it. Run it as the step shown, or call the bridge method named in `record.payload.method` with the rest of the payload.
 
-The same call is appended to that step's `error.message` and printed under the step in the summary, because a message survives a summary line and a journal entry where a field does not. A task cannot see `rollback_on_failure`, so the message names both outcomes and the `replayed` flag says which one happened.
+The same call is appended to that step's `error.message` and printed under the step in the summary, because a message survives a summary line where a field does not. A task cannot see `rollback_on_failure`, so the message names both outcomes and the `replayed` flag says which one happened.
 
 A step carrying `ignore_failure: true` contributes its record on the same terms. The flag says the run may walk past that failure, not that what the step half-wrote should survive a rollback. Because an ignored step does not stop the run, a LATER real failure is what arms `rollback_on_failure`, and the unwind then covers the ignored step's partial write alongside the successful steps before it.
 
@@ -362,6 +353,37 @@ The outermost flow with rollback armed is the one that invokes the inverses, inc
 Requires `@db-lyon/flowkit` 0.17.2 or newer. 0.17.1 unwound a failed child's records at both levels. Up to 0.17.0 the runner harvested an inverse only from a step that succeeded, so a failing step's record was discarded on every run and `replayed` was always `false`.
 
 Conventions for handlers - natural keys, the `onConflict: skip|update|error` option, and rollback record shape - live in [docs/handler-conventions.md](handler-conventions.md).
+
+## When the Editor Goes Away (`on_editor_loss`)
+
+An editor can crash, be closed or restart while a flow runs. Once it has dropped during a run, no further step starts until it is back (up to `editor_loss_timeout_seconds`, default 300). A step that failed while the editor dropped has an **unknown** outcome: when the editor returns, a read-only step is run again as its own verification, and any other step stays unknown. Then the flow's policy decides:
+
+```yaml
+flows:
+  bake_lighting:
+    on_editor_loss: resume           # resume (default) | rollback | fail
+    editor_loss_timeout_seconds: 600
+    steps: { ... }
+```
+
+| Policy | What happens to the step the editor dropped during |
+|---|---|
+| `resume` | The run carries on. The step is reported with `data.editorLoss.outcome: unknown`; read the state back before relying on it. |
+| `rollback` | The step fails and the run unwinds as [`rollback_on_failure`](#rollback-on-failure) does, unless the caller passed `rollback_on_failure` itself. With the [git snapshot](#git-snapshot-safety-net) on, it is restored while the editor is still away, so the editor never holds stale copies. |
+| `fail` | The step fails and the run stops. |
+
+A rollback step that hits a drop waits for the editor and runs once more. The run result carries `editorLoss`: each event with the step, its outcome, the cause (`crashed`, `closed`, `restarting`, `rebuild` or `unknown` under the daemon) and how long it waited, plus the completed steps whose results said they were unsaved when the editor went away, which a crash loses.
+
+To restart or rebuild on purpose, use the built-in tasks:
+
+```yaml
+steps:
+  1: { task: shell, options: { command: "git apply my-change.patch" } }
+  2: { task: editor.rebuild }        # stop, build, start; leaves the editor down if the build fails
+  3: { task: level.get_outliner }
+```
+
+`editor.restart` and `editor.rebuild` go through the daemon when it is serving, so the disconnect they cause is reported as `restarting` or `rebuild` rather than a crash.
 
 ## Git Snapshot Safety Net
 
@@ -393,7 +415,7 @@ ue-mcp:
     port: 7723   # default
 ```
 
-The server prints its bearer token to stderr on startup (or honors `UE_MCP_HTTP_TOKEN`). All routes require it.
+The server prints its bearer token to stderr on startup (or honors `UE_MCP_HTTP_TOKEN`). All routes require it. In the default daemon mode the project's daemon serves it, so it stays up across MCP client restarts and stops with the daemon; in process, the server does.
 
 **Subscribe** to the event stream:
 
@@ -707,7 +729,7 @@ Configuration is loaded with [`@db-lyon/flowkit`'s config loader](https://github
 
 | Layer | File | Purpose |
 |-------|------|---------|
-| 1 (base) | Built-in defaults | All <!-- count:actions -->1933+<!-- /count --> tasks, no flows |
+| 1 (base) | Built-in defaults | All <!-- count:actions -->2049+<!-- /count --> tasks, no flows |
 | 2 | `ue-mcp.yml` | Your project config |
 | 3 | `ue-mcp.{env}.yml` | Environment overlay (set `UE_MCP_ENV`) |
 | 4 | `ue-mcp.local.yml` | Local-only overrides (gitignore this) |

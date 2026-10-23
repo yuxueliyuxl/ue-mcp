@@ -4,8 +4,9 @@ import {
   prefixedActionName,
   compileSchemaFields,
   parseManifest,
-} from "../../src/plugin/manifest.js";
-import { satisfiesMinimum, compareVersions } from "../../src/plugin/version.js";
+  manifestActionNames,
+} from "../../src/extensions/manifest.js";
+import { satisfiesMinimum, compareVersions } from "../../src/extensions/version.js";
 
 describe("PluginManifestSchema", () => {
   it("accepts a minimal manifest", () => {
@@ -188,9 +189,50 @@ describe("version comparison", () => {
     expect(compareVersions("1.0.0", "1.0.0-beta")).toBe(1);
   });
 
+  it("orders prerelease identifiers per semver, numerically where numeric", () => {
+    expect(compareVersions("1.0.0-beta.10", "1.0.0-beta.9")).toBe(1);
+    expect(compareVersions("1.0.0-beta.9", "1.0.0-beta.10")).toBe(-1);
+    expect(compareVersions("1.0.0-beta", "1.0.0-beta.2")).toBe(-1);
+    expect(compareVersions("1.0.0-1", "1.0.0-alpha")).toBe(-1);
+    expect(compareVersions("1.0.0-alpha", "1.0.0-beta")).toBe(-1);
+    expect(compareVersions("1.0.0+build.5", "1.0.0")).toBe(0);
+    expect(satisfiesMinimum("1.3.10-beta.10", "1.3.10-beta.9")).toBe(true);
+  });
+
   it("satisfiesMinimum returns true for equal", () => {
     expect(satisfiesMinimum("1.0.0", "1.0.0")).toBe(true);
     expect(satisfiesMinimum("1.0.1", "1.0.0")).toBe(true);
     expect(satisfiesMinimum("1.0.0", "1.0.1")).toBe(false);
+  });
+});
+
+describe("manifestActionNames (#1316)", () => {
+  const builtIn = new Set(["level", "editor"]);
+  const handlers = { stamp_set: {}, asset_create: {} };
+
+  it("names native handlers bare in a category the plugin provisions", () => {
+    const m = PluginManifestSchema.parse({
+      actionPrefix: "vox",
+      nativeModule: { uePluginName: "Vox", minBridgeApi: 1, source: "ue", category: "voxel", handlers },
+    });
+    expect(manifestActionNames(m, builtIn)).toEqual(["voxel.stamp_set", "voxel.asset_create"]);
+  });
+
+  it("names native handlers prefixed in a built-in category", () => {
+    const m = PluginManifestSchema.parse({
+      actionPrefix: "vox",
+      nativeModule: { uePluginName: "Vox", minBridgeApi: 1, source: "ue", category: "level", handlers },
+    });
+    expect(manifestActionNames(m, builtIn)).toEqual(["level.vox_stamp_set", "level.vox_asset_create"]);
+  });
+
+  it("adds nothing for native handlers with no category, and keeps inject and provides", () => {
+    const m = PluginManifestSchema.parse({
+      actionPrefix: "vox",
+      inject: { level: { fill: { task: "t" } } },
+      provides: { voxtools: { actions: { scan: { task: "t" } } } },
+      nativeModule: { uePluginName: "Vox", minBridgeApi: 1, source: "ue", handlers },
+    });
+    expect(manifestActionNames(m, builtIn)).toEqual(["level.vox_fill", "voxtools.scan"]);
   });
 });

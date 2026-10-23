@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { editorTool } from "../../src/tools/editor.js";
-import type { ElicitFn, ToolContext } from "../../src/types.js";
-import type { UeMcpConfig } from "../../src/project.js";
+import type { ElicitFn, ToolContext } from "../../src/core/types.js";
+import type { UeMcpConfig } from "../../src/config/project.js";
 
 function makeContext(config: UeMcpConfig, elicit?: ElicitFn) {
   const call = vi.fn().mockResolvedValue({ success: true, action: "start" });
@@ -69,9 +69,7 @@ describe("editor(play_in_editor_ignore_blueprint_errors)", () => {
 
     await invoke(ctx);
 
-    expect(call).toHaveBeenCalledWith("pie_control", expect.objectContaining({
-      action: "start",
-      ignoreBlueprintErrors: true,
+    expect(call).toHaveBeenCalledWith("pie_start_ignoring_blueprint_errors", expect.objectContaining({
       authorizationSource: "user_approval",
     }));
   });
@@ -83,9 +81,7 @@ describe("editor(play_in_editor_ignore_blueprint_errors)", () => {
     await invoke(ctx);
 
     expect(elicit).not.toHaveBeenCalled();
-    expect(call).toHaveBeenCalledWith("pie_control", expect.objectContaining({
-      action: "start",
-      ignoreBlueprintErrors: true,
+    expect(call).toHaveBeenCalledWith("pie_start_ignoring_blueprint_errors", expect.objectContaining({
       authorizationSource: "config",
     }));
   });
@@ -120,14 +116,14 @@ describe("editor(play_in_editor_ignore_blueprint_errors)", () => {
     expect(call).not.toHaveBeenCalled();
   });
 
-  it("never sends the bypass flag on the plain play_in_editor action", async () => {
+  it("never sends an authorization on the plain play_in_editor action", async () => {
     const { ctx, call } = makeContext({ pie: { allowIgnoreBlueprintErrors: true } });
 
     await editorTool.handler(ctx, { action: "play_in_editor", pieAction: "start" });
 
     expect(call).toHaveBeenCalledWith(
       "pie_control",
-      expect.not.objectContaining({ ignoreBlueprintErrors: true }),
+      expect.not.objectContaining({ authorizationSource: expect.anything() }),
       undefined,
     );
   });

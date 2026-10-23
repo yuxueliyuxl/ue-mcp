@@ -68,6 +68,18 @@ export class LiveServer {
     env.UE_MCP_AUTH_DIR = path.join(sandbox, "auth");
     env.UE_MCP_DISABLE_UPDATE_CHECK = "1";
     env.UE_MCP_LOG_LEVEL = "error";
+    // The live cases address the category tools by name, which the full
+    // strategy advertises and micro, the default since #1172, does not. A
+    // case that is about another strategy says so in options.env.
+    env.UE_MCP_CONTEXT_STRATEGY = "full";
+    // In process by default; UE_MCP_LIVE_VIA_DAEMON=1 runs every case through
+    // the stdio shim and a per-sandbox daemon instead.
+    if (process.env.UE_MCP_LIVE_VIA_DAEMON === "1") {
+      env.UE_MCP_SERVER_MODE = "daemon";
+      env.UE_MCP_DAEMON_DIR = path.join(sandbox, "daemons");
+    } else {
+      env.UE_MCP_SERVER_MODE = "in-process";
+    }
     Object.assign(env, options.env ?? {});
 
     const client = new Client({ name: "ue-mcp-live-tests", version: "1.0.0" }, { capabilities: {} });
@@ -113,7 +125,9 @@ export class LiveServer {
 
   /** One `tools/call`, flattened to the text blocks and the error flag. */
   async call(name: string, args: Record<string, unknown>): Promise<LiveCallResult> {
-    const raw = await this.client.callTool({ name, arguments: args });
+    // A call that states its own timeoutMs gets it end to end; without this the client cut it off at the SDK's 60s.
+    const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs + 30_000 : undefined;
+    const raw = await this.client.callTool({ name, arguments: args }, undefined, timeoutMs ? { timeout: timeoutMs } : undefined);
     const blocks = (raw.content ?? []) as Array<{ type: string; text?: string }>;
     const texts = blocks.filter((b) => b.type === "text").map((b) => b.text ?? "");
     return {
@@ -126,7 +140,25 @@ export class LiveServer {
   async close(): Promise<void> {
     await this.client.close().catch(() => undefined);
     await this.transport.close().catch(() => undefined);
-    fs.rmSync(this.sandbox, { recursive: true, force: true });
+    // A daemon outlives its shim by design; the sandbox's own is stopped here.
+    const daemons = path.join(this.sandbox, "daemons");
+    for (const f of fs.existsSync(daemons) ? fs.readdirSync(daemons).filter((n) => n.endsWith(".json")) : []) {
+      try {
+        const d = JSON.parse(fs.readFileSync(path.join(daemons, f), "utf-8")) as { port: number; token: string };
+        await fetch(`http://127.0.0.1:${d.port}/v1/shutdown`, { method: "POST", headers: { authorization: `Bearer ${d.token}` } });
+      } catch {
+        // already gone
+      }
+    }
+    if (fs.existsSync(daemons)) await new Promise((r) => setTimeout(r, 500));
+    try {
+      fs.rmSync(this.sandbox, { recursive: true, force: true });
+    } catch (err) {
+      // An editor this server started inherits the sandbox as its profile, and its crash reporter
+      // keeps a log open there while it runs. That is the OS temp folder, so it is left behind.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EBUSY" && code !== "EPERM") throw err;
+    }
   }
 }
 

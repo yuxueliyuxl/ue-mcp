@@ -9,12 +9,33 @@
  *   node scripts/check-release-gates.mjs version-delta   patch-only bumps
  *   node scripts/check-release-gates.mjs count-markers   stamped counts are current
  *   node scripts/check-release-gates.mjs docs-freshness  handlers moved, docs did not
+ *   node scripts/check-release-gates.mjs context-tax     every seed within its budget
+ *   node scripts/check-release-gates.mjs behavioural-coverage
+ *                                                        every action tested, exempt or a shrinking gap
+ *   node scripts/check-release-gates.mjs integration-coverage
+ *                                                        every other surface tested, exempt or a shrinking gap
  *   node scripts/check-release-gates.mjs all             every gate above
  */
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  BUDGETS,
+  TAX_MARKER_FILES,
+  budgetProblems,
+  measureContextTax,
+  staleStamps,
+} from "./context-tax.mjs";
+import {
+  EXEMPTIONS_FILE,
+  INTEGRATION_EXEMPTIONS_FILE,
+  INTEGRATION_RATCHET_FILE,
+  RATCHET_FILE,
+  parseRatchet,
+  ratchetGrowth,
+  readRatchet,
+} from "./lib/behavioural-ratchet.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -35,27 +56,34 @@ export function parseVersion(raw) {
  * move, and the patch must not go backwards. A prerelease on the same X.Y.Z is
  * allowed, because that is how a beta is cut.
  *
+ * A major or minor move is allowed only when `signedOff` names the exact
+ * target version, which is the owner's sign-off committed in
+ * .github/version-signoff.
+ *
  * Returns null when the move is fine, or a sentence saying what is wrong.
  */
-export function versionDeltaProblem(fromRaw, toRaw) {
+export function versionDeltaProblem(fromRaw, toRaw, signedOff = []) {
   const from = parseVersion(fromRaw);
   const to = parseVersion(toRaw);
   if (!to) return `'${toRaw}' is not a version this project can publish.`;
   if (!from) return null; // Nothing to compare against, so nothing to refuse.
   if (from.raw === to.raw) return null;
 
+  const forward = to.major > from.major || (to.major === from.major && to.minor > from.minor);
+  if (forward && signedOff.includes(to.raw)) return null;
+
   if (to.major !== from.major) {
     return (
       `Version went from ${from.raw} to ${to.raw}, which moves the MAJOR. `
       + "Bumps in this repo are patch-only unless the owner says otherwise, so this needs "
-      + "their sign-off rather than a merge."
+      + "their sign-off: the exact version on its own line in .github/version-signoff."
     );
   }
   if (to.minor !== from.minor) {
     return (
       `Version went from ${from.raw} to ${to.raw}, which moves the MINOR. `
       + "Bumps in this repo are patch-only unless the owner says otherwise, so this needs "
-      + "their sign-off rather than a merge."
+      + "their sign-off: the exact version on its own line in .github/version-signoff."
     );
   }
   if (to.patch < from.patch) {
@@ -141,6 +169,16 @@ function versionAt(ref) {
   }
 }
 
+/** Versions the owner signed off on for a major or minor move, one per line. */
+function readSignoff() {
+  try {
+    return fs.readFileSync(path.join(REPO, ".github", "version-signoff"), "utf8")
+      .split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
 function checkVersionDelta() {
   const here = JSON.parse(fs.readFileSync(path.join(REPO, "package.json"), "utf8")).version;
   const base = baselineRef();
@@ -152,7 +190,7 @@ function checkVersionDelta() {
     console.error("    On a pull request this means the checkout had no history: set fetch-depth: 0.");
     return 1;
   }
-  const problem = versionDeltaProblem(there, here);
+  const problem = versionDeltaProblem(there, here, readSignoff());
   if (problem) {
     console.error(`version-delta   - ${problem}`);
     return 1;
@@ -210,9 +248,30 @@ export function docsFreshnessProblem(changedFiles) {
   return (
     "Handler or tool sources changed and nothing under docs/ did. The published docs are "
     + "the thing users read; a surface change that does not reach them is the stale-docs "
-    + "complaint that keeps coming back. Update docs/, or say in the PR why this change is "
-    + "invisible to a reader."
+    + "complaint that keeps coming back. Update docs/, or add a line to the PR body: "
+    + "'Docs: not needed - <why a reader cannot see this change>'."
   );
+}
+
+/**
+ * A PR can state that its change never reaches a reader, as a line in its body:
+ * `Docs: not needed - <reason>`. The reason is required and printed, so the
+ * exemption is on the record rather than silent.
+ */
+export function docsExemptionReason(prBody) {
+  if (typeof prBody !== "string") return null;
+  const match = prBody.match(/^\s*Docs:\s*not needed\s*-\s*(\S.*)$/im);
+  return match ? match[1].trim() : null;
+}
+
+function prBodyFromEvent() {
+  const file = process.env.GITHUB_EVENT_PATH;
+  if (!file || !fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"))?.pull_request?.body ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function checkDocsFreshness() {
@@ -229,6 +288,11 @@ function checkDocsFreshness() {
     return 0;
   }
   const problem = docsFreshnessProblem(changed);
+  const exemption = problem ? docsExemptionReason(prBodyFromEvent()) : null;
+  if (exemption) {
+    console.log(`docs-freshness  - exempted by the PR: ${exemption}`);
+    return 0;
+  }
   if (problem) {
     console.error(`docs-freshness  - ${problem}`);
     return 1;
@@ -237,13 +301,146 @@ function checkDocsFreshness() {
   return 0;
 }
 
+/**
+ * The context a client pays before its first call (#1172). The docs quoted
+ * 45k/23k/1k for a surface that had grown to 270k/105k/2k, because nothing
+ * measured it. This measures every seed and the two discovery answers micro
+ * relies on, fails when one is over its budget, and fails when a number
+ * stamped in the docs has drifted more than the tolerance from the
+ * measurement.
+ */
+async function checkContextTax() {
+  let rows;
+  try {
+    rows = await measureContextTax();
+  } catch (e) {
+    console.error(`context-tax     - could not measure: ${e.message}`);
+    return 1;
+  }
+  const over = budgetProblems(rows);
+  const stale = TAX_MARKER_FILES.flatMap((rel) => {
+    const file = path.join(REPO, rel);
+    return fs.existsSync(file) ? staleStamps(fs.readFileSync(file, "utf8"), rows, rel) : [];
+  });
+  if (over.length > 0) {
+    console.error(
+      "context-tax     - over budget:\n" + over.map((l) => `      ${l}`).join("\n")
+        + "\n    The seed is what every client pays before its first call. Shrink it, or raise the budget in scripts/context-tax.mjs with the owner's sign-off.",
+    );
+  }
+  if (stale.length > 0) {
+    console.error(
+      "context-tax     - stamped numbers are stale:\n" + stale.map((l) => `      ${l}`).join("\n")
+        + "\n    Run `node scripts/context-tax.mjs --stamp` and commit what it changes.",
+    );
+  }
+  if (over.length > 0 || stale.length > 0) return 1;
+  const summary = Object.keys(BUDGETS).map((k) => `${k} ${rows[k].tokens}/${BUDGETS[k]}`).join(", ");
+  console.log(`context-tax     - within budget (${summary})`);
+  return 0;
+}
+
+/**
+ * The grandfathered behavioural-coverage gaps may only shrink (#1223). Null
+ * when the head list adds nothing to the baseline's, or a sentence naming
+ * every entry it added. A baseline with no list yet is the commit that
+ * introduces it, which adds nothing.
+ */
+export function ratchetGrowthProblem(
+  baselineText,
+  headGaps,
+  files = { ratchet: RATCHET_FILE, exemptions: EXEMPTIONS_FILE, subject: "action", test: "a behavioural test" },
+) {
+  if (baselineText === null) return null;
+  const added = ratchetGrowth(parseRatchet(baselineText, files.ratchet), headGaps);
+  if (added.length === 0) return null;
+  return (
+    `${files.ratchet} grew by ${added.length}: ${added.join(", ")}. The gap list only shrinks. ` +
+    `Give each ${files.subject} ${files.test}, or a reasoned exemption in ${files.exemptions}.`
+  );
+}
+
+/** The integration ratchet's files, for ratchetGrowthProblem. */
+export const INTEGRATION_RATCHET = {
+  ratchet: INTEGRATION_RATCHET_FILE,
+  exemptions: INTEGRATION_EXEMPTIONS_FILE,
+  subject: "surface",
+  test: "an integration test",
+};
+
+function checkCoverageInventory({ label, script, prefix, ratchetFile, files }) {
+  let bad = 0;
+  try {
+    const out = execFileSync("npx", ["tsx", script, "--check"], {
+      cwd: REPO,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: process.platform === "win32",
+    });
+    const line = out.split("\n").find((l) => l.startsWith(`${prefix}:`));
+    console.log(`${label} - ${(line ?? "inventory current").slice(line?.startsWith(`${prefix}:`) ? prefix.length + 1 : 0).trim()}`);
+  } catch (e) {
+    const detail = String(e.stderr ?? e.message).split("\n").filter((l) => l.trim()).map((l) => `      ${l}`).join("\n");
+    console.error(`${label} - the ${prefix} inventory does not pass:\n${detail}`);
+    bad = 1;
+  }
+
+  const base = baselineRef();
+  if (base === null) {
+    console.error(`${label} - no baseline commit, so the gap list's growth is unchecked.`);
+    return 1;
+  }
+  let baselineText = null;
+  try {
+    baselineText = git("show", `${base}:${ratchetFile}`);
+  } catch {
+    baselineText = null;
+  }
+  const problem = ratchetGrowthProblem(baselineText, readRatchet(REPO, ratchetFile), files);
+  if (problem) {
+    console.error(`${label} - ${problem}`);
+    return 1;
+  }
+  if (bad === 0) console.log(`${label} - gap list did not grow`);
+  return bad;
+}
+
+/**
+ * Every registered bridge action has a behavioural test, a reasoned exemption
+ * or a grandfathered gap row, the inventory is current, and the gap list did
+ * not grow against the baseline.
+ */
+function checkBehaviouralCoverage() {
+  return checkCoverageInventory({
+    label: "coverage       ",
+    script: "scripts/behavioural-coverage.ts",
+    prefix: "behavioural-coverage",
+    ratchetFile: RATCHET_FILE,
+    files: undefined,
+  });
+}
+
+/** The same three rules for every user-facing surface that is not a bridge action. */
+function checkIntegrationCoverage() {
+  return checkCoverageInventory({
+    label: "integration    ",
+    script: "scripts/integration-coverage.ts",
+    prefix: "integration-coverage",
+    ratchetFile: INTEGRATION_RATCHET_FILE,
+    files: INTEGRATION_RATCHET,
+  });
+}
+
 const GATES = {
   "version-delta": checkVersionDelta,
   "count-markers": checkCountMarkers,
   "docs-freshness": checkDocsFreshness,
+  "context-tax": checkContextTax,
+  "behavioural-coverage": checkBehaviouralCoverage,
+  "integration-coverage": checkIntegrationCoverage,
 };
 
-function main(argv) {
+async function main(argv) {
   const which = argv[0] ?? "all";
   const names = which === "all" ? Object.keys(GATES) : [which];
   let bad = 0;
@@ -253,11 +450,11 @@ function main(argv) {
       console.error(`No such gate: ${name}. Known: ${Object.keys(GATES).join(", ")}, all`);
       return 2;
     }
-    bad += gate();
+    bad += await gate();
   }
   return bad > 0 ? 1 : 0;
 }
 
 if (process.argv[1]?.endsWith("check-release-gates.mjs")) {
-  process.exit(main(process.argv.slice(2)));
+  process.exit(await main(process.argv.slice(2)));
 }

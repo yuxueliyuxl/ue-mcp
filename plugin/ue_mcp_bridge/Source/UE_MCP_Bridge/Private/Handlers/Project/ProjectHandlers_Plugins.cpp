@@ -1,0 +1,608 @@
+// Plugin enablement: read, enable and disable entries in the project's
+// `.uproject` Plugins array. A translation-unit partition of FProjectHandlers;
+// registration stays in ProjectHandlers.cpp::RegisterHandlers.
+//
+// Why this earns handlers, when the house rule is that asset(set_property) and
+// editor(set_property) already reach any UPROPERTY:
+//
+//   Plugin enablement is not a UPROPERTY and is not in an INI. It lives in the
+//   `.uproject` file, in a JSON array of FPluginReferenceDescriptor that is
+//   read once at startup. project(set_config) writes INI only, so nothing in
+//   the toolset could turn a plugin on. That made every plugin-gated capability
+//   permanently unreachable in a project where the plugin ships off - CommonUI
+//   being the case that surfaced it.
+//
+// What a caller must know, and what every result here says out loud:
+//
+//   The change is a FILE change. Modules load at editor startup and mount
+//   points are registered there too, so the plugin's classes, content and
+//   settings do not appear until the editor restarts. Nothing in this file
+//   pretends otherwise, and nothing here tries to load the modules live: a
+//   half-mounted plugin is worse than a plainly-pending one.
+//
+// The three of them are complete CRUD over one plugin reference: list what
+// exists, add or flip an entry, and either flip it back or delete it outright.
+
+#include "ProjectHandlers.h"
+#include "HandlerRegistry.h"
+#include "HandlerUtils.h"
+#include "HandlerPagination.h"
+
+#include "Interfaces/IPluginManager.h"
+#include "Interfaces/IProjectManager.h"
+#include "PluginDescriptor.h"
+#include "PluginReferenceDescriptor.h"
+#include "ProjectDescriptor.h"
+
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
+#include "HAL/FileManager.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Policies/PrettyJsonPrintPolicy.h"
+#include "Internationalization/Text.h"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// File-local helpers.
+//
+// The module is a unity build, so two .cpp files in one blob share their
+// anonymous namespace and a duplicated helper is a redefinition (C2084). Every
+// name below is prefixed PPlug_ inside a named namespace and exists nowhere
+// else in the tree; nothing was copied out of ProjectHandlers.cpp.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace MCPProjectPlugins
+{
+
+/** The name this plugin ships under. Disabling it severs the bridge. */
+static const TCHAR* PPlug_BridgePluginName = TEXT("UE_MCP_Bridge");
+
+static const TCHAR* PPlug_TypeName(EPluginType Type)
+{
+	switch (Type)
+	{
+	case EPluginType::Engine:     return TEXT("Engine");
+	case EPluginType::Enterprise: return TEXT("Enterprise");
+	case EPluginType::Project:    return TEXT("Project");
+	case EPluginType::External:   return TEXT("External");
+	case EPluginType::Mod:        return TEXT("Mod");
+	default:                      return TEXT("Unknown");
+	}
+}
+
+static const TCHAR* PPlug_LoadedFromName(EPluginLoadedFrom From)
+{
+	return From == EPluginLoadedFrom::Engine ? TEXT("Engine") : TEXT("Project");
+}
+
+/**
+ * Resolve a plugin by name, case-insensitively, over everything discovered on
+ * disk rather than only over what is enabled. An answer of null means the name
+ * is not installed at all, which is a different problem from being off.
+ */
+static TSharedPtr<IPlugin> PPlug_Find(const FString& Name)
+{
+	for (const TSharedRef<IPlugin>& Plugin : IPluginManager::Get().GetDiscoveredPlugins())
+	{
+		if (Plugin->GetName().Equals(Name, ESearchCase::IgnoreCase)) return Plugin;
+	}
+	return nullptr;
+}
+
+/** Installed names that look like what was asked for, so a typo is one call. */
+static FString PPlug_NearestNames(const FString& Name, int32 Max = 12)
+{
+	TArray<FString> Hits;
+	for (const TSharedRef<IPlugin>& Plugin : IPluginManager::Get().GetDiscoveredPlugins())
+	{
+		const FString& Candidate = Plugin->GetName();
+		if (Candidate.Contains(Name, ESearchCase::IgnoreCase)
+			|| Name.Contains(Candidate, ESearchCase::IgnoreCase)
+			|| Plugin->GetFriendlyName().Contains(Name, ESearchCase::IgnoreCase))
+		{
+			Hits.Add(Candidate);
+			if (Hits.Num() >= Max) break;
+		}
+	}
+	Hits.Sort();
+	return Hits.Num() ? FString::Join(Hits, TEXT(", ")) : FString(TEXT("(no similar names installed)"));
+}
+
+static TSharedPtr<FJsonValue> PPlug_UnknownPluginError(const FString& Name)
+{
+	return MCPError(FString::Printf(
+		TEXT("No plugin named '%s' is installed in this engine or project, so it cannot be enabled or ")
+		TEXT("disabled. Installed names that look similar: %s. List every installed plugin with ")
+		TEXT("project(list_available_plugins), optionally filtered with `filter`."),
+		*Name, *PPlug_NearestNames(Name)));
+}
+
+/** The loaded project descriptor, or null when the editor has no project. */
+static const FProjectDescriptor* PPlug_Project()
+{
+	return IProjectManager::Get().GetCurrentProject();
+}
+
+/**
+ * The `.uproject` as it is on disk, parsed. The file is the authority: the
+ * editor's loaded descriptor is a startup copy, and writing it back reverted
+ * edits made to the file since (#1248).
+ */
+static TSharedPtr<FJsonObject> PPlug_ReadProjectFile(FString& OutError)
+{
+	const FString Path = FPaths::GetProjectFilePath();
+	FString Text;
+	if (Path.IsEmpty() || !FFileHelper::LoadFileToString(Text, *Path))
+	{
+		OutError = FString::Printf(TEXT("could not read '%s'"), *Path);
+		return nullptr;
+	}
+	TSharedPtr<FJsonObject> Root;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
+	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+	{
+		OutError = FString::Printf(TEXT("'%s' is not valid JSON"), *Path);
+		return nullptr;
+	}
+	return Root;
+}
+
+/** Index of a plugin's entry in the file's Plugins array, or INDEX_NONE. */
+static int32 PPlug_FindFileReference(const TSharedPtr<FJsonObject>& Root, const FString& Name, bool* bOutEnabled = nullptr)
+{
+	const TArray<TSharedPtr<FJsonValue>>* Plugins = nullptr;
+	if (!Root.IsValid() || !Root->TryGetArrayField(TEXT("Plugins"), Plugins) || !Plugins)
+	{
+		return INDEX_NONE;
+	}
+	for (int32 Index = 0; Index < Plugins->Num(); ++Index)
+	{
+		const TSharedPtr<FJsonObject>* Entry = nullptr;
+		FString EntryName;
+		if ((*Plugins)[Index].IsValid() && (*Plugins)[Index]->TryGetObject(Entry) && Entry
+			&& (*Entry)->TryGetStringField(TEXT("Name"), EntryName)
+			&& EntryName.Equals(Name, ESearchCase::IgnoreCase))
+		{
+			if (bOutEnabled)
+			{
+				bool bEnabled = false;
+				(*Entry)->TryGetBoolField(TEXT("Enabled"), bEnabled);
+				*bOutEnabled = bEnabled;
+			}
+			return Index;
+		}
+	}
+	return INDEX_NONE;
+}
+
+/**
+ * The `.uproject` entry for a plugin, as it stands right now.
+ *
+ * bOutPresent separates "there is an explicit entry" from "the entry says
+ * enabled", because the inverse of a write depends on which one it started
+ * in. Read from the file, falling back to the loaded descriptor only when the
+ * file cannot be read.
+ */
+static void PPlug_ReadReference(const FString& Name, bool& bOutPresent, bool& bOutEnabled, const TSharedPtr<FJsonObject>& FileRoot = nullptr)
+{
+	bOutPresent = false;
+	bOutEnabled = false;
+	FString ReadError;
+	const TSharedPtr<FJsonObject> Root = FileRoot.IsValid() ? FileRoot : PPlug_ReadProjectFile(ReadError);
+	if (Root.IsValid())
+	{
+		bOutPresent = PPlug_FindFileReference(Root, Name, &bOutEnabled) != INDEX_NONE;
+		return;
+	}
+	const FProjectDescriptor* Descriptor = PPlug_Project();
+	if (!Descriptor) return;
+	const int32 Index = Descriptor->FindPluginReferenceIndex(Name);
+	if (Index == INDEX_NONE) return;
+	bOutPresent = true;
+	bOutEnabled = Descriptor->Plugins[Index].bEnabled;
+}
+
+/** Everything a caller needs about one plugin, in one object. */
+static TSharedPtr<FJsonObject> PPlug_Describe(const TSharedRef<IPlugin>& Plugin, const TSharedPtr<FJsonObject>& FileRoot)
+{
+	const FPluginDescriptor& Descriptor = Plugin->GetDescriptor();
+
+	bool bPresent = false;
+	bool bRefEnabled = false;
+	PPlug_ReadReference(Plugin->GetName(), bPresent, bRefEnabled, FileRoot);
+
+	TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+	Obj->SetStringField(TEXT("name"), Plugin->GetName());
+	Obj->SetStringField(TEXT("friendlyName"), Plugin->GetFriendlyName());
+	Obj->SetStringField(TEXT("category"), Descriptor.Category);
+	Obj->SetStringField(TEXT("description"), Descriptor.Description);
+	Obj->SetStringField(TEXT("versionName"), Descriptor.VersionName);
+	Obj->SetStringField(TEXT("type"), PPlug_TypeName(Plugin->GetType()));
+	Obj->SetStringField(TEXT("loadedFrom"), PPlug_LoadedFromName(Plugin->GetLoadedFrom()));
+	Obj->SetStringField(TEXT("descriptorFile"), Plugin->GetDescriptorFileName());
+	// `enabled` is the state of THIS editor session, decided at startup. It does
+	// not follow a write made in this session; `projectReference` does.
+	Obj->SetBoolField(TEXT("enabled"), Plugin->IsEnabled());
+#if UE_MCP_HAS_5_5_API
+	Obj->SetBoolField(TEXT("mounted"), Plugin->IsMounted());
+#else
+	// IPlugin::IsMounted() arrived after 5.4, and nothing there answers the
+	// same question: `enabled` is close but not the same fact, and reporting it
+	// under this name would make an approximation look like a reading. The
+	// field is left out on 5.4, the way canEnableInCurrentTarget is below.
+#endif
+	Obj->SetBoolField(TEXT("enabledByDefault"), Plugin->IsEnabledByDefault(/*bAllowEnginePluginsEnabledByDefault*/ true));
+	Obj->SetBoolField(TEXT("isBeta"), Descriptor.bIsBetaVersion);
+	Obj->SetBoolField(TEXT("isExperimental"), Descriptor.bIsExperimentalVersion);
+	Obj->SetBoolField(TEXT("canContainContent"), Plugin->CanContainContent());
+	Obj->SetBoolField(TEXT("hasCode"), !Descriptor.bNoCode);
+
+	TSharedPtr<FJsonObject> Ref = MakeShared<FJsonObject>();
+	Ref->SetBoolField(TEXT("present"), bPresent);
+	Ref->SetBoolField(TEXT("enabled"), bRefEnabled);
+	Obj->SetObjectField(TEXT("projectReference"), Ref);
+
+	return Obj;
+}
+
+/** What a plugin write does to the file's Plugins array. */
+enum class EPPlugEdit : uint8
+{
+	Enable,
+	Disable,
+	Remove,
+};
+
+/**
+ * Patch the plugin's entry in the `.uproject` on disk, read-modify-write, and
+ * nothing else in the file (#1248). The loaded descriptor is then brought in
+ * line without being saved, so this session agrees with the file.
+ *
+ * Returns an error value when the write fails, naming the file and why.
+ */
+static TSharedPtr<FJsonValue> PPlug_Save(const FString& PluginName, EPPlugEdit Edit, const FString& What)
+{
+	const FString Path = FPaths::GetProjectFilePath();
+	FString ReadError;
+	const TSharedPtr<FJsonObject> Root = PPlug_ReadProjectFile(ReadError);
+	if (!Root.IsValid())
+	{
+		return MCPError(FString::Printf(
+			TEXT("%s was not applied: %s, and the .uproject is only ever patched from what is on disk."),
+			*What, *ReadError));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Plugins;
+	const TArray<TSharedPtr<FJsonValue>>* Existing = nullptr;
+	if (Root->TryGetArrayField(TEXT("Plugins"), Existing) && Existing)
+	{
+		Plugins = *Existing;
+	}
+	const int32 Index = PPlug_FindFileReference(Root, PluginName);
+	if (Edit == EPPlugEdit::Remove)
+	{
+		if (Index != INDEX_NONE)
+		{
+			Plugins.RemoveAt(Index);
+		}
+	}
+	else if (Index != INDEX_NONE)
+	{
+		// Only Enabled changes; Optional, allow lists and the rest stay as written.
+		Plugins[Index]->AsObject()->SetBoolField(TEXT("Enabled"), Edit == EPPlugEdit::Enable);
+	}
+	else
+	{
+		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+		Entry->SetStringField(TEXT("Name"), PluginName);
+		Entry->SetBoolField(TEXT("Enabled"), Edit == EPPlugEdit::Enable);
+		Plugins.Add(MakeShared<FJsonValueObject>(Entry));
+	}
+	Root->SetArrayField(TEXT("Plugins"), Plugins);
+
+	FString Text;
+	const TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
+		TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&Text);
+	if (!FJsonSerializer::Serialize(Root.ToSharedRef(), Writer) || !FFileHelper::SaveStringToFile(Text, *Path))
+	{
+		const bool bReadOnly = IFileManager::Get().IsReadOnly(*Path);
+		return MCPError(FString::Printf(
+			TEXT("%s was not applied: '%s' could not be written%s. The file is unchanged. Check it is not read-only ")
+			TEXT("or checked out elsewhere, then call the action again."),
+			*What, *Path, bReadOnly ? TEXT(" (it is read-only)") : TEXT("")));
+	}
+
+	// Keep this session's descriptor in step without saving it, so nothing the
+	// editor writes later reverts the file to its startup copy of the entry.
+	FText Ignored;
+	if (Edit == EPPlugEdit::Remove)
+	{
+		IProjectManager::Get().RemovePluginReference(PluginName, Ignored);
+	}
+	else
+	{
+		IProjectManager::Get().SetPluginEnabled(PluginName, Edit == EPPlugEdit::Enable, Ignored);
+	}
+	return nullptr;
+}
+
+} // namespace MCPProjectPlugins
+
+using namespace MCPProjectPlugins;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// list_available_plugins
+// ═════════════════════════════════════════════════════════════════════════════
+
+TSharedPtr<FJsonValue> FProjectHandlers::ListAvailablePlugins(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString Filter = OptionalString(Params, TEXT("filter"));
+	const FString Category = OptionalString(Params, TEXT("pluginCategory"));
+	const bool bEnabledOnly = OptionalBool(Params, TEXT("enabledOnly"), false);
+	// Noted before ReadPageRequest can refuse the limit, so the spec contract
+	// test sees every declared read (#1057).
+	HasParam(Params, TEXT("cursor"));
+
+	// T3: paged. This used to stop adding rows at `limit` while still counting
+	// the matches, so a caller was told there were 900 and handed 200 with no
+	// way to ask for the rest.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("list_available_plugins|filter=%s|pluginCategory=%s|enabledOnly=%d"),
+				*Filter, *Category, bEnabledOnly ? 1 : 0),
+			/*DefaultLimit*/ 200, /*MaxLimit*/ 2000, Page))
+	{
+		return Err;
+	}
+
+	TArray<TSharedRef<IPlugin>> All = IPluginManager::Get().GetDiscoveredPlugins();
+	// GetDiscoveredPlugins returns them in discovery order, which is not a
+	// contract, so they are sorted by name before paging, as they always were.
+	All.Sort([](const TSharedRef<IPlugin>& A, const TSharedRef<IPlugin>& B)
+	{
+		return A->GetName() < B->GetName();
+	});
+
+	// Parsed once for the whole listing rather than once per plugin.
+	FString ReadError;
+	const TSharedPtr<FJsonObject> FileRoot = PPlug_ReadProjectFile(ReadError);
+
+	TArray<MCPPagination::FPageRow> Rows;
+	for (const TSharedRef<IPlugin>& Plugin : All)
+	{
+		if (bEnabledOnly && !Plugin->IsEnabled()) continue;
+		if (!Filter.IsEmpty()
+			&& !Plugin->GetName().Contains(Filter, ESearchCase::IgnoreCase)
+			&& !Plugin->GetFriendlyName().Contains(Filter, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		if (!Category.IsEmpty()
+			&& !Plugin->GetDescriptor().Category.Contains(Category, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		// The plugin NAME is the page anchor: it is what enable_plugin and
+		// disable_plugin address, and it is unique across discovered plugins.
+		Rows.Add({ Plugin->GetName(), MakeShared<FJsonValueObject>(PPlug_Describe(Plugin, FileRoot)) });
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetNumberField(TEXT("matched"), Rows.Num());
+	Result->SetNumberField(TEXT("totalDiscovered"), All.Num());
+	MCPPagination::EmitPage(Page, Rows, TEXT("plugins"), Result);
+	Result->SetStringField(TEXT("note"), TEXT(
+		"`enabled` is what this editor session started with. `projectReference` is what the .uproject "
+		"says right now, so after project(enable_plugin) the two disagree until the editor restarts."));
+	return MCPResult(Result);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// enable_plugin
+// ═════════════════════════════════════════════════════════════════════════════
+
+TSharedPtr<FJsonValue> FProjectHandlers::EnablePlugin(const TSharedPtr<FJsonObject>& Params)
+{
+	FString PluginName;
+	if (auto Err = RequireString(Params, TEXT("pluginName"), PluginName)) return Err;
+
+	// ── Validate everything before touching the descriptor.
+	TSharedPtr<IPlugin> Plugin = PPlug_Find(PluginName);
+	if (!Plugin) return PPlug_UnknownPluginError(PluginName);
+
+	// Use the plugin's own spelling from here on, so the .uproject entry matches
+	// the .uplugin regardless of how the caller cased it.
+	PluginName = Plugin->GetName();
+
+	if (!PPlug_Project())
+	{
+		return MCPError(TEXT(
+			"No project descriptor is loaded, so there is no .uproject to write a plugin reference into. "
+			"This is only possible in a commandlet or a standalone process with no project."));
+	}
+
+	bool bPresent = false;
+	bool bRefEnabled = false;
+	PPlug_ReadReference(PluginName, bPresent, bRefEnabled);
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("pluginName"), PluginName);
+	Result->SetStringField(TEXT("friendlyName"), Plugin->GetFriendlyName());
+	Result->SetStringField(TEXT("descriptorFile"), Plugin->GetDescriptorFileName());
+	Result->SetBoolField(TEXT("enabledByDefault"), Plugin->IsEnabledByDefault(true));
+	Result->SetBoolField(TEXT("loadedInThisSession"), Plugin->IsEnabled());
+#if UE_MCP_HAS_5_5_API
+	Result->SetBoolField(TEXT("canEnableInCurrentTarget"),
+		IPluginManager::Get().CanEnablePluginInCurrentTarget(PluginName));
+#else
+	// IPluginManager::CanEnablePluginInCurrentTarget arrived in 5.5. Nothing on
+	// 5.4 answers the same question, and a guess reported as a fact is worse
+	// than an absent field.
+#endif
+
+	// ── Idempotency. Two shapes of "already enabled", and neither writes.
+	if (bPresent && bRefEnabled)
+	{
+		MCPSetExisted(Result);
+		Result->SetBoolField(TEXT("unchanged"), true);
+		Result->SetBoolField(TEXT("restartRequired"), !Plugin->IsEnabled());
+		Result->SetStringField(TEXT("reason"), Plugin->IsEnabled()
+			? TEXT("The .uproject already enables this plugin and the editor has it loaded.")
+			: TEXT("The .uproject already enables this plugin, but this editor session started before that "
+			       "and has not loaded it. Restart the editor with editor(restart_editor)."));
+		return MCPResult(Result);
+	}
+	if (!bPresent && Plugin->IsEnabled())
+	{
+		// On by default with no explicit entry. Writing one would change the file
+		// and change nothing else, so the honest answer is that it is already on.
+		MCPSetExisted(Result);
+		Result->SetBoolField(TEXT("unchanged"), true);
+		Result->SetBoolField(TEXT("restartRequired"), false);
+		Result->SetStringField(TEXT("reason"), TEXT(
+			"This plugin is enabled by default and is already loaded, so the .uproject needs no entry for "
+			"it and none was added."));
+		return MCPResult(Result);
+	}
+
+	// ── Mutate the file's Plugins array, and nothing else in it (#1248).
+	if (auto SaveErr = PPlug_Save(PluginName, EPPlugEdit::Enable, FString::Printf(TEXT("Enabling '%s'"), *PluginName)))
+	{
+		return SaveErr;
+	}
+
+	if (bPresent) MCPSetUpdated(Result); else MCPSetCreated(Result);
+	Result->SetBoolField(TEXT("unchanged"), false);
+	Result->SetBoolField(TEXT("restartRequired"), true);
+	Result->SetStringField(TEXT("restartWith"), TEXT("editor(restart_editor)"));
+	Result->SetStringField(TEXT("note"), FString::Printf(TEXT(
+		"'%s' is now enabled in the .uproject. Its modules, classes, content and settings appear only "
+		"after the editor restarts; nothing about this session changed. If the plugin has code and the "
+		"project has never built with it, the restart may ask to rebuild."), *PluginName));
+
+#if UE_MCP_HAS_5_5_API
+	if (!IPluginManager::Get().CanEnablePluginInCurrentTarget(PluginName))
+	{
+		Result->SetStringField(TEXT("warning"), FString::Printf(TEXT(
+			"'%s' declares no support for the current build target, so the entry is written but the plugin "
+			"may not load. Check its .uplugin SupportedTargetPlatforms and module HostType."), *PluginName));
+	}
+#endif
+
+	// The inverse depends on where it started, and the two cases differ in the
+	// FILE rather than in behaviour: with no entry before, the exact undo is
+	// deleting the entry, not writing an explicit disable that was never there.
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("pluginName"), PluginName);
+	Payload->SetBoolField(TEXT("removeReference"), !bPresent);
+	MCPSetRollback(Result, TEXT("disable_plugin"), Payload);
+
+	return MCPResult(Result);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// disable_plugin
+// ═════════════════════════════════════════════════════════════════════════════
+
+TSharedPtr<FJsonValue> FProjectHandlers::DisablePlugin(const TSharedPtr<FJsonObject>& Params)
+{
+	FString PluginName;
+	if (auto Err = RequireString(Params, TEXT("pluginName"), PluginName)) return Err;
+
+	// removeReference deletes the .uproject entry outright instead of writing
+	// an explicit `"Enabled": false`. The two differ for a plugin that is on by
+	// default: deleting the entry hands it back to the default, writing false
+	// overrides the default. Both are legitimate, so the caller picks.
+	const bool bRemoveReference = OptionalBool(Params, TEXT("removeReference"), false);
+
+	TSharedPtr<IPlugin> Plugin = PPlug_Find(PluginName);
+	if (!Plugin) return PPlug_UnknownPluginError(PluginName);
+	PluginName = Plugin->GetName();
+
+	if (PluginName.Equals(PPlug_BridgePluginName, ESearchCase::IgnoreCase))
+	{
+		return MCPError(FString::Printf(TEXT(
+			"Refusing to disable '%s'. It is the bridge serving this call, and disabling it means the next "
+			"editor start has no bridge and no way to undo the change from here. Edit the .uproject by hand "
+			"if that is really what you want."), *PluginName));
+	}
+
+	if (!PPlug_Project())
+	{
+		return MCPError(TEXT(
+			"No project descriptor is loaded, so there is no .uproject to change."));
+	}
+
+	bool bPresent = false;
+	bool bRefEnabled = false;
+	PPlug_ReadReference(PluginName, bPresent, bRefEnabled);
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("pluginName"), PluginName);
+	Result->SetStringField(TEXT("friendlyName"), Plugin->GetFriendlyName());
+	Result->SetBoolField(TEXT("enabledByDefault"), Plugin->IsEnabledByDefault(true));
+	Result->SetBoolField(TEXT("loadedInThisSession"), Plugin->IsEnabled());
+	Result->SetBoolField(TEXT("removeReference"), bRemoveReference);
+
+	// ── Idempotency, against the state the caller actually asked for.
+	if (bRemoveReference && !bPresent)
+	{
+		MCPSetExisted(Result);
+		Result->SetBoolField(TEXT("unchanged"), true);
+		Result->SetBoolField(TEXT("restartRequired"), false);
+		Result->SetStringField(TEXT("reason"), FString::Printf(TEXT(
+			"The .uproject has no entry for '%s', so there is nothing to remove. It is currently %s by "
+			"default."), *PluginName, Plugin->IsEnabledByDefault(true) ? TEXT("enabled") : TEXT("disabled")));
+		return MCPResult(Result);
+	}
+	if (!bRemoveReference && bPresent && !bRefEnabled)
+	{
+		MCPSetExisted(Result);
+		Result->SetBoolField(TEXT("unchanged"), true);
+		Result->SetBoolField(TEXT("restartRequired"), Plugin->IsEnabled());
+		Result->SetStringField(TEXT("reason"), Plugin->IsEnabled()
+			? TEXT("The .uproject already disables this plugin, but this editor session started before that "
+			       "and still has it loaded. Restart the editor with editor(restart_editor).")
+			: TEXT("The .uproject already disables this plugin and the editor has not loaded it."));
+		return MCPResult(Result);
+	}
+
+	// ── Mutate the file's Plugins array, and nothing else in it (#1248).
+	if (auto SaveErr = PPlug_Save(PluginName, bRemoveReference ? EPPlugEdit::Remove : EPPlugEdit::Disable, FString::Printf(
+		TEXT("%s '%s'"), bRemoveReference ? TEXT("Removing the reference to") : TEXT("Disabling"), *PluginName)))
+	{
+		return SaveErr;
+	}
+
+	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("unchanged"), false);
+	Result->SetBoolField(TEXT("restartRequired"), Plugin->IsEnabled());
+	Result->SetStringField(TEXT("restartWith"), TEXT("editor(restart_editor)"));
+	Result->SetStringField(TEXT("note"), FString::Printf(TEXT(
+		"'%s' is no longer enabled by the .uproject. This editor session keeps whatever it loaded at "
+		"startup until it restarts. Assets referencing the plugin's classes will fail to load once it is "
+		"off, which is a content change this call does not and cannot undo."), *PluginName));
+
+	// The exact inverse of each starting state.
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("pluginName"), PluginName);
+	if (bPresent && bRefEnabled)
+	{
+		// There was an explicit enabled entry: put it back.
+		MCPSetRollback(Result, TEXT("enable_plugin"), Payload);
+	}
+	else
+	{
+		// Either there was no entry (on by default), or there was a disabled one
+		// that removeReference has just deleted. Both are restored by taking the
+		// file back to the entry it had, which is what disable_plugin writes:
+		// removeReference=true deletes the entry we just added, and
+		// removeReference=false re-adds the disabled entry we just deleted.
+		Payload->SetBoolField(TEXT("removeReference"), !bPresent);
+		MCPSetRollback(Result, TEXT("disable_plugin"), Payload);
+	}
+
+	return MCPResult(Result);
+}

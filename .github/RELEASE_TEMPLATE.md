@@ -22,6 +22,10 @@ npx ue-mcp@latest
 <!-- One plain sentence of scale if there is one to give, e.g. "N new actions
      across M categories." No thesis, no metaphor, no three-part list. -->
 
+<!-- The covered-action share, as `node scripts/check-release-gates.mjs
+     behavioural-coverage` prints it, e.g. "245 of 1,086 bridge actions have a
+     behavioural test." (#1223) -->
+
 ## Features
 
 ### <category> (N new actions)

@@ -44,6 +44,7 @@ describe("UE-MCP test engine build guard", () => {
       `-Project="${plan.projectFile}"`,
       "-WaitMutex",
       "-FromMsBuild",
+      "-NoHotReloadFromIDE",
       "-NoEngineChanges",
     ]);
     expect(plan.buildArgs.filter((argument: string) => argument === "-NoEngineChanges")).toHaveLength(1);
@@ -82,7 +83,7 @@ describe("UE-MCP test engine build guard", () => {
     expect(() => resolveTestEngine({}, "linux")).toThrow("Unreal Engine build tool not found");
   });
 
-  it.each([
+  it.each<[NodeJS.Platform, string]>([
     ["win32", "Win64"],
     ["darwin", "Mac"],
     ["linux", "Linux"],

@@ -36,7 +36,7 @@
 import { describe, it, expect } from "vitest";
 import { auditHandlers, stripComments } from "../../scripts/audit-handler-conventions.mjs";
 import { ALL_TOOLS } from "../../src/tools.js";
-import { classifyActionClass } from "../../src/action-class.js";
+
 
 /**
  * The counts as they stand. Lower these when you fix one; never raise them.
@@ -60,7 +60,21 @@ const BASELINE = {
   // non-zero, because a rollback is not always possible and pretending
   // otherwise would mean emitting inverses that do not invert. What is not
   // allowed is silence: see mutationsSilentOnRollback.
-  mutationsWithoutRollback: 127,
+  // 128: render_sequence_frames writes files, which nothing can delete (#1098).
+  // 129: landscape(merge_edit_layers) re-derives merged maps and has no inverse (#1156).
+  // 130: asset(compile_customizable_object) compiles derived data and has no inverse (#1059).
+  // 131: blueprint(export_batch) writes files, which nothing can delete (#1166).
+  // 132: pcg(update_level_assets) overwrites assets with a fresh export and has no inverse (#1244).
+  // 133: asset(generate_skeletal_mesh_lods) replaces LOD geometry, and no action removes LODs (#1372).
+  // 135: editor(press_window_button) and editor(close_window) act on a live window, which has no inverse (#1231).
+  // 136: source_control(revert) discards local edits, which nothing restores (#1357).
+  // 137: source_control(submit) is repository history; undoing it is a new change (#1357).
+  // 138: niagara(capture_sim_cache) advances the simulation, which cannot be rewound (#1394).
+  // 139: material(delete_orphans) deletes unreachable nodes and keeps no copy to restore (#1403).
+  // 141: datasmith(import) creates an asset set and actors, and datasmith(reimport) rewrites them from source (#1383).
+  // 145: metahuman(set_wardrobe, request_rig, request_textures, assemble) replace or create character data with no inverse (#1354).
+  // 147: source_control(sync) moves the workspace to other revisions, and source_control(connect) changes no files (#1357).
+  mutationsWithoutRollback: 147,
   // Zero, and held there by a flat assertion. Every mutation with no inverse
   // now says so in its own result body with the reason, which is the half a
   // caller can act on.
@@ -69,7 +83,8 @@ const BASELINE = {
   // anything says that too, through MCPSetIdempotencyUnobservable, rather than
   // inventing an `unchanged` flag about somebody else's code.
   mutationsWithoutIdempotency: 0,
-  orphanedHandlers: 22,
+  // 23: pie_start_ignoring_blueprint_errors, split out of pie_control (#1057).
+  orphanedHandlers: 23,
 };
 
 /**
@@ -91,15 +106,13 @@ const KNOWN_ORPHANS: Record<string, string> = {
   acquire_lock: "asset(lock) drives this; the raw handler is the lock primitive.",
   release_lock: "as above.",
   release_session_locks: "called on session teardown, not by a caller.",
-  build_project: "editor(build_project) is a local handler that shells out to UBT instead.",
   execute_python: "editor(execute_python) wraps this with the workaround tracker and the search gate.",
+  pie_start_ignoring_blueprint_errors:
+    "editor(play_in_editor_ignore_blueprint_errors) calls it only after its approval gate, so no action "
+    + "declares it and play_in_editor's pie_control never reads an authorization (#1057).",
   request_editor_shutdown: "editor(stop_editor) drives it through the lifecycle path.",
-  save_current_level: "level(save) supersedes it and reports per-package results.",
   search_assets: "asset(search) supersedes it.",
-  delete_datatable_row: "asset(remove_datatable_row) is the shipped spelling.",
-  get_applied_imcs: "gameplay(get_applied_imcs) reaches it under the get_input_mapping_contexts name.",
   add_instances: "level(add_hismc_instances) is the shipped spelling.",
-  add_ismc_instances: "as above.",
   list_sockets: "asset(list_sockets) reaches it under a different bridge name.",
 
   // Alias registrations: a SECOND RegisterHandler line pointing at the same
@@ -107,20 +120,6 @@ const KNOWN_ORPHANS: Record<string, string> = {
   // were first annotated as holes; reading each function pointer showed
   // otherwise, which is why "unreferenced by name" is not the same question as
   // "unreachable".
-  add_material_function_expression:
-    "Alias of AddMaterialFunctionExpression; material(add_function_expression) calls it as add_expression_in_function.",
-  connect_material_function_expressions:
-    "Alias of ConnectMaterialFunctionExpressions; material(connect_function_expressions) calls it as connect_expressions_in_function.",
-  list_material_function_expressions:
-    "Alias of ListMaterialFunctionExpressions; material(list_function_expressions) calls it as list_expressions_in_function.",
-  populate_blendspace_1d:
-    "Alias of PopulateBlendspace, which already branches on UBlendSpace1D; animation(populate_blendspace) calls it.",
-  remove_animation_notify:
-    "Alias of RemoveAnimNotify; animation(remove_notify) calls it as remove_anim_notify. CRUD is complete.",
-  add_force:
-    "Alias of AddImpulse; gameplay(add_impulse) with mode='force' calls it.",
-  place_skeletal_actor:
-    "Alias of SpawnSkeletalMeshActor; level(spawn_skeletal_mesh_actor) calls it.",
   add_curve:
     "Alias of AddCurve; animation(add_curve) calls it under the identical name.",
 };
@@ -140,11 +139,11 @@ const KNOWN_ORPHANS: Record<string, string> = {
  */
 
 /** bridge method -> the TS tool+action that reaches it. */
-function bridgeToAction(): Map<string, { tool: string; action: string }> {
-  const out = new Map<string, { tool: string; action: string }>();
+function bridgeToAction(): Map<string, { tool: string; action: string; effect: string }> {
+  const out = new Map<string, { tool: string; action: string; effect: string }>();
   for (const tool of ALL_TOOLS) {
     for (const [action, spec] of Object.entries(tool.actions)) {
-      if (spec.bridge) out.set(spec.bridge, { tool: tool.name, action });
+      if (spec.bridge) out.set(spec.bridge, { tool: tool.name, action, effect: spec.effect });
     }
   }
   return out;
@@ -166,7 +165,7 @@ function audit(): Row[] {
   const rows = auditHandlers((bridgeName: string) => {
     const hit = byBridge.get(bridgeName);
     if (!hit) return "orphan";
-    return classifyActionClass(hit.tool, hit.action).class;
+    return hit.effect;
   }) as Row[];
   // The audit keys on the bridge method name; the read-verb test has to read
   // the TS spelling, which is what a caller actually types and is not always
@@ -179,11 +178,10 @@ function audit(): Row[] {
 /**
  * Read verbs that settle the question no matter what else the name contains.
  *
- * `classifyActionClass` scans the WHOLE action name for a mutating verb and is
- * deliberately generous, because it answers a different question: while this
- * server drives more than one editor, an unaddressed call falls through to the
- * active session, so over-classifying costs an explicit target and nothing
- * else. Erring that way is right at the gate.
+ * A row's class is the action's declared effect, which answers a different
+ * question: whether an unaddressed call may fall through to the active editor.
+ * Over-declaring a mutation there costs an explicit target and nothing else,
+ * so erring that way is right at the gate.
  *
  * It is wrong here. `editor(get_frame_timing)` matches on nothing it does,
  * `level(get_relative_transform)` reads a transform, `editor(list_dirty_packages)`
@@ -351,6 +349,7 @@ describe("handler conventions", () => {
       "grant_ability", "revoke_ability",
       "add_eqs_generator", "add_eqs_test", "remove_eqs_test",
       "remove_eqs_option", "reorder_eqs_tests",
+      "add_loose_gameplay_tag", "remove_loose_gameplay_tag",
     ];
     const byAction = new Map(rows.map((r) => [r.action, r]));
     const offenders: string[] = [];

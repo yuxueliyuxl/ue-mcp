@@ -34,7 +34,8 @@ function docActions(section) {
   const chunk = end === -1 ? after : after.slice(0, end);
   const rows = [];
   for (const line of chunk.split("\n")) {
-    const rm = line.match(/^\|\s+`([a-z_][a-z0-9_]*)`/);
+    // The first cell is the action's signature, `name(params)` (#1172).
+    const rm = line.match(/^\|\s+`([a-z_][a-z0-9_]*)[`(]/);
     if (rm) rows.push(rm[1]);
   }
   return rows;

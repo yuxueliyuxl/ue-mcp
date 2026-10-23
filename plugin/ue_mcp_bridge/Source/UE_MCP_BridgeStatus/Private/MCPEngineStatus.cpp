@@ -1,4 +1,5 @@
 #include "MCPEngineStatus.h"
+#include "MCPBridgeStateDir.h"
 
 #include "CoreGlobals.h"
 #include "Containers/Ticker.h"
@@ -185,20 +186,17 @@ void FMCPEngineStatus::Shutdown()
 		ModulesChangedHandle.Reset();
 	}
 
-	if (BoundContext)
+	// Only the current GWarn is known to be alive. A binding on any other
+	// context is dropped without touching it; its handlers check bInstalled.
+	for (const FContextBinding& Binding : Bindings)
 	{
-		if (SlowTaskStartHandle.IsValid())
+		if (Binding.Context && Binding.Context == GWarn)
 		{
-			BoundContext->OnStartSlowTask().Remove(SlowTaskStartHandle);
-			SlowTaskStartHandle.Reset();
+			Binding.Context->OnStartSlowTask().Remove(Binding.SlowTaskStartHandle);
+			Binding.Context->OnFinalizeSlowTask().Remove(Binding.SlowTaskFinalizeHandle);
 		}
-		if (SlowTaskFinalizeHandle.IsValid())
-		{
-			BoundContext->OnFinalizeSlowTask().Remove(SlowTaskFinalizeHandle);
-			SlowTaskFinalizeHandle.Reset();
-		}
-		BoundContext = nullptr;
 	}
+	Bindings.Empty();
 
 	ModalProvider = nullptr;
 	CompileProvider = nullptr;
@@ -237,35 +235,39 @@ bool FMCPEngineStatus::SharedStatusBelongsToThisProcess()
 
 void FMCPEngineStatus::RebindFeedbackContextIfNeeded()
 {
-	// GWarn is swapped from the bootstrap context to FFeedbackContextEditor
-	// partway through startup, taking any bindings with it, so check identity
-	// rather than binding once and assuming it holds.
-	if (!GWarn || GWarn == BoundContext)
+	// GWarn is swapped during startup and, briefly, by code that installs its
+	// own context. Each context is bound once and never touched again unless it
+	// is GWarn at that moment, so a temporary one going away is harmless (#1268).
+	if (!GWarn)
 	{
 		return;
 	}
-
-	if (BoundContext)
+	for (const FContextBinding& Binding : Bindings)
 	{
-		if (SlowTaskStartHandle.IsValid())
+		if (Binding.Context == GWarn)
 		{
-			BoundContext->OnStartSlowTask().Remove(SlowTaskStartHandle);
-		}
-		if (SlowTaskFinalizeHandle.IsValid())
-		{
-			BoundContext->OnFinalizeSlowTask().Remove(SlowTaskFinalizeHandle);
+			return;
 		}
 	}
 
-	BoundContext = GWarn;
-	SlowTaskStartHandle = GWarn->OnStartSlowTask().AddLambda([this](const FText&)
+	// Bounded: a dropped entry's handlers stay on its context and are harmless.
+	constexpr int32 MaxBindings = 16;
+	if (Bindings.Num() >= MaxBindings)
+	{
+		Bindings.RemoveAt(0);
+	}
+
+	FContextBinding Binding;
+	Binding.Context = GWarn;
+	Binding.SlowTaskStartHandle = GWarn->OnStartSlowTask().AddLambda([this](const FText&)
 	{
 		CaptureNow();
 	});
-	SlowTaskFinalizeHandle = GWarn->OnFinalizeSlowTask().AddLambda([this](const FText&, double)
+	Binding.SlowTaskFinalizeHandle = GWarn->OnFinalizeSlowTask().AddLambda([this](const FText&, double)
 	{
 		CaptureNow();
 	});
+	Bindings.Add(Binding);
 }
 
 void FMCPEngineStatus::SetPhase(const FString& InPhase)
@@ -305,7 +307,15 @@ void FMCPEngineStatus::NoteHandlerEnd(const FString& Method)
 
 void FMCPEngineStatus::CaptureNow()
 {
-	if (!IsInGameThread())
+	if (!IsInGameThread() || !bInstalled)
+	{
+		return;
+	}
+
+	// A commandlet publishes nothing (ShouldPublishStatus), and it is where
+	// code swaps GWarn for a stack-local context, so nothing is captured or
+	// bound there (#1268).
+	if (IsRunningCommandlet())
 	{
 		return;
 	}
@@ -525,7 +535,7 @@ TSharedPtr<FJsonObject> FMCPEngineStatus::Snapshot() const
 
 FString FMCPEngineStatus::StatusDir()
 {
-	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UE_MCP_Bridge"));
+	return UEMCP::BridgeStateDir();
 }
 
 FString FMCPEngineStatus::StatusFilePath()

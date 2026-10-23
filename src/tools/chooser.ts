@@ -1,5 +1,6 @@
-import { z } from "zod";
-import { categoryTool, bp, type ToolDef } from "../types.js";
+import type { ToolDef } from "../core/types.js";
+import { categoryTool } from "../surface/category-tool.js";
+import { specBp, schema as specSchema } from "./specs/chooser.generated.js";
 
 // #685 - ChooserTable (UChooserTable) row authoring. Chooser tables are the
 // data-driven selection layer behind Motion Matching: a chooser maps character
@@ -11,43 +12,19 @@ export const chooserTool: ToolDef = categoryTool(
   "chooser",
   "Author ChooserTable assets (the data-driven selection layer behind Motion Matching): introspect columns, list/add/edit/delete rows mapping input-column conditions to an output object.",
   {
-    create:     bp("mutate", "Create an empty ChooserTable asset. Add input columns with add_column, then rows with add_row. Params: name, packagePath? (default /Game), onConflict? (#685)", "chooser_create", (p) => ({ name: p.name, packagePath: p.packagePath, onConflict: p.onConflict })),
-    describe:   bp("read", "Introspect a ChooserTable: row count, each input column (index, name, columnType, cellType) and the fallback result. Read this first to learn the cell text format each column expects. Params: table (#685)", "chooser_describe", (p) => ({ table: p.table })),
-    add_column: bp("mutate", "Add an input column to a ChooserTable (so rows have a condition to fill). columnType is a Chooser column struct short name, e.g. EnumColumn, BoolColumn, FloatRangeColumn, GameplayTagColumn, ObjectColumn, or an Output* column. Optionally bind its input: inputStruct (parameter struct e.g. EnumContextProperty/BoolContextProperty), boundProperty (context property name to read), enumPath (for enum columns). Sizes the new column's cells to the current rows. Params: table, columnType, inputStruct?, boundProperty?, enumPath? (#685)", "chooser_add_column", (p) => ({ table: p.table, columnType: p.columnType, inputStruct: p.inputStruct, boundProperty: p.boundProperty, enumPath: p.enumPath })),
-    list_rows:  bp("read", "List every row: index, disabled flag, output object (resultType + referenced asset path), and each column's cell value as round-trippable text. Params: table (#685)", "chooser_list_rows", (p) => ({ table: p.table })),
-    add_row:    bp("mutate", "Append a row. Set the output via `output` (asset path) + outputType ('asset' hard ref default | 'soft_asset' | 'evaluate' for a nested ChooserTable). Set input-column conditions via `cells` (array aligned to column order) and/or `inputs` (object keyed by column index or name). Cell values are struct text like '(Value=2)' - partial fields are allowed and unspecified ones keep defaults; a bare number/bool works for scalar columns. Params: table, output?, outputType?, cells?, inputs? (#685)", "chooser_add_row", (p) => ({ table: p.table, output: p.output, outputType: p.outputType, cells: p.cells, inputs: p.inputs })),
-    set_row:    bp("mutate", "Edit an existing row by index: optionally replace the output (output + outputType), toggle disabled, and/or update column cells (cells / inputs, same format as add_row). Params: table, index, output?, outputType?, disabled?, cells?, inputs? (#685)", "chooser_set_row", (p) => ({ table: p.table, index: p.index, output: p.output, outputType: p.outputType, disabled: p.disabled, cells: p.cells, inputs: p.inputs })),
-    delete_row: bp("mutate", "Delete a row by index (removes its output plus the per-row cell from every column). Params: table, index (#685)", "chooser_delete_row", (p) => ({ table: p.table, index: p.index })),
-    list_object_references: bp("read", "List every leaf object reference reachable from a chooser, descending through nested chooser tables. list_rows renders those as an opaque resultType:NestedChooser with an empty output, so the actual PoseSearchDatabase/asset paths were invisible. Each entry reports the owning table, the exact location (e.g. ResultsStructs[3].Asset), the struct type and the current object path. Params: assetPath, classFilter? (match the referenced object's class), pathFilter? (substring on the path) (#754)", "chooser_list_object_references", (p) => ({ assetPath: p.assetPath, classFilter: p.classFilter, pathFilter: p.pathFilter })),
-    remap_object_references: bp("mutate", "Repoint object references throughout a chooser's nested structure. Either an exact swap (from + to) or a folder rewrite (fromPrefix + toPrefix), which is the 'adopt vendor choosers into our namespace' case. DRY RUN BY DEFAULT - pass dryRun=false to apply. Object-typed targets are class-checked before assignment; the chooser is recompiled and left dirty rather than saved. Params: assetPath, from?+to? | fromPrefix?+toPrefix?, dryRun? (default true) (#754)", "chooser_remap_object_references", (p) => ({ assetPath: p.assetPath, from: p.from, to: p.to, fromPrefix: p.fromPrefix, toPrefix: p.toPrefix, dryRun: p.dryRun, allowMissing: p.allowMissing })),
+    create:     specBp("mutate", "Create an empty ChooserTable asset. Add input columns with add_column, then rows with add_row (#685).", "chooser_create"),
+    describe:   specBp("read", "Introspect a ChooserTable: row count, each input column (index, name, columnType, cellType) and the fallback result. Read this first to learn the cell text format each column expects (#685).", "chooser_describe"),
+    add_column: specBp("mutate", "Add an input column to a ChooserTable (so rows have a condition to fill). columnType is a Chooser column struct short name, e.g. EnumColumn, BoolColumn, FloatRangeColumn, GameplayTagColumn, ObjectColumn, or an Output* column. Optionally bind its input: inputStruct (parameter struct e.g. EnumContextProperty/BoolContextProperty), boundProperty (context property name to read), enumPath (for enum columns). Sizes the new column's cells to the current rows (#685).", "chooser_add_column"),
+    list_rows:  specBp("read", "List every row: index, disabled flag, output object (resultType + referenced asset path), and each column's cell value as round-trippable text (#685).", "chooser_list_rows"),
+    add_row:    specBp("mutate", "Append a row. Set the output via `output` (asset path) + outputType ('asset' hard ref default | 'soft_asset' | 'evaluate' for a nested ChooserTable). Set input-column conditions via `cells` (array aligned to column order) and/or `inputs` (object keyed by column index or name). Cell values are struct text like '(Value=2)' - partial fields are allowed and unspecified ones keep defaults; a bare number/bool works for scalar columns (#685).", "chooser_add_row"),
+    set_row:    specBp("mutate", "Edit an existing row by index: optionally replace the output (output + outputType), toggle disabled, and/or update column cells (cells / inputs, same format as add_row) (#685).", "chooser_set_row"),
+    delete_row: specBp("mutate", "Delete a row by index (removes its output plus the per-row cell from every column) (#685).", "chooser_delete_row"),
+    list_object_references: specBp("read", "List every leaf object reference reachable from a chooser, descending through nested chooser tables. list_rows renders those as an opaque resultType:NestedChooser with an empty output, so the actual PoseSearchDatabase/asset paths were invisible. Each entry reports the owning table, the exact location (e.g. ResultsStructs[3].Asset), the struct type and the current object path. classFilter matches the referenced object's class, pathFilter is a substring on the path (#754).", "chooser_list_object_references"),
+    remap_object_references: specBp("mutate", "Repoint object references throughout a chooser's nested structure. Either an exact swap (from + to) or a folder rewrite (fromPrefix + toPrefix), which is the 'adopt vendor choosers into our namespace' case. DRY RUN BY DEFAULT - pass dryRun=false to apply. Object-typed targets are class-checked before assignment; the chooser is recompiled and left dirty rather than saved (#754).", "chooser_remap_object_references"),
   },
-  undefined,
   {
-    table: z.string().optional().describe("ChooserTable asset path, e.g. /Game/Path/CT_Locomotion"),
-    assetPath: z.string().optional().describe("list_object_references / remap_object_references: ChooserTable asset path (#754)"),
-    classFilter: z.string().optional().describe("list_object_references: only references whose target class matches (#754)"),
-    pathFilter: z.string().optional().describe("list_object_references: substring filter on the referenced object path (#754)"),
-    from: z.string().optional().describe("remap_object_references: exact object path to replace (#754)"),
-    to: z.string().optional().describe("remap_object_references: replacement object path (#754)"),
-    fromPrefix: z.string().optional().describe("remap_object_references: path prefix to rewrite, e.g. /Game/Vendor/ (#754)"),
-    toPrefix: z.string().optional().describe("remap_object_references: replacement prefix, e.g. /Game/MyProject/ (#754)"),
-    dryRun: z.boolean().optional().describe("remap_object_references: preview without writing (default true) (#754)"),
-    allowMissing: z.boolean().optional().describe("remap_object_references: write a soft reference even when the target does not exist yet (default false) (#754)"),
-    name: z.string().optional().describe("create: new ChooserTable asset name"),
-    packagePath: z.string().optional().describe("create: destination package path (default /Game)"),
-    onConflict: z.string().optional().describe("create: conflict policy skip (default) | error | overwrite"),
-    index: z.number().optional().describe("Row index for set_row / delete_row"),
-    output: z.string().optional().describe("Output asset path for the row (a PoseSearchDatabase, a nested ChooserTable, etc.)"),
-    outputType: z.string().optional().describe("Output wrapper: 'asset' (hard ref, default) | 'soft_asset' | 'evaluate' (nested ChooserTable reference)"),
-    disabled: z.boolean().optional().describe("set_row: enable/disable the row without deleting it"),
-    columnType: z.string().optional().describe("add_column: Chooser column struct short name (EnumColumn, BoolColumn, FloatRangeColumn, GameplayTagColumn, ObjectColumn, Output*Column, ...)"),
-    inputStruct: z.string().optional().describe("add_column: parameter struct to bind the column input (e.g. EnumContextProperty, BoolContextProperty)"),
-    boundProperty: z.string().optional().describe("add_column: context property name the column reads at evaluation time"),
-    enumPath: z.string().optional().describe("add_column: enum asset path for an EnumColumn"),
-    // #936: a concrete element type. The handler stringifies a cell through
-    // TryGetString/TryGetBool/TryGetNumber and skips nulls, so string, number,
-    // boolean and null is the whole of what a cell can be.
-    cells: z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional().describe("Per-column cell values aligned to column order; each is struct text like '(Value=2)', or a scalar. null/omitted leaves a column at its default."),
-    inputs: z.record(z.any()).optional().describe("Cell values keyed by column index (as string) or column name; same value format as cells"),
+    // #1057: every key a spec'd handler declares, generated from its C++
+    // registration.
+    ...specSchema,
   },
 );

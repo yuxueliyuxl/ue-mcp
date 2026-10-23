@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { existsSync } from "node:fs";
 import { getBridge, disconnectBridge, callBridge } from "../setup.js";
-import type { EditorBridge } from "../../src/bridge.js";
+import type { EditorBridge } from "../../src/bridge/bridge.js";
 
 let bridge: EditorBridge;
 
@@ -21,7 +21,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await callBridge(bridge, "pie_control", { action: "stop" }).catch(() => {});
+  await callBridge(bridge, "pie_control", { pieAction: "stop" }).catch(() => {});
   if (priorPieConfig) {
     await callBridge(bridge, "configure_pie", {
       numClients: priorPieConfig.numClients,
@@ -43,12 +43,12 @@ describe("editor - capture_screenshot target=pie (#724)", () => {
     });
     expect(configured.ok, configured.error).toBe(true);
 
-    const start = await callBridge(bridge, "pie_control", { action: "start" });
+    const start = await callBridge(bridge, "pie_control", { pieAction: "start" });
     // PIE can fail to start on a cold AssetRegistry / headless config - skip then.
     if (!start.ok) skip();
     await new Promise((r) => setTimeout(r, 3000));
 
-    const status = await callBridge(bridge, "pie_control", { action: "status" });
+    const status = await callBridge(bridge, "pie_control", { pieAction: "status" });
     const running = JSON.stringify(status.result).toLowerCase().includes("running")
       || (status.result as Record<string, unknown>)?.isPlaying === true;
     if (!running) skip();

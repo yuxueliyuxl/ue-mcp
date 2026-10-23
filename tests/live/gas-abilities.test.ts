@@ -473,10 +473,10 @@ describe("audit_attributes", () => {
   beforeAll(async () => {
     await call("gas", { action: "create_attribute_set", name: "AS_LiveProbe", packagePath: PACKAGE });
     await call("gas", {
-      action: "add_attribute", attributeSetPath: ATTR_SET, attributeName: "Health", defaultValue: 100,
+      action: "add_attribute", attributeSetPath: ATTR_SET, attributeName: "Health",
     });
     await call("gas", {
-      action: "add_attribute", attributeSetPath: ATTR_SET, attributeName: "MaxHealth", defaultValue: 100,
+      action: "add_attribute", attributeSetPath: ATTR_SET, attributeName: "MaxHealth",
     });
   }, 300_000);
 

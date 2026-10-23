@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { getBridge, disconnectBridge, callBridge } from "../setup.js";
-import type { EditorBridge } from "../../src/bridge.js";
+import type { EditorBridge } from "../../src/bridge/bridge.js";
 
 let bridge: EditorBridge;
 
@@ -39,7 +39,7 @@ describe("editor - read / query", () => {
   });
 
   it("pie_control (status)", async () => {
-    const r = await callBridge(bridge, "pie_control", { action: "status" });
+    const r = await callBridge(bridge, "pie_control", { pieAction: "status" });
     expect(r.ok, r.error).toBe(true);
   });
 });

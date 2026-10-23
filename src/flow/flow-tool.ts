@@ -10,12 +10,11 @@ import type {
   FlowDefinition,
 } from "@db-lyon/flowkit";
 import type { FlowContext } from "./context.js";
-import type { FlowConfig } from "./schema.js";
-import type { ToolDef, ToolContext, ActionSpec } from "../types.js";
-import { actionEnum } from "../types.js";
-import { McpError, ErrorCode } from "../errors.js";
-import { nearestActions } from "../action-schema.js";
-import { warn } from "../log.js";
+import { FlowStepKeySchema, type FlowConfig } from "./schema.js";
+import type { ToolDef, ToolContext, ActionSpec } from "../core/types.js";
+import { actionEnum } from "../surface/category-tool.js";
+import { McpError, ErrorCode } from "../core/errors.js";
+import { nearestActions } from "../surface/action-schema.js";
 import {
   takeSnapshot,
   restoreSnapshot,
@@ -30,16 +29,15 @@ import {
   trimStepResult,
   trimError,
 } from "./events.js";
-import {
-  journalEnabled,
-  journalFile,
-  endRun,
-  startRun,
-  type JournalStep,
-} from "../journal.js";
-import { journalActions } from "./journal-actions.js";
 import { unappliedRollbackCall } from "./handler-outcome.js";
-import { skillActions } from "./skill-actions.js";
+import {
+  DEFAULT_EDITOR_LOSS_TIMEOUT_MS,
+  EditorLossGuard,
+  type ConnectionSource,
+  type EditorLossPolicy,
+  type EditorLossReport,
+} from "./editor-loss.js";
+import { taskEffect } from "../surface/action-effects.js";
 
 /**
  * Name a failed rollback by the bridge method it tried to call. Every record
@@ -75,9 +73,7 @@ export function createFlowTool(
       kind: "handler",
       effect: "mutate",
       description:
-        "Execute a named flow from ue-mcp.yml. The run is recorded in this project's workflow "
-        + "journal automatically, under the flow's name, with its per-step outcome, so "
-        + 'flow(action="journal_get", runId=...) reconstructs it afterwards. Params: flowName, '
+        "Execute a named flow from ue-mcp.yml. Params: flowName, "
         + "skip? (step names or numbers), params? (runtime options merged into every step's options, "
         + "highest priority), rollback_on_failure? (invoke inverse tasks in reverse order when a "
         + "later step fails). A step whose handler reports success:false FAILS the step and stops the "
@@ -98,8 +94,9 @@ export function createFlowTool(
       kind: "handler",
       effect: "read",
       description:
-        "Show a flow's execution plan without running a step of it, and without journalling "
-        + "anything. Params: flowName. Returns the ordered plan.",
+        "Show a flow's execution plan without running a step of it. Params: flowName. Returns the ordered plan, "
+        + "and the flow as declared under definition: its description and each step's task or nested flow, "
+        + "options and conditions, with ${steps.N...} references left unresolved.",
       handler: async (ctx, params) => planFlow(registryFor(ctx), configFor(ctx), ctx, params),
     },
     list: {
@@ -110,23 +107,16 @@ export function createFlowTool(
         + "and any loaded plugin. Params: none",
       handler: async (ctx) => listFlows(configFor(ctx)),
     },
-    ...journalActions,
-    ...skillActions,
   };
 
   const def: ToolDef = {
     name: "flow",
     description:
-      `Run pre-built named sequences for this project, and keep the record of what was run. ` +
+      `Run pre-built named sequences for this project. ` +
       `ALWAYS check project(action="get_status") first - its 'flows' field lists what's available. ` +
       `If a flow matches the user's request, run it via ` +
       `flow(action="run", flowName="...") instead of composing the sequence by hand. ` +
       `Config reloads on every call - no restart needed.\n\n` +
-      `The journal_* actions are the record a run leaves behind: what was done, what it produced, ` +
-      `and how it ended. Every flow run writes one automatically; open one by hand for work that is ` +
-      `not a flow, so the next session can read back what this one did.\n\n` +
-      `The skill_* actions cover the skill packs - the written workflows that say which calls to ` +
-      `make in what order - including verifying that the calls they teach still exist.\n\n` +
       `Actions:\n` +
       Object.entries(actions)
         .map(([name, spec]) => `- ${name}: ${spec.description ?? ""}`)
@@ -139,29 +129,10 @@ export function createFlowTool(
       `    1: { task: shell, options: { command: "npm run up:build" } }`,
     schema: {
       action: actionEnum(Object.keys(actions) as [string, ...string[]]),
-      flowName: z.string().optional().describe("Flow name from ue-mcp.yml. On journal_list, keeps only runs of that flow"),
+      flowName: z.string().optional().describe("Flow name from ue-mcp.yml"),
       skip: z.array(z.string()).optional().describe("run: step names or numbers to skip"),
       params: z.record(z.unknown()).optional().describe("run: runtime options merged into every step's options (highest priority)"),
       rollback_on_failure: z.boolean().optional().describe("run: invoke inverse tasks in reverse order on failure"),
-      runId: z.string().optional().describe("Journal run to act on. Omitted on a write, the open run is used and the response says so"),
-      title: z.string().optional().describe("journal_start: what the run is, in a few words"),
-      tags: z.array(z.string()).optional().describe("journal_start: labels to filter this run by later"),
-      tag: z.string().optional().describe("journal_list: keep only runs carrying this tag"),
-      text: z.string().optional().describe("journal_note: the note's content"),
-      artifactPath: z.string().optional().describe("journal_attach: what the run produced - a content path, a file on disk, or a URL"),
-      artifactKind: z.string().optional().describe("journal_attach: free-form label such as asset, screenshot, log, report"),
-      note: z.string().optional().describe("journal_attach: one line about the artifact"),
-      status: z.string().optional().describe("journal_finish: completed|failed. journal_list: active|completed|failed|cancelled"),
-      summary: z.string().optional().describe("journal_finish: what the run achieved, read first by the next session"),
-      reason: z.string().optional().describe("journal_cancel: why the run was abandoned"),
-      since: z.string().optional().describe("journal_list: epoch ms, an ISO date, or a relative age like 2h / 7d / 30m"),
-      contains: z.string().optional().describe("journal_list: case-insensitive substring over the title, summary and notes"),
-      limit: z.number().optional().describe("journal_list: how many runs to return (default 20, 0 for all)"),
-      detail: z.boolean().optional().describe("journal_list / skill_list: return full detail rather than summary rows"),
-      all: z.boolean().optional().describe("journal_delete / skill_remove: act on every one of them instead of a named one"),
-      skillName: z.string().optional().describe("skill_get / skill_install / skill_remove: the pack's directory name"),
-      includeBody: z.boolean().optional().describe("skill_get: include the pack's markdown (default true)"),
-      source: z.string().optional().describe("skill_list: packaged|project|plugin"),
     },
     actions,
     handler: async (ctx, params) => {
@@ -192,6 +163,21 @@ function listFlows(config: FlowConfig): Record<string, unknown> {
   return { flowCount: flows.length, flows };
 }
 
+/**
+ * The runner orders steps by their keys as numbers, so a named key is a step
+ * it cannot find. Said before the run instead of as a crash inside it.
+ */
+function refuseUnorderedSteps(config: FlowConfig, flowName: string): void {
+  const def = (config.flows as Record<string, { steps?: Record<string, unknown> } | undefined>)[flowName];
+  const bad = Object.keys(def?.steps ?? {}).filter((key) => !FlowStepKeySchema.safeParse(key).success);
+  if (bad.length > 0) {
+    throw new Error(
+      `Flow '${flowName}' has step key${bad.length > 1 ? "s" : ""} ${bad.map((k) => `"${k}"`).join(", ")}: `
+      + 'a flow step key is its run order, a whole number such as "1" or "2".',
+    );
+  }
+}
+
 async function planFlow(
   registry: TaskRegistry,
   config: FlowConfig,
@@ -200,11 +186,16 @@ async function planFlow(
 ): Promise<unknown> {
   const flowName = params.flowName as string;
   if (!flowName) throw new Error("flowName is required");
+  refuseUnorderedSteps(config, flowName);
 
   // Plan mode short-circuits inside the runner before any hooks fire,
   // so the runId placeholder we pass here is never observed.
   const runner = makeRunner(registry, config, ctx, nextRunId(), flowName);
-  return runner.run({ flowName, plan: true });
+  const planned = await runner.run({ flowName, plan: true });
+  // The plan names each step's task; the definition carries what a reader needs to see how the
+  // steps connect, which is the options and the ${steps.N...} references between them.
+  const def = (config.flows as Record<string, FlowDefinition | undefined>)[flowName];
+  return def ? { ...planned, definition: { description: def.description, steps: def.steps } } : planned;
 }
 
 async function runFlow(
@@ -215,6 +206,7 @@ async function runFlow(
 ): Promise<unknown> {
   const flowName = params.flowName as string;
   if (!flowName) throw new Error("flowName is required");
+  refuseUnorderedSteps(config, flowName);
   const skip = (params.skip as string[] | undefined) ?? [];
   const flowParams = params.params as Record<string, unknown> | undefined;
   const rollback_on_failure = params.rollback_on_failure as boolean | undefined;
@@ -223,11 +215,67 @@ async function runFlow(
   // emit carries this id so SSE subscribers can filter to a specific
   // run; the response includes it so callers can correlate.
   const runId = nextRunId();
-  const runner = makeRunner(registry, config, ctx, runId, flowName);
-  const result = await runner.run({ flowName, skip, params: flowParams, rollback_on_failure });
+  const def = (config.flows as Record<string, { on_editor_loss?: EditorLossPolicy; editor_loss_timeout_seconds?: number }>)[flowName];
+  const policy: EditorLossPolicy = def?.on_editor_loss ?? "resume";
+  const snapshot: SnapshotHolder = {};
+  const guard = makeLossGuard(ctx, policy, def?.editor_loss_timeout_seconds, snapshot);
+  const runner = makeRunner(guard ? guard.wrap(registry) : registry, config, ctx, runId, flowName, snapshot, guard);
+  try {
+    // Under on_editor_loss: rollback a failed run unwinds, unless the caller said otherwise.
+    const rollback = rollback_on_failure ?? (policy === "rollback" ? true : undefined);
+    const result = await runner.run({ flowName, skip, params: flowParams, rollback_on_failure: rollback });
+    const formatted = formatFlowResult(result);
+    const loss = guard?.report();
+    if (loss) formatted.summary = `${formatted.summary as string}\n\n${describeEditorLoss(loss)}`;
+    return { ...formatted, editorLoss: loss, runId };
+  } finally {
+    guard?.dispose();
+  }
+}
 
-  const formatted = formatFlowResult(result);
-  return { ...formatted, runId };
+/** The git snapshot of the run in progress, shared with the editor-loss guard. */
+interface SnapshotHolder {
+  current?: Snapshot;
+}
+
+function makeLossGuard(
+  ctx: ToolContext,
+  policy: EditorLossPolicy,
+  timeoutSeconds: number | undefined,
+  snapshot: SnapshotHolder,
+): EditorLossGuard | undefined {
+  const source = ctx.session?.bridge as unknown as ConnectionSource | undefined;
+  if (typeof source?.onConnectionChanged !== "function" || typeof source.waitForConnection !== "function") return undefined;
+  const graph = (ctx as FlowContext).getToolGraph?.() ?? ctx.session?.toolGraph;
+  return new EditorLossGuard(source, {
+    policy,
+    timeoutMs: timeoutSeconds ? timeoutSeconds * 1000 : DEFAULT_EDITOR_LOSS_TIMEOUT_MS,
+    isReadOnly: (taskName) => taskEffect(taskName, graph).effect === "read",
+    // Filesystem only, and only while the editor is away, so it never holds stale copies.
+    restoreWhileDown: () => {
+      if (!snapshot.current) return false;
+      try {
+        restoreSnapshot(snapshot.current);
+        snapshot.current = undefined;
+        return true;
+      } catch (e) {
+        console.error(`[ue-mcp] git snapshot restore failed: ${(e as Error).message}`);
+        return false;
+      }
+    },
+  });
+}
+
+function describeEditorLoss(loss: EditorLossReport): string {
+  const lines = [`  Editor loss (on_editor_loss: ${loss.policy}):`];
+  for (const e of loss.events) {
+    lines.push(`      ${e.step}: ${e.outcome}${e.cause ? ` (${e.cause})` : ""}, waited ${Math.round(e.waitedMs / 1000)}s`);
+  }
+  if (loss.unsavedBeforeLoss.length > 0) {
+    lines.push(`      Not saved when the editor went away, so lost if it crashed: ${loss.unsavedBeforeLoss.join(", ")}`);
+  }
+  if (loss.snapshotRestoredWhileDown) lines.push("      Git snapshot restored while the editor was away.");
+  return lines.join("\n");
 }
 
 function makeRunner(
@@ -236,6 +284,8 @@ function makeRunner(
   ctx: ToolContext,
   runId: string,
   flowName: string,
+  snapshot: SnapshotHolder = {},
+  guard?: EditorLossGuard,
 ): FlowRunner {
   // The whole context, not two fields of it. Rebuilding it field-by-field
   // dropped `elicit`, `getFlows`, `getPlugins` and now the editor session, so
@@ -248,39 +298,8 @@ function makeRunner(
   // Handler-level rollbacks cover in-memory state (selection, PIE, unsaved
   // actors); the snapshot covers anything that touched disk.
   const snapCfg = config.git_snapshot;
-  let activeSnapshot: Snapshot | undefined;
   let flowFailed = false;
   const snapshotEnabled = !!(snapCfg?.enabled && ctx.project.projectDir);
-
-  // The automatic half of the journal (V16).
-  //
-  // A flow run is the one case where the server already knows, without being
-  // told, that a unit of work started and how it ended - the runner brackets
-  // it and the plan names it. So it is recorded without asking, sharing the
-  // runId the flow events already carry, which means an SSE subscriber and the
-  // journal are talking about the same run.
-  //
-  // The explicit half exists because this half cannot: intent, and what a run
-  // produced, are known only to the caller. Recording every mutating call
-  // instead would produce a call log, not a workflow record - forty lines of
-  // "set_property succeeded" that say nothing about what was being built.
-  //
-  // A session with no project directory has no journal: the file is keyed by
-  // project root, and one shared stream for every projectless server would be
-  // a worse record than none.
-  const journalPath = journalFile(ctx.project.projectDir);
-  const journalling = journalEnabled() && !!ctx.project.projectDir;
-
-  // Never let a journal write take a flow down: the record is a byproduct, and
-  // a full disk must not fail the work it was recording.
-  const journalSafely = (what: string, write: () => void): void => {
-    if (!journalling) return;
-    try {
-      write();
-    } catch (e) {
-      warn("journal", `${what} failed for flow '${flowName}' (${journalPath})`, e);
-    }
-  };
 
   // Always-on per-step observation. Each hook emits a single event on
   // the module-level bus that the HTTP server's /flows/events SSE
@@ -294,15 +313,6 @@ function makeRunner(
         plan,
         timestamp: Date.now(),
       });
-      journalSafely("opening the run", () => {
-        startRun(journalPath, {
-          runId,
-          title: `flow: ${flowName}`,
-          flowName,
-          tags: ["flow"],
-          project: ctx.project.projectDir,
-        });
-      });
       if (!snapshotEnabled) return;
       const projectDir = ctx.project.projectDir!;
       const snapshotDir = snapCfg!.snapshot_dir ?? ".ue-mcp/snapshot.git";
@@ -311,7 +321,7 @@ function makeRunner(
         : snapshotDir;
       pruneOldSnapshots(absSnap, (snapCfg!.max_age_hours ?? 24) * 3_600_000);
       try {
-        activeSnapshot = takeSnapshot(
+        snapshot.current = takeSnapshot(
           projectDir,
           snapCfg!.paths ?? ["Content", "Config"],
           snapshotDir,
@@ -332,6 +342,7 @@ function makeRunner(
       });
     },
     afterStep: async (step: PlanStep, result: FlowStepResult) => {
+      guard?.stepCompleted(step.name, result.result?.data);
       emitFlowEvent({
         type: "step_completed",
         runId,
@@ -356,6 +367,7 @@ function makeRunner(
       // so the run_completed event is the last thing observers see.
       if (snapshotEnabled) {
         flowFailed = !result.success;
+        const activeSnapshot = snapshot.current;
         if (activeSnapshot && flowFailed) {
           try {
             const { changedPaths } = restoreSnapshot(activeSnapshot);
@@ -374,17 +386,6 @@ function makeRunner(
           }
         }
       }
-      const failedStep = stoppingStep(result);
-      journalSafely("closing the run", () => {
-        endRun(journalPath, runId, {
-          status: result.success ? "completed" : "failed",
-          summary: result.success
-            ? `${result.steps.length} step(s) completed in ${formatDuration(result.duration)}.`
-            : `Failed at step '${failedStep ?? "unknown"}' after ${formatDuration(result.duration)}.`,
-          durationMs: result.duration,
-          steps: result.steps.map(journalStep),
-        });
-      });
       emitFlowEvent({
         type: "run_completed",
         runId,
@@ -392,7 +393,7 @@ function makeRunner(
         success: result.success,
         duration: result.duration,
         stepCount: result.steps.length,
-        failedStep,
+        failedStep: stoppingStep(result),
         timestamp: Date.now(),
       });
     },
@@ -405,23 +406,6 @@ function makeRunner(
     context: flowCtx,
     hooks,
   });
-}
-
-/**
- * One step, trimmed to what a later reader needs. The step's DATA is
- * deliberately left out: an asset listing or a shell log belongs in the run
- * response, not in a file that accumulates one entry per flow forever.
- */
-function journalStep(s: FlowStepResult): JournalStep {
-  return {
-    stepNumber: s.stepNumber,
-    name: s.name,
-    type: s.type,
-    success: s.result?.success ?? false,
-    skipped: s.skipped,
-    durationMs: s.duration,
-    error: s.result?.error?.message,
-  };
 }
 
 /**
