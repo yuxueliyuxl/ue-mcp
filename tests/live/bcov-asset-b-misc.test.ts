@@ -1,3 +1,4 @@
+// @live-editor headless
 /**
  * Asset-level operations read back through a second action: texture import and
  * settings, enum and struct listing, moves, searches, the dirty-package sweep,

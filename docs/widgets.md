@@ -48,12 +48,11 @@ three things happened, because your next move differs:
 ## Where the runtime actions stop
 
 The runtime actions here are point-in-time: one read of the current state, or
-one write plus the delegate broadcast that a real interaction would fire. That
-is the line this project keeps. Core does authoring and point-in-time
-inspection; recording, replaying, sampling over a window, and synthesizing
-input events belong to the [PIE Studio](pie-record-replay.md) plugin.
+one write plus the delegate broadcast that a real interaction would fire.
+Recording, replaying, sampling over a window, and synthesizing input events
+belong to the [`pie`](pie.md) tool.
 
-So reach for PIE Studio instead when you want to:
+So reach for `pie` instead when you want to:
 
 - capture a widget's state every frame over a window rather than once, which is
   `pie(observe_arm)` and `pie(observe_read)`;

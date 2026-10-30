@@ -10,18 +10,15 @@ Most plugins use only the first shape; the other two are available when injectio
 
 Browse and search published plugins in the registry at **[plugins.ue-mcp.com](https://plugins.ue-mcp.com)**, then install any listing by its slug with `ue-mcp plugin install <slug>`.
 
-!!! info "Live reference"
-    [`pie-studio`](https://github.com/db-lyon/pie-studio) ([npm](https://www.npmjs.com/package/pie-studio)) is the canonical native-module reference. It ships C++ handlers for PIE recording, replay, observation, and input injection, surfaced as a `pie` category it provisions via `nativeModule.category`. See [Native C++ modules](plugins-native-modules.md).
-
 ## Quick start
 
 In your Unreal project directory:
 
 ```bash
-ue-mcp plugin install pie-studio
+ue-mcp plugin install <slug>
 ```
 
-That runs `npm install --save`, validates the plugin's manifest, deploys the native C++ module, and adds an entry to your `ue-mcp.yml`. Rebuild the UE project so the native module compiles in, then restart your MCP client (in Claude Code, `/mcp` reconnects).
+That runs `npm install --save`, validates the plugin's manifest, deploys its native C++ module if it has one, and adds an entry to your `ue-mcp.yml`. When a native module was deployed, rebuild the UE project so it compiles in. Then restart your MCP client (in Claude Code, `/mcp` reconnects).
 
 Verify with the introspection tool:
 
@@ -29,7 +26,7 @@ Verify with the introspection tool:
 plugins(action="list")
 ```
 
-The `pie-studio` entry reports `status: "active"` and lists `pie` under `providedCategories`. Its native handlers are then callable as actions of that category, e.g. `pie(action="record_arm", ...)`. Full consumer details are in [Using plugins](plugins-using.md).
+The plugin's entry reports `status: "active"` and lists the categories it injects into or provides. Its actions are then callable like built-in ones, for example `<category>(action="<prefix>_<action>", ...)` for an injected action. Full consumer details are in [Using plugins](plugins-using.md).
 
 ## How plugins work
 
@@ -63,7 +60,7 @@ Shape A is overwhelmingly the right answer. An action that belongs inside an exi
 
 Shape B is for genuinely new domains. If your plugin's actions don't fit anywhere in the built-in category list, owning a new top-level category is cleaner than forcing a misfit injection.
 
-Shape C is for capability that can't be expressed through orchestration of existing actions. The plugin ships C++ source that compiles into the user's project alongside the bridge, and registers handlers via `UEMCP::RegisterExternalHandler` from its `StartupModule`. Native handlers participate in the same dispatch path as built-in ones. `pie-studio` is a Shape C plugin. See [Native C++ modules](plugins-native-modules.md).
+Shape C is for capability that can't be expressed through orchestration of existing actions. The plugin ships C++ source that compiles into the user's project alongside the bridge, and registers handlers via `UEMCP::RegisterExternalHandler` from its `StartupModule`. Native handlers participate in the same dispatch path as built-in ones. See [Native C++ modules](plugins-native-modules.md).
 
 ## What belongs in core and what belongs in a plugin
 
@@ -79,12 +76,6 @@ Everything else is a plugin:
 - Anything where ue-mcp itself would call an external service or hold a credential.
 - Anything that reaches undocumented interfaces or interfaces whose terms restrict that use.
 
-## Official plugins
-
-| Plugin | What it does |
-|--------|-------------|
-| [`pie-studio`](https://github.com/db-lyon/pie-studio) | PIE recording, replay, observation, and input injection. Native C++ handlers surfaced as its own `pie` category. |
-
 ## Where to next
 
 - [Using plugins](plugins-using.md) - install, configure, introspect, and manage plugins in a project.
@@ -92,4 +83,3 @@ Everything else is a plugin:
 - [Native C++ modules](plugins-native-modules.md) - ship engine APIs the bridge doesn't expose.
 - [Guards](plugins-guards.md) - gate every bridge call: source control, access policy, audit.
 - [Validation and troubleshooting](plugins-troubleshooting.md) - the rules the loader enforces and common failures.
-- [PIE Studio](pie-record-replay.md) - the canonical native-module plugin, documented end to end.

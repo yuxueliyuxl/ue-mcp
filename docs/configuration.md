@@ -11,7 +11,7 @@ The easiest way to configure UE-MCP is to run `npx ue-mcp init` - it detects you
   "mcpServers": {
     "ue-mcp": {
       "command": "npx",
-      "args": ["-y", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
+      "args": ["-y", "--min-release-age=0", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
     }
   }
 }
@@ -22,7 +22,7 @@ Codex uses TOML instead:
 ```toml
 [mcp_servers.ue-mcp]
 command = "npx"
-args = ["-y", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
+args = ["-y", "--min-release-age=0", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
 cwd = "C:/path/to"
 enabled = true
 ```
@@ -49,7 +49,7 @@ Pass more than one `.uproject` and each becomes an addressable **editor session*
   "mcpServers": {
     "ue-mcp": {
       "command": "npx",
-      "args": ["-y", "ue-mcp@latest", "C:/games/Alpha/Alpha.uproject", "C:/games/Beta/Beta.uproject"]
+      "args": ["-y", "--min-release-age=0", "ue-mcp@latest", "C:/games/Alpha/Alpha.uproject", "C:/games/Beta/Beta.uproject"]
     }
   }
 }
@@ -155,6 +155,17 @@ The form outlives the call that raised it. A blocked call waits a minute for you
 
 A daemon extension that runs actions in process, such as UE-MCP Studio, answers the dialogs its own calls meet: `callAction` takes a `dialogPrompt` with the same form an MCP client is shown, so `interactive` works there too. Its answer may also be `delegate`, which hands that one dialog to the agent with the press calls, as `auto` would. An answer sooner than `UE_MCP_ELICIT_MIN_HUMAN_MS` is not taken as a person's. Every dialog is also published on the daemon's event stream as `dialog.opened`, `dialog.answered`, `dialog.delegated` and `dialog.closed`, whoever met it and under every mode. Nothing changes for an MCP client or the CLI.
 
+### Playtest mode
+
+Who starts playtest runs, `pie(action="script_run")` and `pie(action="script_replay")`: a person or an agent.
+
+| Mode | What happens |
+|---|---|
+| `manual` | A person starts playtests. An MCP client's `script_run` and `script_replay` are refused before anything reaches the editor, directly or through the micro gateway, with `success: false`, `refusedMethod`, and a `reason` that names the setting and the command that changes it. |
+| `automatic` | An agent may start them. |
+| unset | Each client decides. The server changes nothing. |
+
+Set it with `npx ue-mcp playtest mode <manual|automatic>` (add `--editor <name>` to scope it to one project, `clear` to clear it). A project's own setting wins over the per-user one. A daemon extension reads and sets it through `api.modes` (feature `modes.playtest`); calls it makes through `api.callAction` are not refused, so it applies its own rule.
 
 ### User-machine state (`~/.ue-mcp/`)
 
@@ -162,7 +173,7 @@ Machine-specific state that ue-mcp commands write but you wouldn't hand-edit liv
 
 | Path | What |
 |------|------|
-| `~/.ue-mcp/state.json` | Three things: (a) per-project `installedHooks` - absolute paths of every Claude Code `settings.json` where ue-mcp installed the feedback PostToolUse hook, keyed by absolute project root; (b) `preferences.feedback.mode` - your personal default for the feedback approval mode (`interactive` / `auto-approve` / `defer`). (c) `preferences.dialog.mode` and per-project `dialog.mode` - the dialog handling mode (`interactive` / `auto` / `defer`). Maintained by `npx ue-mcp init`, `npx ue-mcp uninstall-hooks`, `npx ue-mcp feedback mode` and `npx ue-mcp dialog mode`. Written by those commands, not by hand. |
+| `~/.ue-mcp/state.json` | Three things: (a) per-project `installedHooks` - absolute paths of every Claude Code `settings.json` where ue-mcp installed the feedback PostToolUse hook, keyed by absolute project root; (b) `preferences.feedback.mode` - your personal default for the feedback approval mode (`interactive` / `auto-approve` / `defer`). (c) `preferences.dialog.mode` and per-project `dialog.mode` - the dialog handling mode (`interactive` / `auto` / `defer`); (d) `preferences.playtest.mode` and per-project `playtest.mode` - the [playtest mode](#playtest-mode) (`manual` / `automatic`). Maintained by `npx ue-mcp init`, `npx ue-mcp uninstall-hooks`, `npx ue-mcp feedback mode`, `npx ue-mcp dialog mode` and `npx ue-mcp playtest mode`. Written by those commands, not by hand. |
 | `~/.ue-mcp/auth.json` | Cached GitHub OAuth token for `feedback(submit)` author=user mode. Mode 600. Written by `npx ue-mcp auth`. |
 | `~/.ue-mcp/pending-feedback/<id>.json` | Submissions captured while `feedback mode` is `defer`. Acted on with `npx ue-mcp feedback list/approve/discard`. |
 
@@ -174,7 +185,7 @@ The `plugins:` array in **`ue-mcp.yml`** declares npm packages that inject new a
 
 ```yaml
 plugins:
-  - name: pie-studio
+  - name: ue-mcp-perforce
   - name: some-other-plugin
     version: "0.2.x"        # optional - npm semver range
 ```
@@ -203,10 +214,10 @@ Everything the server injects at session start - the `initialize` instructions p
 | Strategy | Seed | What's advertised | Cost to use |
 |----------|------|-------------------|-------------|
 | **`micro`** (default) | <!-- tax:micro -->~2.2k<!-- /tax --> tokens | a single `tools` gateway - `search`, `list_categories`, `describe`, and `call` - fronting every category | discovery for everything |
-| **`lean`** | <!-- tax:lean -->~19k<!-- /tax --> tokens | the <!-- count:tools -->29<!-- /count --> category tools with their `action` enums and a one-line summary each; a `catalog` tool (`search` / `describe` / `list_categories`) and a per-category `describe` action serve the signatures on demand | ~1 round-trip to learn a category |
-| **`full`** | <!-- tax:full -->~51k<!-- /tax --> tokens | the <!-- count:tools -->29<!-- /count --> category tools, each with one signature line per action inline | zero discovery calls |
+| **`lean`** | <!-- tax:lean -->~20k<!-- /tax --> tokens | the <!-- count:tools -->30<!-- /count --> category tools with their `action` enums and a one-line summary each; a `catalog` tool (`search` / `describe` / `list_categories`) and a per-category `describe` action serve the signatures on demand | ~1 round-trip to learn a category |
+| **`full`** | <!-- tax:full -->~55k<!-- /tax --> tokens | the <!-- count:tools -->30<!-- /count --> category tools, each with one signature line per action inline | zero discovery calls |
 
-On demand, micro's `describe` of the largest category (a page of signatures) costs <!-- tax:describe -->~1.5k<!-- /tax --> tokens and a default `search` <!-- tax:search -->~500<!-- /tax -->.
+On demand, micro's `describe` of the largest category (a page of signatures) costs <!-- tax:describe -->~1.5k<!-- /tax --> tokens and a default `search` <!-- tax:search -->~520<!-- /tax -->.
 
 The figures include the <!-- count:nativeToolActions -->830<!-- /count --> wrapped Epic tools, which are declared in the package, and are measured hermetically (throwaway project, no editor) by `npm run context-tax`, which stamps them into these docs. Set `ANTHROPIC_API_KEY` for exact token counts instead of the chars/4 estimate. The `context-tax` release gate (`node scripts/check-release-gates.mjs context-tax`) fails the build when a seed exceeds its budget: micro <!-- tax:microBudget -->~5.0k<!-- /tax -->, lean <!-- tax:leanBudget -->~30k<!-- /tax -->, full <!-- tax:fullBudget -->~60k<!-- /tax -->, a category describe <!-- tax:describeBudget -->~2.0k<!-- /tax --> and a search <!-- tax:searchBudget -->~1.0k<!-- /tax -->.
 
@@ -254,7 +265,7 @@ Set `server.mode: in-process` in `ue-mcp.yml`, or `UE_MCP_SERVER_MODE=in-process
 | `npx ue-mcp daemon status` | The daemon's pid, port and version, its editors, and why each one last disconnected (`closed`, `crashed`, `restarting`, `rebuild` or `unknown`). `--json` for a machine. |
 | `npx ue-mcp daemon start` / `stop` | Start one for the project, or ask it to exit. |
 | `npx ue-mcp daemon open` | Print the URL of the client UI it serves, if one is installed. `--browser` opens it. |
-| `npx ue-mcp extension install <source> [--sha256 <hex>]` | Install a daemon extension into `~/.ue-mcp/extensions/` and restart the project's daemon to load it. The source is a zip, a URL with its SHA-256, or a release manifest (`.json` with `url` and `sha256`). `extension remove <name>` and `extension list` manage them. |
+| `npx ue-mcp extension install <source> [--sha256 <hex>] [project]` | Install a daemon extension into `~/.ue-mcp/extensions/<name>@<version>/`, record the project at that version, and restart the project's daemon to load it. The source is a zip, a URL with its SHA-256, or a release manifest (`.json` with `url` and `sha256`). Versions sit side by side: each project loads the version it records, so installing for one project never changes another. `extension use <name> <version> [project]` moves a project to a version already installed, `extension list [project]` shows every installed version and the one the project records, and `extension remove <name>` removes every version. A version no project records is removed on the next install. |
 
 The daemon listens on 127.0.0.1 only, and every request needs the token in `~/.ue-mcp/daemons/<key>.json`, which only your user can read.
 
@@ -265,9 +276,59 @@ ue-mcp:
     openBrowserOnCrash: false    # open the client UI in your browser when the editor crashes
 ```
 
-A call that still cannot reach the editor says why it last went away. The daemon's event stream (`GET /v1/events`) carries `call.started` and `call.finished` for every MCP call from every client, named by the client, with the category, action, duration and outcome.
+A call that still cannot reach the editor says why it last went away. The daemon's event stream (`GET /v1/events`) carries `call.started` and `call.finished` for every MCP call from every client, named by the client, with the category, action, duration and outcome. It also carries `dialog.opened`, `dialog.answered`, `dialog.delegated` and `dialog.closed` for editor dialogs, and the progress of every PIE test script run: `script.run_started`, `script.step_started`, `script.step_passed`, `script.step_failed`, `script.verdict_requested`, `script.verdict` and `script.run_finished`. [Test scripts](pie-scripts.md#daemon-events) lists their payloads.
 
 The daemon also manages the project's plugins over HTTP, for clients such as an in-editor panel. `GET /v1/plugins` lists the plugins `ue-mcp.yml` declares with their version, status and categories, and `GET /v1/plugins/catalog` lists the registry's published plugins. `POST /v1/plugins/install` (`{ name, version? }`), `POST /v1/plugins/update` (`{ name? }`) and `POST /v1/plugins/uninstall` (`{ name }`) run the same `ue-mcp plugin` commands, one at a time, and publish `plugins.changed` on the event stream. A change takes effect when the server restarts.
+
+### What a client can read from the daemon
+
+These routes serve a client that builds its own agent context, such as an in-editor panel. Each is also on the extension API, and `/v1/health` lists its feature name under `features` (an extension reads `api.features`).
+
+| Route | Extension API | Feature | Answers |
+|---|---|---|---|
+| `GET /v1/skills` | `api.skills.list()` | `skills` | Every skill a client of this project can load |
+| `GET /v1/context/projection?strategy=&categories=` | `api.context.project(opts)`, `api.context.call(tool, input, opts?)` | `context.projection` | What a context strategy and category scope advertise, and a call against that surface |
+| `GET /v1/actions?categories=` | `api.actions.effects(categories?)` | `actions.effects` | Each action's effect and whether it is destructive |
+
+**Skills.** `GET /v1/skills` returns `{ skills }`: ue-mcp's packaged skills and every skill directory under the project's `.claude/skills` and `.agents/skills`. Each entry has its `id` (the directory name; a plugin's skills are installed as `<namespace>-<skill>`), `name` and `description` from the frontmatter, the absolute `dir`, the other `files` in it, the `body` without frontmatter, the parsed `frontmatter`, `tokens` (SKILL.md characters / 4, rounded up), `location` (`packaged` or `project`) with the project `folder`, and `owner`:
+
+- `{ kind: "ue-mcp", version }` for a packaged skill, or a project copy `.ue-mcp/skills.json` records as ue-mcp's own.
+- `{ kind: "plugin", package, version }` for a copy recorded under a plugin package. `version` is the installed package's, or `null` when it cannot be found.
+- `{ kind: "project" }` for anything else, and for everything in `.agents/skills`.
+
+One id is listed once. A project copy wins over the packaged one, and `.claude/skills` over `.agents/skills`; the winner lists what it hides in `shadows`. A SKILL.md whose frontmatter does not parse is still listed, with the reason in `problems`.
+
+**Context projection.** `GET /v1/context/projection?strategy=micro|lean|full&categories=a,b` returns what the server would hand a client under that [context strategy](#context-strategy-full-lean-micro), narrowed to those categories: `strategy`, `categories` (the scope after resolving; omitted means every enabled category), `instructions` (the initialize text, quoting the scope's counts and categories), `tools` (each tool's `name`, `description`, `inputSchema` as `tools/list` sends it, and `category`, null for micro's `tools` gateway, lean's `catalog` and `flow`), and `seedTokens`, the characters of the instructions and tools JSON divided by 4, the estimate `scripts/context-tax.mjs` makes without an API key (`estimator: "chars/4"`). Over every category it is exactly what the server sends for that strategy. Lean's `catalog` and micro's gateway search and describe only the scope. `strategy` defaults to the server's own; an unknown strategy or category answers 400.
+
+`api.context.call(tool, input, { strategy?, categories?, dialogPrompt?, dialogWaitMs?, elicit? })` runs one call to a projected tool as the MCP server would: a category, its lean `describe`, `catalog`, micro's `tools` gateway, or `flow`, through the same dispatch as `api.callAction`, so dialogs, forms, effect gates and checkpoints apply the same way. A tool or gateway call to a category outside the scope is refused with an error result and nothing runs.
+
+**Action effects.** `GET /v1/actions?categories=a,b` returns `{ actions }`, one entry per enabled action: `category`, `action`, `effect` (`read`, `mutate` or `unknown`) and `effectSource` (`declared` on the action, `inferred` from the name for a plugin action whose manifest gave none, `undeclared` when nothing claims it), read from the graph the server dispatches, plugin actions included. `destructive` says the action destroys or overwrites something it cannot give back. An action can declare it; otherwise a `mutate` or `unknown` action is destructive when its name leads with `delete`, `remove`, `clear`, `discard`, `revert`, `reset`, `purge`, `wipe`, `destroy`, `drop`, `overwrite`, `replace`, `restore` or `uninstall` (after an `epic_`, `bulk_` or `batch_` prefix), and a read never is. `destructiveSource` says which: `declared`, `lexicon` or `none`. The verb list is a fallback, so an action it misjudges declares the answer instead. An unknown category answers 400.
+
+### Context measurements
+
+A client that measures which context strategy costs least writes the result in one shared format, so measurements from different clients and models can be compared. `ue-mcp/daemon` exports the `ContextMeasurement` type, `parseContextMeasurement(value)` (returns `{ ok: true, value }` or `{ ok: false, errors }`, every problem named by its path) and `scopeBucket(categoryCount)`. The package ships the same shape as a JSON Schema at `ue-mcp/schemas/context-measurement.schema.json` for tools that are not TypeScript.
+
+```json
+{
+  "version": 1,
+  "measuredAt": "2026-10-25T12:30:00Z",
+  "ueMcpVersion": "1.4.11",
+  "client": { "name": "my-client", "version": "0.2.0" },
+  "runs": [
+    {
+      "model": { "vendor": "anthropic", "model": "claude-opus-5-5" },
+      "scope": "1-3",
+      "strategy": "micro",
+      "seedTokens": 2207,
+      "tasks": [
+        { "id": "place-light", "totalTokens": 18000, "modelCalls": 6, "discoveryCalls": 2, "passed": true }
+      ]
+    }
+  ]
+}
+```
+
+One run is one model, one strategy and one scope over a set of tasks. `scope` buckets how many categories the context was narrowed to: `1-3`, `4-8` or `9+`, as `scopeBucket` computes it. `seedTokens` is the projection's estimate for that strategy and scope (`GET /v1/context/projection`). Per task, `totalTokens` counts everything the task spent, `modelCalls` the model requests, `discoveryCalls` the tool calls that only searched or described the surface, and `passed` whether it did what it was asked. A task keeps its `id` across runs so runs can be compared. Keys outside the format are refused.
 
 ### Updates through the daemon
 
@@ -277,9 +338,11 @@ A minute after it starts, and every six hours, the daemon looks for a newer rele
 |---|---|---|
 | Binary, Windows | Swapped in now | Each loaded file renamed aside and replaced; the new bridge loads on the next start, and the renamed files are removed once the editor exits |
 | Binary, Mac and Linux | Swapped in now | Staged beside the plugin and swapped in when the editor exits |
-| Source | Deployed; builds on the next restart | Deployed; builds on the next restart |
+| Source | Deployed and built now; a failed build fails the update | Deployed, with the build recorded as owed; the next start or restart through ue-mcp builds before the editor opens |
 
-Each step is reported as `update.staged`, `update.applied` or `update.failed`. A downloaded archive is installed only when the release manifest lists it with a matching SHA-256, and source is never written over a binary install. `UE_MCP_DISABLE_UPDATE_CHECK=1` turns the periodic check off.
+Unreal rebuilds a module on start only when its DLL is missing, never when its source is newer, so a source update is always built by ue-mcp. An owed build shows as `plugin.pendingBuild` in `GET /v1/install`, and `POST /v1/editor/rebuild` stops the editor, builds, and starts it again only when the build passed; a failed step carries `reason`. Running `ue-mcp update --apply-only` again with the editor down also finishes an owed build.
+
+Each step is reported as `update.staged`, `update.building`, `update.applied` or `update.failed`. A downloaded archive is installed only when the release manifest lists it with a matching SHA-256, and source is never written over a binary install. `UE_MCP_DISABLE_UPDATE_CHECK=1` turns the periodic check off.
 
 ## Bridge Connection
 
@@ -395,6 +458,7 @@ The C++ bridge plugin enables these UE plugins (adding them to `.uproject` if mi
 | `npx ue-mcp auth` | Run the GitHub device flow standalone so `feedback(submit)` can author issues as your real GitHub user. Same step that lives inside `init`; use this if you skipped it at init time. |
 | `npx ue-mcp uninstall-hooks` | Remove the feedback PostToolUse hook from every Claude Code settings file recorded for this project in `~/.ue-mcp/state.json`. |
 | `npx ue-mcp dialog mode [<mode>]` | Read or set how a modal dialog blocking the editor is handled (`interactive`, `auto`, or `defer`). `--editor <name>` scopes it to one project; `default` clears it. Stored in `~/.ue-mcp/state.json`. See [Dialog handling mode](#dialog-handling-mode). |
+| `npx ue-mcp playtest mode [<mode>]` | Read or set who starts playtest runs (`manual` or `automatic`). `--editor <name>` scopes it to one project; `clear` clears it. Stored in `~/.ue-mcp/state.json`. See [Playtest mode](#playtest-mode). |
 | `npx ue-mcp feedback mode [<mode>]` | Read or set your personal feedback approval mode (`interactive`, `auto-approve`, or `defer`). Stored in `~/.ue-mcp/state.json`. See [Feedback → modes](feedback.md#feedback-modes). |
 | `npx ue-mcp feedback list \| show \| approve \| discard \| review` | Manage submissions queued while feedback mode is `defer`. `review` (experimental) walks the queue interactively (approve/discard/skip per item). See [Feedback → Reviewing deferred submissions](feedback.md#reviewing-deferred-submissions). |
 | `npx ue-mcp resolve <issue>` | Fetch a feedback issue, branch, hand it to Claude Code to implement, open a PR. See [Feedback](feedback.md#resolving-feedback-issues). |

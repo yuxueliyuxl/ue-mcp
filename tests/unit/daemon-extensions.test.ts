@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startDaemon, type Daemon } from "../../src/daemon/daemon.js";
-import { signBundle } from "../../src/daemon/ui-bundles.js";
+import { signBundle, UiBundleStore } from "../../src/daemon/ui-bundles.js";
 import { DAEMON_API_VERSION } from "../../src/daemon/discovery.js";
 import { restoreEnv } from "../helpers/env.js";
 import { userSandboxEnv } from "../helpers/user-sandbox.js";
@@ -89,6 +89,7 @@ beforeAll(async () => {
       api.route("POST", "/modes", (req) => {
         if (req.body?.feedback !== undefined) api.modes.setFeedback(req.body.feedback ?? undefined);
         if (req.body?.dialog !== undefined) api.modes.setDialog(req.body.dialog ?? undefined);
+        if (req.body?.playtest !== undefined) api.modes.setPlaytest(req.body.playtest ?? undefined);
         return { body: api.modes.get() };
       });
       api.route("POST", "/status", async () => {
@@ -106,6 +107,15 @@ beforeAll(async () => {
     ueMcpExtension: { name: "future", api: { min: 99, max: 99 } },
   }));
   fs.writeFileSync(path.join(future, "index.js"), "export function activate() {}");
+
+  // One that needs a ue-mcp newer than this one.
+  const ahead = path.join(sandbox, "extensions", "ahead");
+  fs.mkdirSync(ahead, { recursive: true });
+  fs.writeFileSync(path.join(ahead, "package.json"), JSON.stringify({
+    name: "ahead-ext", version: "2.0.0", type: "module", main: "index.js",
+    ueMcpExtension: { name: "ahead", api: { min: 1, max: 99 }, ueMcp: "999.0.0" },
+  }));
+  fs.writeFileSync(path.join(ahead, "index.js"), "export function activate() {}");
 
   daemon = await startDaemon({
     projects: [uproject],
@@ -127,6 +137,14 @@ describe("extensions", () => {
   it("loads the compatible extension and skips the other", async () => {
     const health = await (await fetch(`${base}/v1/health`, { headers: auth })).json();
     expect(health.extensions).toEqual([{ name: "sample", version: "0.1.0" }]);
+  });
+
+  it("refuses an extension that needs a newer ue-mcp, and says which in health", async () => {
+    const health = await (await fetch(`${base}/v1/health`, { headers: auth })).json();
+    expect(health.refusedExtensions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "ahead", version: "2.0.0", needsUeMcp: "999.0.0", reason: expect.stringContaining("needs ue-mcp 999.0.0 or later") }),
+    ]));
+    expect(health.extensions.map((x: { name: string }) => x.name)).not.toContain("ahead");
   });
 
   it("serves its routes, with path params and a per-project data dir", async () => {
@@ -155,9 +173,17 @@ describe("modes, for an extension", () => {
   const modes = async (body: unknown) =>
     (await fetch(`${base}/v1/ext/sample/modes`, { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify(body) })).json();
 
-  it("sets this project's feedback and dialog modes and reads them back, then clears them", async () => {
-    expect(await modes({ feedback: "defer", dialog: "auto" })).toEqual({ feedback: { mode: "defer", project: true }, dialog: { mode: "auto", project: true } });
-    expect(await modes({ feedback: null, dialog: null })).toMatchObject({ feedback: { project: false }, dialog: { project: false } });
+  it("sets this project's feedback, dialog and playtest modes and reads them back, then clears them", async () => {
+    expect(await modes({ feedback: "defer", dialog: "auto", playtest: "manual" })).toEqual({
+      feedback: { mode: "defer", project: true },
+      dialog: { mode: "auto", project: true },
+      playtest: { mode: "manual", project: true },
+    });
+    expect(await modes({ feedback: null, dialog: null, playtest: null })).toMatchObject({
+      feedback: { project: false },
+      dialog: { project: false },
+      playtest: { mode: null, project: false },
+    });
   });
 });
 
@@ -253,6 +279,13 @@ describe("UI bundles", () => {
     expect((await fetch(`${base}/v1/health`, { headers: { cookie } })).status).toBe(200);
   });
 
+  it("ranks a release above its own prereleases", () => {
+    const store = new UiBundleStore(DAEMON_API_VERSION, path.join(sandbox, "ui-semver"));
+    store.trustKey(publicPem);
+    for (const v of ["1.2.0-beta.3", "1.2.0", "1.2.0-beta.10", "1.1.9"]) store.install(bundle("semver", v));
+    expect(store.active()?.manifest.version).toBe("1.2.0");
+  });
+
   it("names its cookie by port, so another project's daemon on the same host cannot overwrite it", async () => {
     const login = await fetch(`${base}/ui/?token=${daemon.token}`, { redirect: "manual" });
     const cookie = login.headers.get("set-cookie")!.split(";")[0];
@@ -284,4 +317,24 @@ describe("a held event loop", () => {
       spy.mockRestore();
     }
   }, 15_000);
+});
+
+describe("test script events", () => {
+  it("advertises the script events and republishes the bus as script.<type>", async () => {
+    const res = await (await fetch(`${base}/v1/ext/sample/features`, { headers: auth })).json();
+    expect(res.features).toEqual(expect.arrayContaining(["events.script"]));
+
+    const { emitScriptEvent } = await import("../../src/pie/script-events.js");
+    const before = daemon.events.lastId;
+    const common = { runId: "run-x", script: "/Game/PIEStudio/Scripts/Door", at: "2026-10-23T10:00:00.000Z" };
+    emitScriptEvent({ ...common, type: "step_passed", atMs: 1200, seq: 3, step: { index: 0, instruction: "Open the door", judge: "auto", status: "passed" } });
+    emitScriptEvent({ ...common, type: "verdict_requested", atMs: 1500, seq: 4, awaiting: [{ index: 1, instruction: "The door opens smoothly" }] });
+    emitScriptEvent({ ...common, type: "run_finished", atMs: 9000, seq: 7, state: "finished", summary: { total: 2, passed: 2, failed: 0, skipped: 0, pending: 0 } });
+    const seen = daemon.events.since(before).events;
+    expect(seen.map((e) => e.type)).toEqual(["script.step_passed", "script.verdict_requested", "script.run_finished"]);
+    expect(seen[0].data).toEqual({ ...common, atMs: 1200, seq: 3, step: { index: 0, instruction: "Open the door", judge: "auto", status: "passed" } });
+    expect(seen[1].data).toMatchObject({ runId: "run-x", awaiting: [{ index: 1 }] });
+    expect(seen[2].data).toMatchObject({ seq: 7, summary: { passed: 2 } });
+    expect(seen.every((e) => !("type" in e.data))).toBe(true);
+  });
 });

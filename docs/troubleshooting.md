@@ -209,6 +209,12 @@ If the editor starts but the bridge doesn't appear in the Output Log:
 2. **Build step.** Make sure you ran `npm run build` - the server runs from `dist/index.js`, not source.
 3. **Path to .uproject.** The path must be absolute and point to a valid `.uproject` file.
 
+### Server won't start after an update, with npm's `min-release-age` set
+
+npm 11.10 and later refuse a package version younger than `min-release-age` days. `npx` does not apply `min-release-age-exclude`, so excluding `ue-mcp` does not help, and a client config that runs `npx -y ue-mcp@<version>` fails with `ETARGET No matching version found` until the release is old enough.
+
+The configs ue-mcp writes carry `--min-release-age=0` before the package spec, which lifts the gate for that one launch. Its dependencies resolve without the gate too. `ue-mcp doctor` reports any npx entry the gate would refuse, and `ue-mcp doctor --fix` adds the flag to it. Keep the `=` form: npm before 11.10 ignores the unknown key, but would take a separate `0` for the package to run.
+
 ### Tools return errors
 
 - **"Bridge not connected"** - the editor isn't running or the plugin isn't loaded. See connection issues above.
@@ -306,9 +312,20 @@ When `ue-mcp` is a dependency in the project's `package.json`, `npx ue-mcp` runs
 
 - `ue-mcp update --build` aligns the local copy to latest automatically, or
 - remove `ue-mcp` from the project's `package.json` and delete `node_modules/ue-mcp`, or
-- pin `.mcp.json` to `npx -y ue-mcp@latest` so the server self-heals to latest on every launch.
+- pin `.mcp.json` to `npx -y --min-release-age=0 ue-mcp@latest` so the server self-heals to latest on every launch.
 
 Then quit and relaunch your MCP client so it spawns the updated server.
+
+## A Beta Install Keeps Coming Back as the Stable Release
+
+A bare `npx ue-mcp` resolves to the `latest` dist-tag, which is the stable line. On the beta channel, run every command against the channel instead:
+
+```bash
+npx ue-mcp@beta update
+npx ue-mcp@beta doctor
+```
+
+`ue-mcp update` run by an older package leaves a newer binary bridge alone and says which command updates it. A stable MCP client entry (`ue-mcp@latest`) still works: its shim starts the daemon at the installed bridge's version. `ue-mcp doctor` shows what a bare `npx ue-mcp` runs as `effective (npx)` and flags a bridge ahead of it.
 
 ## A Fix Shipped but the Editor Behaves the Same (stale compiled plugin)
 

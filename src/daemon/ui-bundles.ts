@@ -7,12 +7,15 @@
  * bindings.
  *
  * Bundles are versioned apart from ue-mcp. Each declares the daemon API range
- * it works with, and the daemon serves the newest compatible one.
+ * it works with. A bundle named for a loaded extension is served only at that
+ * extension's version or older (see selectBundle), so an older agent never gets
+ * a newer UI.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { userDir } from "../core/user-dir.js";
+import { compareVersions } from "../extensions/version.js";
 
 export interface UiManifest {
   name: string;
@@ -26,6 +29,38 @@ export interface UiManifest {
 export interface UiBundle {
   manifest: UiManifest;
   dir: string;
+}
+
+/** A loaded extension, as far as choosing its UI bundle goes. */
+export interface UiBundleOwner {
+  /** The extension name, which its bundles carry as manifest.name. */
+  name: string;
+  /** The extension package version. */
+  version: string;
+  /** The oldest bundle version it works with (`ueMcpExtension.ui.min`). */
+  uiMin?: string;
+}
+
+/**
+ * The bundle to serve. A bundle named for a loaded extension is a candidate
+ * only from that extension's `uiMin` up to its own version, so the exact match
+ * wins and nothing newer is ever served. Bundles no loaded extension names are
+ * used only when no owned one qualifies. Newest wins in semver order.
+ */
+export function selectBundle<T extends { manifest: UiManifest }>(candidates: readonly T[], owners: readonly UiBundleOwner[]): T | null {
+  const ownerOf = new Map(owners.map((o) => [o.name, o]));
+  const owned: T[] = [];
+  const free: T[] = [];
+  for (const c of candidates) {
+    const owner = ownerOf.get(c.manifest.name);
+    if (!owner) free.push(c);
+    else if (compareVersions(c.manifest.version, owner.version) <= 0 && (!owner.uiMin || compareVersions(c.manifest.version, owner.uiMin) >= 0)) owned.push(c);
+  }
+  const pool = owned.length > 0 ? owned : free;
+  // Semver order: a release ranks above its own prereleases, so 1.2.0 outranks 1.2.0-beta.3.
+  // Equal precedence (build metadata differs) prefers the version string the owner names exactly.
+  const exact = (c: T) => (ownerOf.get(c.manifest.name)?.version === c.manifest.version ? 1 : 0);
+  return [...pool].sort((a, b) => compareVersions(a.manifest.version, b.manifest.version) || exact(a) - exact(b)).at(-1) ?? null;
 }
 
 export function uiStoreDir(): string {
@@ -82,6 +117,7 @@ export function verifyBundle(dir: string, trustedKeys: readonly crypto.KeyObject
 export class UiBundleStore {
   private readonly keys: crypto.KeyObject[] = [];
   private current: UiBundle | null = null;
+  private owners: UiBundleOwner[] = [];
 
   constructor(private readonly apiVersion: number, private readonly root: string = uiStoreDir()) {}
 
@@ -90,6 +126,12 @@ export class UiBundleStore {
     const key = crypto.createPublicKey(pem);
     if (key.asymmetricKeyType !== "ed25519") throw new Error("UI signing keys must be Ed25519");
     this.keys.push(key);
+    this.current = null;
+  }
+
+  /** The loaded extensions whose bundles are held to their versions. Replaces the previous set. */
+  setOwners(owners: readonly UiBundleOwner[]): void {
+    this.owners = [...owners];
     this.current = null;
   }
 
@@ -107,7 +149,7 @@ export class UiBundleStore {
     return manifest;
   }
 
-  /** The newest installed bundle that verifies and supports this daemon's API, or null. */
+  /** The installed bundle selectBundle picks among those that verify and support this daemon's API, or null. */
   active(): UiBundle | null {
     if (this.current) return this.current;
     if (!fs.existsSync(this.root) || this.keys.length === 0) return null;
@@ -122,8 +164,7 @@ export class UiBundleStore {
         // Not ours, tampered, or for a key no extension trusts: never served.
       }
     }
-    candidates.sort((a, b) => a.manifest.version.localeCompare(b.manifest.version, undefined, { numeric: true }));
-    this.current = candidates.at(-1) ?? null;
+    this.current = selectBundle(candidates, this.owners);
     return this.current;
   }
 

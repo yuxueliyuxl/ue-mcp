@@ -104,7 +104,7 @@ src/
 ├── integrations/claude-code/  # Hooks and MCP client config
 ├── cli/                  # Subcommands, --editor parsing, terminal UI (cli/ui/)
 ├── flow/                 # Flow engine (registry, loader, task factory, HTTP)
-└── tools/                # <!-- count:tools -->29<!-- /count --> category tools, one file each
+└── tools/                # <!-- count:tools -->30<!-- /count --> category tools, one file each
     ├── project/          # project category, split by action group
     ├── epic/             # Generated epic_* actions (npm run epic:generate)
     └── specs/            # Generated parameter specs (npm run specs:generate)
@@ -193,19 +193,27 @@ records the bridge publishes.
 npm run test:live
 ```
 
-It attaches to an editor that is **already running** and never starts or stops
-one. The preflight finds the bridge, asks the editor which project it has open,
-prints the target, and aborts with the ports it tried when nothing answers, so
-"no editor" is one message rather than a wall of failed assertions. Like the
-smoke runner, it drives `tests/ue_mcp` and refuses every other project.
+It runs sharded: each shard is a copy of `tests/ue_mcp` with its own editor
+and port, launched with the flags its files declare (`// @live-editor
+headless`, `render`, `interactive`, `base`, `scm`), most of them `-nullrhi`.
+Files are split by measured time, the shard count follows the memory free at
+launch, and the run fails when it takes longer than 10 minutes or a single
+test passes its budget. Every shard is checked to have its own project open
+before anything is sent, and no other project is ever touched.
+
+`npm run test:live -- --attach` instead drives the `tests/ue_mcp` editor that
+is **already running**, and never starts or stops it. Its preflight finds the
+bridge, asks the editor which project it has open, prints the target, and
+aborts with the ports it tried when nothing answers.
 
 - **One editor is enough.** Cases that need more than one editor use a second
   session for a throwaway project whose editor is not running: a session is
   registered for every project regardless of editor state, and the session
   count is what arms targeting, gating and the union refusal.
 - **The leak assertions need the parameter echo**, which can only be armed when
-  the editor process starts. Launch the editor with `UE_MCP_PARAM_ECHO=1` in its
-  environment to include them; without it they skip and the runner says so.
+  the editor process starts. Shard editors are launched with it. In attach mode,
+  launch the editor with `UE_MCP_PARAM_ECHO=1` in its environment to include
+  them; without it they skip and the runner says so.
 - `tests/live/matrix.ts` records, case by case, where each assertion lives, and
   `tests/live/coverage.test.ts` checks every reference still resolves.
 - **Crash-class inputs** (`tests/live/crash-class-inputs.test.ts`) drive the

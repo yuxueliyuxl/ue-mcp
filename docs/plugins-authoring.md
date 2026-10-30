@@ -226,14 +226,14 @@ For each category your plugin injects into, ship a short markdown file under `kn
 Keep it terse - one screenful per category. Concrete examples beat prose. The agent already knows how the category works; the knowledge file is just the delta the plugin introduces.
 
 ```markdown
-# PIE Studio - gameplay actions
+# Sample Recorder - gameplay actions
 
-33 actions for PIE input recording, replay, observation, and injection.
+4 actions for recording and replaying gameplay input.
 
 Quick start:
-1. `gameplay(action="pie_record_arm", sample_hz=60)` - arm the recorder
-2. Press Play, do your thing, stop PIE
-3. `gameplay(action="pie_replay_arm", recording_id="<id>", eject=true, time_scale=0.1)` - replay at 10%
+1. `gameplay(action="rec_record_arm", sample_hz=60)` - arm the recorder
+2. Press Play, play, stop PIE
+3. `gameplay(action="rec_replay_arm", recording_id="<id>")` - replay it
 ```
 
 ## Skills

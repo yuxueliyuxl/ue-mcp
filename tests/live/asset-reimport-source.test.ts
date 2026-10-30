@@ -1,3 +1,4 @@
+// @live-editor headless
 /**
  * `asset(reimport)`: what it reads, and what it refuses (#1008).
  *

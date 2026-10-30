@@ -2,21 +2,21 @@
 
 When a plugin needs engine APIs ue-mcp's bridge doesn't already expose, it ships a UE C++ module alongside the npm package. The module compiles into the user's project at install time and registers handlers on the bridge via `UEMCP::RegisterExternalHandler`. This is Shape C from the [overview](plugins.md); most plugins never need it.
 
-`pie-studio` is a real-world example of this shape. Its manifest:
+Here is the manifest of a plugin of this shape, a fictional `sample-recorder`:
 
 ```yaml
-actionPrefix: pie                    # used only when injecting into a built-in
+actionPrefix: rec                    # used only when injecting into a built-in
 
 nativeModule:
-  uePluginName: PIE_Studio           # name of the .uplugin that gets deployed
+  uePluginName: Sample_Recorder      # name of the .uplugin that gets deployed
   minBridgeApi: 2                    # gate against UEMCP_BRIDGE_API_VERSION; 2 = typed contracts
-  source: ue/Plugins/PIE_Studio      # path inside your npm tarball
-  category: pie                      # surface handlers under a pie(...) tool
-  categoryDescription: "PIE record, replay, observe, and input injection"
+  source: ue/Plugins/Sample_Recorder # path inside your npm tarball
+  category: recorder                 # surface handlers under a recorder(...) tool
+  categoryDescription: "Record and replay gameplay input"
   specs: handler-specs.json          # recorded C++ contracts (ue-mcp plugin record-specs)
   handlers:
-    record_arm:   { description: "Arm the PIE input recorder" }
-    replay_arm:   { description: "Arm the PIE input replayer" }
+    record_arm:   { description: "Arm the input recorder" }
+    replay_arm:   { description: "Arm the input replayer" }
     inject_input:
       description: "Single-frame Enhanced Input inject"
       timeoutSeconds: 5
@@ -27,8 +27,8 @@ nativeModule:
 
 Set `category` and ue-mcp surfaces every handler as an MCP action that dispatches to the bare bridge method your C++ registered (`record_arm` above). No TypeScript task class is involved - the C++ handler *is* the implementation. The category value picks one of two shapes:
 
-- **A new (non-built-in) category** - as in the `pie` example above - is **provisioned as its own top-level tool** the plugin owns. Actions are **not** prefixed (the category is the namespace): `pie(action="record_arm")`. Set `categoryDescription` for the tool's summary. This is the right choice when the handlers form their own domain. Cross-plugin name collisions resolve first-wins, like `provides:`.
-- **A built-in category** (e.g. `gameplay`) **injects** the handlers into that existing tool, prefixed with `actionPrefix`: handler `record_arm` becomes `gameplay(action="pie_record_arm")`. Choose this when the handlers belong inside a category that already exists.
+- **A new (non-built-in) category** - as in the `recorder` example above - is **provisioned as its own top-level tool** the plugin owns. Actions are **not** prefixed (the category is the namespace): `recorder(action="record_arm")`. Set `categoryDescription` for the tool's summary. This is the right choice when the handlers form their own domain. Cross-plugin name collisions resolve first-wins, like `provides:`.
+- **A built-in category** (e.g. `gameplay`) **injects** the handlers into that existing tool, prefixed with `actionPrefix`: handler `record_arm` becomes `gameplay(action="rec_record_arm")`. Choose this when the handlers belong inside a category that already exists.
 
 Two rules that bite if missed:
 
@@ -76,19 +76,19 @@ Ship that file in the tarball (`files:`). The server builds the surface from the
 ## Layout inside the npm tarball
 
 ```
-pie-studio/
+sample-recorder/
   ue-mcp.plugin.yml
   dist/                              # tsc output (TypeScript tasks, if any)
   ue/                                # native source ships here
     Plugins/
-      PIE_Studio/
-        PIE_Studio.uplugin
+      Sample_Recorder/
+        Sample_Recorder.uplugin
         Source/
-          PIE_Studio/
-            PIE_Studio.Build.cs
+          Sample_Recorder/
+            Sample_Recorder.Build.cs
             Private/
               Handlers/              # handler .cpp files
-              PIE/                   # engine subsystem wrappers
+              Recorder/              # engine subsystem wrappers
               UI/                    # editor UI panels
 ```
 
@@ -103,9 +103,9 @@ Update `package.json` `files:` so the `ue/` directory ships with the published t
 Add `UE_MCP_Bridge` to `PrivateDependencyModuleNames` in your `.Build.cs`:
 
 ```csharp
-public class PIE_Studio : ModuleRules
+public class Sample_Recorder : ModuleRules
 {
-    public PIE_Studio(ReadOnlyTargetRules Target) : base(Target)
+    public Sample_Recorder(ReadOnlyTargetRules Target) : base(Target)
     {
         PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "Json" });
         PrivateDependencyModuleNames.AddRange(new string[] { "UE_MCP_Bridge" });
@@ -118,7 +118,7 @@ Register handlers from `StartupModule`:
 ```cpp
 #include "MCPHandlerRegistration.h"
 
-void FPIE_StudioModule::StartupModule()
+void FSample_RecorderModule::StartupModule()
 {
     UEMCP::RegisterExternalHandler(
         TEXT("inject_input"),
@@ -135,18 +135,18 @@ void FPIE_StudioModule::StartupModule()
         });
 }
 
-void FPIE_StudioModule::ShutdownModule()
+void FSample_RecorderModule::ShutdownModule()
 {
     UEMCP::UnregisterExternalHandler(TEXT("inject_input"));
 }
 ```
 
-The handler's method name (`inject_input`) is the bare bridge method. It's what an auto-surfaced action (`gameplay(action="pie_inject_input")`, via `nativeModule.category`) dispatches to, what a TypeScript task can address through `this.call(...)`, and what the bridge looks up on any dispatch. Register it bare - ue-mcp adds the `actionPrefix` when it surfaces the action.
+The handler's method name (`inject_input`) is the bare bridge method. It's what an auto-surfaced action (`gameplay(action="rec_inject_input")`, via `nativeModule.category`) dispatches to, what a TypeScript task can address through `this.call(...)`, and what the bridge looks up on any dispatch. Register it bare - ue-mcp adds the `actionPrefix` when it surfaces the action.
 
 ## Install flow
 
 ```bash
-ue-mcp plugin install pie-studio
+ue-mcp plugin install sample-recorder
 ```
 
 The CLI now also:

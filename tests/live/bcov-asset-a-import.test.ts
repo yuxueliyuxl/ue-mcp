@@ -1,3 +1,4 @@
+// @live-editor render
 /**
  * Imports and texture assets, read back through a second action: generic,
  * static mesh, skeletal mesh and animation imports from files the editor

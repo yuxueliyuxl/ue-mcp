@@ -21,6 +21,10 @@
 export { DAEMON_API_VERSION, readDiscovery, readLiveDiscovery, discoveryPath, type DaemonDiscovery } from "./daemon/discovery.js";
 export {
   EXTENSION_API_VERSION,
+  EXTENSION_API_MIN_VERSION,
+  type ModelProvider,
+  type ModelRequest,
+  type ModelResponse,
   type ActionResult,
   type CallActionOptions,
   type DialogEventData,
@@ -31,7 +35,32 @@ export {
   type ExtensionHandler,
   type ExtensionRequest,
   type ExtensionResponse,
+  type ChangeEntry,
+  type CheckpointInfo,
+  type ChangesResult,
+  type CheckpointResult,
+  type CheckpointState,
+  type RestoreRefusal,
+  type RestoreResult,
+  type DaemonSkill,
+  type DaemonSkillOwner,
+  type ShadowedSkill,
+  type ProjectSkillFolder,
+  type ContextCallOptions,
+  type ContextProjection,
+  type ContextProjectionOptions,
+  type ProjectedTool,
+  type ActionEffectInfo,
 } from "./daemon/extension-api.js";
+export {
+  parseContextMeasurement,
+  scopeBucket,
+  type ContextMeasurement,
+  type ContextMeasurementParse,
+  type ContextMeasurementRun,
+  type ContextMeasurementTask,
+  type ContextScopeBucket,
+} from "./daemon/context-measurement.js";
 export type { DaemonEvent } from "./daemon/events.js";
 export type { DialogPromptFn, DialogPromptRequest, DialogPromptResult } from "./core/types.js";
 export type { DisconnectCause } from "./daemon/disconnect.js";

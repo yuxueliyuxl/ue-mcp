@@ -1,13 +1,15 @@
+// @live-editor render
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBridge, disconnectBridge, callBridge, TEST_PREFIX } from "../setup.js";
 import type { EditorBridge } from "../../src/bridge/bridge.js";
+import { TEST_PROJECT_DIR } from "../../scripts/bridge-target.mjs";
 
 let bridge: EditorBridge;
 const id = `AssetPipeline_${Date.now()}`;
 const folder = `${TEST_PREFIX}/${id}`;
-const savedDir = path.resolve("tests/ue_mcp/Saved");
+const savedDir = path.join(TEST_PROJECT_DIR, "Saved");
 const disk = path.join(savedDir, id);
 const created = new Set<string>();
 const textures = ["T_Color", "T_Normal", "T_RMA"].map((name) => `${folder}/${name}.${name}`);

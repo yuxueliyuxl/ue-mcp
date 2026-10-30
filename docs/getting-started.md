@@ -153,7 +153,7 @@ If an update "succeeds" but the running server keeps reporting an old version, r
 ue-mcp doctor
 ```
 
-It prints every version source - registry latest, npm global, the running server(s), the deployed bridge plugin - and, crucially, flags a project-local `node_modules/ue-mcp` that **shadows** the global install. With `ue-mcp` pinned in a project's `package.json`, `npx ue-mcp` runs the local copy, so global updates do nothing. `doctor` surfaces that one-line root cause (and suggests pinning `.mcp.json` to `npx -y ue-mcp@latest` so the server self-heals on each launch). `ue-mcp update --build` aligns a stale local copy automatically. It also flags a `.mcp.json` pinned to a version other than the installed bridge plugin's.
+It prints every version source - registry latest, npm global, the running server(s), the deployed bridge plugin - and, crucially, flags a project-local `node_modules/ue-mcp` that **shadows** the global install. With `ue-mcp` pinned in a project's `package.json`, `npx ue-mcp` runs the local copy, so global updates do nothing. `doctor` surfaces that one-line root cause (and suggests pinning `.mcp.json` to `npx -y --min-release-age=0 ue-mcp@latest` so the server self-heals on each launch). `ue-mcp update --build` aligns a stale local copy automatically. It also flags a `.mcp.json` pinned to a version other than the installed bridge plugin's.
 
 After removing the bridge or a project, MCP client configs can be left pointing at it. `doctor` names every such entry, in the project's configs and the machine-wide ones (Claude Desktop, Claude Code global, Codex), and `ue-mcp doctor --fix` removes exactly those entries:
 
@@ -216,7 +216,7 @@ If you'd rather skip `npx ue-mcp init`, edit the MCP client config yourself.
       "mcpServers": {
         "ue-mcp": {
           "command": "npx",
-          "args": ["-y", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
+          "args": ["-y", "--min-release-age=0", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
         }
       }
     }
@@ -230,7 +230,7 @@ If you'd rather skip `npx ue-mcp init`, edit the MCP client config yourself.
       "mcpServers": {
         "ue-mcp": {
           "command": "npx",
-          "args": ["-y", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
+          "args": ["-y", "--min-release-age=0", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
         }
       }
     }
@@ -244,7 +244,7 @@ If you'd rather skip `npx ue-mcp init`, edit the MCP client config yourself.
       "mcpServers": {
         "ue-mcp": {
           "command": "npx",
-          "args": ["-y", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
+          "args": ["-y", "--min-release-age=0", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
         }
       }
     }
@@ -256,7 +256,7 @@ If you'd rather skip `npx ue-mcp init`, edit the MCP client config yourself.
     ```toml
     [mcp_servers.ue-mcp]
     command = "npx"
-    args = ["-y", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
+    args = ["-y", "--min-release-age=0", "ue-mcp@latest", "C:/path/to/MyGame.uproject"]
     cwd = "C:/path/to"
     enabled = true
     ```

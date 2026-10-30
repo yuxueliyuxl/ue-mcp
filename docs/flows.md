@@ -36,7 +36,7 @@ The response carries a `summary` line per step plus a `steps` array holding what
 
 ### Tasks
 
-A task is a named unit of work. UE-MCP ships with **<!-- count:actions -->2049+<!-- /count --> built-in tasks** across <!-- count:tools -->29<!-- /count --> categories - every action available through the MCP tools is also a flow task.
+A task is a named unit of work. UE-MCP ships with **<!-- count:actions -->2123+<!-- /count --> built-in tasks** across <!-- count:tools -->30<!-- /count --> categories - every action available through the MCP tools is also a flow task.
 
 Tasks are defined in the `tasks:` section of your config:
 
@@ -59,7 +59,7 @@ The fields:
 | `group` | No | Category for organization |
 | `options` | No | Default options passed to the task (can be overridden per-step) |
 
-You rarely need to define tasks yourself - the built-in defaults cover all <!-- count:actions -->2049+<!-- /count --> actions. You define tasks when you want to **override** or **add** custom ones.
+You rarely need to define tasks yourself - the built-in defaults cover all <!-- count:actions -->2123+<!-- /count --> actions. You define tasks when you want to **override** or **add** custom ones.
 
 ### Flows
 
@@ -457,16 +457,59 @@ Preview what a flow will do without running it:
 flow(action="plan", flowName="setup_scene")
 ```
 
-Returns each step with its task name, type, and skip status.
+Returns each step with its task name, type, and skip status, the flow as declared under `definition`, and the flow's `inputs`. `GET /flows/<name>/plan` on the flow HTTP server, and `GET /v1/flows/<name>/plan` on the daemon, return the same body.
+
+### Inputs
+
+`inputs` lists the parameters a run may pass in `params`. It is derived from the steps, so a flow author writes nothing for it. Each step task's parameters come from its action's schema, overlaid field by field by the task's `options_schema` where one is declared. A task that is not an action and declares no schema falls back to the `Params:` clause of its description.
+
+A parameter is an input when at least one step that reads it leaves it unset. A step sets a parameter through its own `options`, its task definition's `options`, a nesting flow step's override map, an alias of the parameter, or the other side of a choice (`actorLabel OR actorPath`). A parameter every step sets is not an input. Routing parameters (`editor`, `timeoutMs`, `select`, `omit`) never are. Nested flows contribute their own inputs, and hook steps (`on_start`, `on_success`, `on_failure`, `finally`) count too.
+
+| Field | Meaning |
+|-------|---------|
+| `name` | The key to pass in `params`. |
+| `type` | The parameter's type. When the steps disagree it is an array of every type, and `conflict: true` is set. |
+| `conflict` | Present, and `true`, when two steps type the parameter differently or allow no common `enum` value. |
+| `description` | From the first step that describes it. |
+| `enum` | The values every step reading it allows. |
+| `default` | The first default a step declares. |
+| `required` | A step reading it requires it and no step declares a default. |
+| `steps` | The steps that read it: `path` (`3`, `2/1` inside step 2's nested flow, `on_start/1` for a hook step), `task`, and the `flow` the step is declared in. |
+
+Required inputs come first, then the rest in the order the run meets them.
+
+```json
+{
+  "inputs": [
+    {
+      "name": "target",
+      "type": "string",
+      "description": "Asset path of the Blueprint to test, or a description of it to search for.",
+      "required": true,
+      "steps": [{ "path": "1", "task": "playtest.gather", "flow": "playtest" }]
+    },
+    {
+      "name": "package_path",
+      "type": "string",
+      "description": "Content folder the script is saved in.",
+      "required": false,
+      "steps": [{ "path": "8", "task": "playtest.save", "flow": "playtest" }]
+    }
+  ]
+}
+```
+
+Run params merge into every step's options, so a parameter the flow sets everywhere can still be overridden by passing it. `inputs` lists what the flow leaves open, not everything a run could override.
 
 ## Built-in Flows
 
-UE-MCP ships with three built-in flows you can run out of the box.
+UE-MCP ships with these built-in flows, which you can run out of the box.
 
 | Flow | Steps | What it does |
 |------|-------|--------------|
 | `beacon` | 56 | YAML-authored shrine scene built step by step via individual tool calls. Useful as a reference for how a multi-step flow looks. |
 | `neon_shrine` | 19 | The full Neon Shrine demo, driven through the bridge's `demo.step` handler. Leaves the editor on `/Game/Demo/DemoLevel`. |
+| `playtest` | 8 | Drafts a PIE test script for a target with the flow model, has the editor check it, and saves it. See [Playtest](#playtest). |
 | `neon_shrine_cleanup` | 1 | Wipes the Neon Shrine demo content. Switches the editor to `/Game/MCP_Home` first so you don't get stranded on Untitled. |
 
 ```
@@ -534,6 +577,65 @@ flow(action="run", flowName="neon_shrine_cleanup")
 ```
 
 For a step-by-step walkthrough of what each demo step builds, see the [Neon Shrine Demo](neon-shrine-demo.md) page.
+
+### Playtest
+
+Drafts a [test script](pie-scripts.md) for a target and saves it once the editor accepts it.
+
+```
+flow(action="run", flowName="playtest", params={ "target": "/Game/Hero/BP_Hero", "context": "the jump lands on the ledge" })
+```
+
+| Param | |
+|---|---|
+| `target` | Required. An asset or class path, or a description; a description is looked up among the project's Blueprints by its words. |
+| `context` | What to test, in your words. |
+| `profile` | Observation profile asset path for the script. |
+| `name`, `package_path` | Where the script is saved. Default `TS_Playtest_<target>` under `/Game/PIEStudio/Scripts`. |
+
+| Step | Task | |
+|---|---|---|
+| 1 | `playtest.gather` | Reads the target Blueprint, the project's input mapping contexts, and `pie(script_values)`: the values PIE can watch. |
+| 2 | `playtest.draft` | An agent step with no tools and a token budget, answering in the script step schema. |
+| 3 | `playtest.check` | `pie(script_validate)` on the draft. A refusal's errors become the next prompt. |
+| 4 to 7 | `playtest.draft`, `playtest.check` | Two more rounds, each run only when the last draft was refused. |
+| 8 | `playtest.save` | `pie(script_create)` with the draft that passed. |
+
+When the third draft is still refused, the flow fails with its errors and nothing is saved.
+
+## Agent Steps
+
+A task with `class_path: agent` (multi-turn, with tools) or `agent_prompt` (one call) runs on a model. The model comes from, in order:
+
+1. A provider a daemon extension registered with `api.models.register(provider)` (extension API 2, feature `models.provider`).
+2. `ANTHROPIC_API_KEY`, with `UE_MCP_FLOW_MODEL` naming the model (default `claude-opus-5-5`) and `ANTHROPIC_BASE_URL` an alternative endpoint.
+
+With neither, the step fails with `No model is configured for flow agent steps.`
+
+```yaml
+tasks:
+  summarize:
+    class_path: agent_prompt
+    options:
+      system: You describe Unreal projects in two sentences.
+      maxTokens: 2000
+flows:
+  describe_project:
+    description: Describe the project.
+    steps:
+      1: { task: project.get_info }
+      2: { task: summarize, options: { prompt: "Describe this project: ${steps.1}" } }
+```
+
+A provider is the object flowkit's agent tasks call:
+
+```ts
+interface ModelProvider {
+  complete(req: ModelRequest): Promise<ModelResponse>;
+}
+// ModelRequest: { system?, prompt?, messages?, model?, maxTokens?, temperature?, stop?, schema?, tools?, toolChoice?, signal? }
+// ModelResponse: { text, parsed?, toolCalls?, finishReason?, usage?: { inputTokens?, outputTokens? }, model? }
+```
 
 ---
 
@@ -729,7 +831,7 @@ Configuration is loaded with [`@db-lyon/flowkit`'s config loader](https://github
 
 | Layer | File | Purpose |
 |-------|------|---------|
-| 1 (base) | Built-in defaults | All <!-- count:actions -->2049+<!-- /count --> tasks, no flows |
+| 1 (base) | Built-in defaults | All <!-- count:actions -->2123+<!-- /count --> tasks, no flows |
 | 2 | `ue-mcp.yml` | Your project config |
 | 3 | `ue-mcp.{env}.yml` | Environment overlay (set `UE_MCP_ENV`) |
 | 4 | `ue-mcp.local.yml` | Local-only overrides (gitignore this) |

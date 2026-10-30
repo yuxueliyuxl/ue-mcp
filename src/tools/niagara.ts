@@ -161,6 +161,6 @@ export const niagaraTool: ToolDef = categoryTool(
     node: z.string().optional().describe("For graph_disconnect_pins/set_pin/set_node_property/remove_node: node name"),
     pin: z.string().optional().describe("For graph_disconnect_pins/set_pin: pin name"),
     direction: z.number().optional().describe("For graph_disconnect_pins/set_pin: 0 input, 1 output, -1 any"),
-    ops: z.array(z.record(z.unknown())).optional().describe("For batch: [{action, params}]"),
+    ops: z.array(z.record(z.string(), z.unknown())).optional().describe("For batch: [{action, params}]"),
   },
 );

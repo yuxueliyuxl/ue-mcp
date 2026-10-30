@@ -329,6 +329,13 @@ interface ActionSpecBase {
   effect: ActionEffect;
   /** Omitted means `declared`. Set to `inferred` only by runtime injection. */
   effectSource?: ActionEffectSource;
+  /**
+   * This action destroys or overwrites something it cannot give back: true
+   * or false said outright. Omitted, a client reading action effects falls
+   * back to the leading verb of the name (DESTRUCTIVE_VERBS), so declare it
+   * only where that fallback is wrong in either direction.
+   */
+  destructive?: boolean;
   description?: string;
   /** Override the bridge call timeout in milliseconds. Defaults to 30s. */
   timeoutMs?: number;

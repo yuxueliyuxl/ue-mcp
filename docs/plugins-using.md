@@ -32,7 +32,7 @@ The consumer surface is a single block in `ue-mcp.yml`:
 
 ```yaml
 plugins:
-  - name: pie-studio
+  - name: ue-mcp-perforce
   - name: some-other-plugin
     version: "^0.2.0"     # optional; npm semver range against package.json
 ```

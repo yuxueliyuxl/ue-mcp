@@ -11,7 +11,7 @@
  *
  * The bridge port is discovered, not assumed: see scripts/bridge-target.mjs.
  *
- * Usage:  node scripts/smoke-test.js [--host 127.0.0.1] [--port <port>] [--timeout 5000]
+ * Usage:  node scripts/smoke-test.js [--host 127.0.0.1] [--port <port>] [--timeout 5000] [--uncovered]
  */
 
 import fs from "fs";
@@ -60,7 +60,14 @@ const DIM = "\x1b[2m";
 // 1. Discover handler names from C++ sources
 // ---------------------------------------------------------------------------
 function discoverHandlers() {
-  return listRegistrations().map(({ method, file }) => ({ method, file }));
+  const all = listRegistrations().map(({ method, file }) => ({ method, file }));
+  if (!args.includes("--uncovered")) return all;
+  // --uncovered: only actions no behavioural test dispatches. The live and UE.MCP.* tests
+  // listed in the coverage inventory already call the rest and assert their effect, which
+  // is a stronger check than "it answered".
+  const inventory = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "tests", "coverage", "behavioural-coverage.json"), "utf-8"));
+  const covered = new Set(Object.values(inventory.actions).filter((a) => a.status === "covered").map((a) => a.method));
+  return all.filter((h) => !covered.has(h.method));
 }
 
 // ---------------------------------------------------------------------------

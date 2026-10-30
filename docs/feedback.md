@@ -32,8 +32,8 @@ Before assembling the body, the server reads the published catalog from `https:/
 
 | Signal | Example | Result |
 |---|---|---|
-| `repo` parameter | `repo="db-lyon/pie-studio"` | Honored, but **only** for ue-mcp core or a repo a registered plugin owns. Anything else is ignored and the report files against core. |
-| Ownership | `idealTool="pie(action=replay)"` and a loaded plugin provides the `pie` category | That plugin's repo, confidence `certain`. |
+| `repo` parameter | `repo="db-lyon/ue-mcp-perforce"` | Honored, but **only** for ue-mcp core or a repo a registered plugin owns. Anything else is ignored and the report files against core. |
+| Ownership | `idealTool="recorder(action=replay)"` and a loaded plugin provides the `recorder` category | That plugin's repo, confidence `certain`. |
 | Core anchor | The text names a built-in action such as `editor(play_in_editor)` | Core keeps it, even when a plugin also matched. The match is still shown at the prompt. |
 | Identity terms | The title names the plugin's slug, name, or a category it provides | That plugin's repo, confidence `likely`. |
 | Tag terms only | A listing's descriptive tag (`import`, `replay`) appears in the text | Core keeps it. The match is offered at the prompt as a one-click override. |
@@ -44,8 +44,8 @@ Preview the decision without posting anything:
 
 ```text
 feedback(action="route",
-  title="pie(replay) diverges from the recorded run after 200 frames",
-  summary="Replaying a recorded PIE session drifts from the capture...")
+  title="recorder(replay) diverges from the recorded run after 200 frames",
+  summary="Replaying a recorded session drifts from the capture by several metres.")
 ```
 
 It returns the target repo, the matched plugin and why, any runner-up suggestions, the core anchor it found, and whether the registry was reachable.
@@ -267,7 +267,7 @@ The hook handler self-gates: if `feedback` is in `ue-mcp.yml`'s `ue-mcp.disable[
 - **The redaction passes are non-bypassable.** They run before the body reaches the elicitation prompt or `submitFeedback`, and the agent never sees the pre-scrubbed bytes.
 - **Routing cannot aim a report at an arbitrary repo.** The `repo` parameter is accepted only for ue-mcp core or a repo a registered plugin owns, and the `Tracker` field on the approval prompt only accepts the two values it offered. There is no path from "an agent wrote a string" to "an issue on any GitHub project".
 - **The package ships no credentials.** `author="user"` posts with a token you authorized yourself through GitHub's device flow, stored under `~/.ue-mcp/`. `author="bot"` posts through a hosted signing service (`POST https://feedback.ue-mcp.com`) whose contract is to hold the `ue-mcp-feedback` App key server-side, apply per-caller rate limits, re-run the redaction pass, and only open issues on ue-mcp core or the tracker of a published plugin. Until a signing key is installed on that deployment the anonymous path hands back a prefilled issue URL instead of posting. Either way there is no key inside the package to extract.
-- **Disable the category if you don't want it available.** Add `"feedback"` to `ue-mcp.yml`'s `ue-mcp.disable[]` and the tool is not registered with the MCP server. The category checkbox lives in the **Agent behavior** section of `npx ue-mcp init` (default unchecked on fresh installs).
+- **Disable the category if you don't want it available.** Add `"feedback"` to `ue-mcp.yml`'s `ue-mcp.disable[]` and the tool is not registered with the MCP server. The category checkbox lives in the **Agent behavior** section of `npx ue-mcp init` (default unchecked on fresh installs). With it disabled, the `execute_python` workaround directive and the server instructions stop mentioning `feedback(action="submit")`; the agent tells you about the gap and points you at https://github.com/db-lyon/ue-mcp/issues to file it yourself.
 
 ## For maintainers
 
