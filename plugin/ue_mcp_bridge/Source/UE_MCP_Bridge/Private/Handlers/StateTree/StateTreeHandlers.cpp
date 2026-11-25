@@ -13,7 +13,7 @@
 #include "StateTreeEditorData.h"
 #include "StateTreeState.h"
 #include "StateTreeEditorNode.h"
-#include "StateTreeEditingSubsystem.h"
+#include "HandlerStateTreeEditingSubsystem.h"
 #include "StateTreeEditorPropertyBindings.h"
 #include "StateTreeCompilerLog.h"
 #include "StateTreeTypes.h"
@@ -332,32 +332,79 @@ void FStateTreeHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Required(TEXT("nodeClass"), EType::String, TEXT("The Blueprint class this node runs, as a class path or a loaded class name")),
 	});
 	Registry.RegisterHandler(TEXT("read_state_tree_runtime"), &ReadRuntime, {
-		MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Label of the actor carrying the running StateTree component (or pass actorPath)")),
-		MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Full object path of that actor; unambiguous where a label is not")),
+		MCPSharedParam::ActorLabel().Describe(TEXT("Label of the actor carrying the running StateTree component (or pass actorPath)")),
+		MCPSharedParam::ActorPath().Describe(TEXT("Full object path of that actor; unambiguous where a label is not")),
 		MCPParam::Optional(TEXT("componentName"), EType::String, TEXT("Which StateTree component, when the actor has more than one")),
-		MCPParam::Optional(TEXT("world"), EType::String, TEXT("pie (default), auto, or editor")),
-		MCPParam::Optional(TEXT("pieInstance"), EType::Integer, TEXT("Which PIE instance, when several are running")),
+		MCPSharedParam::World().Describe(TEXT("pie (default), auto, or editor")),
+		MCPSharedParam::PieInstance(),
 		MCPParam::Optional(TEXT("includeDebugStrings"), EType::Boolean, TEXT("Include the engine's own debug dump of the execution state")),
 	});
 	Registry.RegisterHandler(TEXT("send_state_tree_event"), &SendEvent, {
-		MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Label of the actor carrying the running StateTree component (or pass actorPath)")),
-		MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Full object path of that actor; unambiguous where a label is not")),
+		MCPSharedParam::ActorLabel().Describe(TEXT("Label of the actor carrying the running StateTree component (or pass actorPath)")),
+		MCPSharedParam::ActorPath().Describe(TEXT("Full object path of that actor; unambiguous where a label is not")),
 		MCPParam::Required(TEXT("eventTag"), EType::String, TEXT("Registered gameplay tag of the event")),
 		MCPParam::Optional(TEXT("componentName"), EType::String, TEXT("Which StateTree component, when the actor has more than one")),
 		MCPParam::Optional(TEXT("origin"), EType::String, TEXT("Who the event says it came from (default ue-mcp)")),
-		MCPParam::Optional(TEXT("world"), EType::String, TEXT("pie (default), auto, or editor")),
-		MCPParam::Optional(TEXT("pieInstance"), EType::Integer, TEXT("Which PIE instance, when several are running")),
+		MCPSharedParam::World().Describe(TEXT("pie (default), auto, or editor")),
+		MCPSharedParam::PieInstance(),
 	});
 	Registry.RegisterHandler(TEXT("request_state_tree_transition"), &RequestTransition, {
-		MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Label of the actor carrying the running StateTree component (or pass actorPath)")),
-		MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Full object path of that actor; unambiguous where a label is not")),
+		MCPSharedParam::ActorLabel().Describe(TEXT("Label of the actor carrying the running StateTree component (or pass actorPath)")),
+		MCPSharedParam::ActorPath().Describe(TEXT("Full object path of that actor; unambiguous where a label is not")),
 		MCPParam::Optional(TEXT("targetStateId"), EType::String, TEXT("GUID of the state to transition to (or pass targetStateTag)")),
 		MCPParam::Optional(TEXT("targetStateTag"), EType::String, TEXT("Tag of the state to transition to, UE 5.8 and later")),
 		MCPParam::Optional(TEXT("priority"), EType::String, TEXT("Low, Normal, Medium, High or Critical")),
 		MCPParam::Optional(TEXT("fallback"), EType::String, TEXT("None (default) or NextSelectableSibling")),
 		MCPParam::Optional(TEXT("componentName"), EType::String, TEXT("Which StateTree component, when the actor has more than one")),
-		MCPParam::Optional(TEXT("world"), EType::String, TEXT("pie (default), auto, or editor")),
-		MCPParam::Optional(TEXT("pieInstance"), EType::Integer, TEXT("Which PIE instance, when several are running")),
+		MCPSharedParam::World().Describe(TEXT("pie (default), auto, or editor")),
+		MCPSharedParam::PieInstance(),
+	});
+
+	// Node authoring by ID and binding introspection (StateTreeHandlers_NodesAndBindings.cpp).
+	Registry.RegisterHandler(TEXT("move_state_tree_node"), &MoveNode, {
+		MCPParam::Required(TEXT("assetPath"), EType::String, TEXT("StateTree asset path, e.g. /Game/Path/To/ST_Asset")),
+		MCPParam::Required(TEXT("nodeId"), EType::String, TEXT("GUID of the task, condition, consideration, evaluator or global task, as the add_* actions return it")),
+		MCPParam::Required(TEXT("newIndex"), EType::Integer, TEXT("Position the node ends up at within the list it is in, 0-based")),
+	});
+	Registry.RegisterHandler(TEXT("read_state_tree_node"), &ReadNode, {
+		MCPParam::Required(TEXT("assetPath"), EType::String, TEXT("StateTree asset path, e.g. /Game/Path/To/ST_Asset")),
+		MCPParam::Required(TEXT("nodeId"), EType::String, TEXT("GUID of any node in the tree, as the add_* actions return it")),
+	});
+	Registry.RegisterHandler(TEXT("set_state_tree_node_flags"), &SetNodeFlags, {
+		MCPParam::Required(TEXT("assetPath"), EType::String, TEXT("StateTree asset path, e.g. /Game/Path/To/ST_Asset")),
+		MCPParam::Required(TEXT("nodeId"), EType::String, TEXT("GUID of the node, as the add_* actions return it")),
+		MCPParam::Optional(TEXT("taskEnabled"), EType::Boolean, TEXT("Tasks: enable or disable the task")),
+		MCPParam::Optional(TEXT("consideredForCompletion"), EType::Boolean, TEXT("Tasks: whether the task counts toward the state completing. The task must be enabled and allow the edit")),
+		MCPParam::Optional(TEXT("evaluationMode"), EType::String, TEXT("Conditions: Evaluated, ForcedTrue or ForcedFalse")),
+	});
+	Registry.RegisterHandler(TEXT("set_state_tree_node_data"), &SetNodeData, {
+		MCPParam::Required(TEXT("assetPath"), EType::String, TEXT("StateTree asset path, e.g. /Game/Path/To/ST_Asset")),
+		MCPParam::Required(TEXT("nodeId"), EType::String, TEXT("GUID of the node, as the add_* actions return it")),
+		MCPParam::Optional(TEXT("target"), EType::String, TEXT("node (the node struct), instance (default) or executionRuntime")),
+		MCPParam::Optional(TEXT("propertyName"), EType::String, TEXT("Property to write. Omit to replace the whole struct with value")),
+		MCPParam::Required(TEXT("value"), EType::String, TEXT("Value in Unreal text format, e.g. 2.5, true, (X=1,Y=2)")),
+	});
+	Registry.RegisterHandler(TEXT("list_state_tree_bindable_properties"), &ListBindableProperties, {
+		MCPParam::Required(TEXT("assetPath"), EType::String, TEXT("StateTree asset path, e.g. /Game/Path/To/ST_Asset")),
+		MCPParam::Required(TEXT("structId"), EType::String, TEXT("Bindable struct GUID, as list_bindable_sources reports it")),
+		MCPParam::Optional(TEXT("targetPath"), EType::String, TEXT("A property of that struct: list the compatible sources in its scope instead of the struct's properties")),
+		MCPParam::Optional(TEXT("exactOnly"), EType::Boolean, TEXT("With targetPath: leave out sources that need a numeric promotion")),
+		MCPParam::Optional(TEXT("maxDepth"), EType::Integer, TEXT("How deep to descend into value structs: 1 is top level only, 0 is unlimited (default 3)")),
+	});
+	Registry.RegisterHandler(TEXT("check_state_tree_binding"), &CheckBinding, {
+		MCPParam::Required(TEXT("assetPath"), EType::String, TEXT("StateTree asset path, e.g. /Game/Path/To/ST_Asset")),
+		MCPParam::Required(TEXT("targetStructId"), EType::String, TEXT("Target struct GUID")),
+		MCPParam::Optional(TEXT("targetPath"), EType::String, TEXT("Target property path")),
+		MCPParam::Optional(TEXT("sourceStructId"), EType::String, TEXT("Source struct GUID. Omit to resolve the target alone")),
+		MCPParam::Optional(TEXT("sourcePath"), EType::String, TEXT("Source property path")),
+	});
+	Registry.RegisterHandler(TEXT("promote_state_tree_property_to_parameter"), &PromoteToParameter, {
+		MCPParam::Required(TEXT("assetPath"), EType::String, TEXT("StateTree asset path, e.g. /Game/Path/To/ST_Asset")),
+		MCPParam::Required(TEXT("targetStructId"), EType::String, TEXT("Struct GUID of the property to promote")),
+		MCPParam::Required(TEXT("targetPath"), EType::String, TEXT("Property path to promote")),
+		MCPParam::Optional(TEXT("parameterName"), EType::String, TEXT("Name for the new parameter (default: the property name, made unique)")),
+		MCPParam::Optional(TEXT("stateId"), EType::String, TEXT("State to hold the parameter: the target's state or an ancestor. Omit both for a tree parameter")),
+		MCPParam::Optional(TEXT("statePath"), EType::String, TEXT("Dot-path of that state, as an alternative to stateId")),
 	});
 #endif // UE_MCP_HAS_5_5_API
 }
@@ -1158,6 +1205,31 @@ TSharedPtr<FJsonValue> FStateTreeHandlers::ReadStateTree(const TSharedPtr<FJsonO
 		Result->SetArrayField(TEXT("editorBindings"), BindArr);
 	}
 
+	// Editor data extensions (what K2_GetExtension returns, by class). Read
+	// through reflection: the Extensions array is not on every supported
+	// engine. Each objectPath is writable with editor(set_property).
+	{
+		TArray<TSharedPtr<FJsonValue>> ExtArr;
+		if (FArrayProperty* ExtProp = FindFProperty<FArrayProperty>(EditorData->GetClass(), TEXT("Extensions")))
+		{
+			if (FObjectPropertyBase* Inner = CastField<FObjectPropertyBase>(ExtProp->Inner))
+			{
+				FScriptArrayHelper Helper(ExtProp, ExtProp->ContainerPtrToValuePtr<void>(EditorData));
+				for (int32 i = 0; i < Helper.Num(); ++i)
+				{
+					if (UObject* Ext = Inner->GetObjectPropertyValue(Helper.GetRawPtr(i)))
+					{
+						auto EObj = MakeShared<FJsonObject>();
+						EObj->SetStringField(TEXT("class"), Ext->GetClass()->GetPathName());
+						EObj->SetStringField(TEXT("objectPath"), Ext->GetPathName());
+						ExtArr.Add(MakeShared<FJsonValueObject>(EObj));
+					}
+				}
+			}
+		}
+		Result->SetArrayField(TEXT("extensions"), ExtArr);
+	}
+
 	return MCPResult(Result);
 }
 
@@ -1474,7 +1546,8 @@ TSharedPtr<FJsonValue> FStateTreeHandlers::SetStateProperty(const TSharedPtr<FJs
 #if UE_MCP_HAS_STATETREE_STATE_DESCRIPTION
 		State->Description = Value;
 #else
-		return MCPError(TEXT("State description is not available in this UE version"));
+		return MCPUnsupportedEngineError(TEXT("A state description"), TEXT("5.6"),
+			TEXT("This engine's FStateTreeState has no Description field; keep the note in the state's name or tag instead"));
 #endif
 	}
 	else if (PropName == TEXT("tag"))
@@ -1507,7 +1580,8 @@ TSharedPtr<FJsonValue> FStateTreeHandlers::SetStateProperty(const TSharedPtr<FJs
 			State->CustomTickRate = FCString::Atof(*Value);
 		}
 #else
-		return MCPError(TEXT("State customTickRate is not available in this UE version"));
+		return MCPUnsupportedEngineError(TEXT("A state customTickRate"), TEXT("5.6"),
+			TEXT("On this engine every state ticks with its StateTree"));
 #endif
 	}
 	else if (PropName == TEXT("color"))

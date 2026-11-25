@@ -1,4 +1,5 @@
 #include "LandscapeHandlers.h"
+#include "LandscapeHandlers_Splines.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerPagination.h"
@@ -35,6 +36,7 @@
 #include "Materials/MaterialInterface.h"
 #include "EditorScriptingUtilities/Public/EditorAssetLibrary.h"
 #include "RenderingThread.h"
+#include "BridgeRequestContext.h"
 #include "Components/PrimitiveComponent.h"
 #include "PhysicsEngine/BodyInstance.h"
 #include "LandscapeLayerInfoObject.h"
@@ -52,7 +54,7 @@ static bool PersistLandscapeTargetLayer(ALandscapeProxy* Proxy, FName LayerName,
 	{
 		return false;
 	}
-#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5)
+#if UE_MCP_HAS_5_5_API
 	if (Landscape->HasTargetLayer(LayerInfo))
 	{
 		return false;
@@ -432,8 +434,8 @@ void FLandscapeHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// nowhere else; the TS surface for it is generated from a recording of these.
 	// The shared spellings are declared once and listed per handler.
 	using EType = EMCPParamType;
-	const FMCPParamSpec SpecActorLabel = MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Landscape actor label, when the level has more than one"));
-	const FMCPParamSpec SpecActorPath = MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Landscape actor object path; wins over actorLabel, which is not unique"));
+	const FMCPParamSpec SpecActorLabel = MCPSharedParam::ActorLabel().Describe(TEXT("Landscape actor label, when the level has more than one"));
+	const FMCPParamSpec SpecActorPath = MCPSharedParam::ActorPath().Describe(TEXT("Landscape actor object path; wins over actorLabel, which is not unique"));
 	const FMCPParamSpec SpecRegion = MCPParam::Optional(TEXT("region"), EType::Object, TEXT("Rectangle {minX, minY, maxX, maxY} in landscape vertex indices, or centimetres with space world. Omit it for the whole landscape"));
 	const FMCPParamSpec SpecSpace = MCPParam::Optional(TEXT("space"), EType::String, TEXT("Units of region: quad (vertex indices, default) | world (centimetres)"));
 	const FMCPParamSpec SpecCenter = MCPParam::Optional(TEXT("center"), EType::Object, TEXT("Brush centre {x, y} in world space"));
@@ -486,7 +488,7 @@ void FLandscapeHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		SpecLayerName,
 		MCPParam::Optional(TEXT("name"), EType::String, TEXT("LayerInfo asset name (default LI_<layerName>)")),
 		MCPParam::Optional(TEXT("packagePath"), EType::String, TEXT("Content folder for the LayerInfo asset (default /Game/Landscape/LayerInfos)")),
-		MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("When the asset already exists: skip (default) | error")),
+		MCPSharedParam::OnConflict(),
 		MCPParam::Optional(TEXT("physMaterial"), EType::String, TEXT("PhysicalMaterial asset path")),
 		MCPParam::Optional(TEXT("hardness"), EType::Number, TEXT("Layer hardness")),
 	}, MCPSpec::ContractExempt(TEXT("Contract values reach CreatePackage before anything is loaded")));
@@ -688,6 +690,9 @@ void FLandscapeHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		SpecActorLabel, SpecActorPath,
 		MCPParam::Optional(TEXT("updateNow"), EType::Boolean, TEXT("Run the merge now rather than on the next editor tick (default true)")),
 	});
+
+	// Spline authoring, in LandscapeHandlers_Splines.cpp.
+	FLandscapeSplineHandlers::RegisterHandlers(Registry);
 }
 
 TSharedPtr<FJsonValue> FLandscapeHandlers::GetLandscapeInfo(const TSharedPtr<FJsonObject>& Params)
@@ -1099,34 +1104,16 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::ListLandscapeSplines(const TSharedPtr
 {
 	REQUIRE_EDITOR_WORLD(World);
 
+	// Landscape actors, streaming proxies and World Partition spline actors.
 	TArray<TSharedPtr<FJsonValue>> SplineArray;
-
-	for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
-	{
-		ALandscapeProxy* Landscape = *It;
-		if (!Landscape) continue;
-
-		ULandscapeSplinesComponent* SplinesComp = Landscape->GetSplinesComponent();
-		if (!SplinesComp) continue;
-
-		const TArray<TObjectPtr<ULandscapeSplineControlPoint>>& ControlPoints = SplinesComp->GetControlPoints();
-		for (const TObjectPtr<ULandscapeSplineControlPoint>& CP : ControlPoints)
-		{
-			if (!CP) continue;
-
-			TSharedPtr<FJsonObject> PointObj = MakeShared<FJsonObject>();
-			FVector Location = CP->Location;
-			PointObj->SetNumberField(TEXT("x"), Location.X);
-			PointObj->SetNumberField(TEXT("y"), Location.Y);
-			PointObj->SetNumberField(TEXT("z"), Location.Z);
-			PointObj->SetStringField(TEXT("landscapeName"), Landscape->GetName());
-			SplineArray.Add(MakeShared<FJsonValueObject>(PointObj));
-		}
-	}
+	TArray<TSharedPtr<FJsonValue>> SegmentArray;
+	MCPLandscapeSplines::DescribeAll(World, SplineArray, SegmentArray);
 
 	auto Result = MCPSuccess();
 	Result->SetArrayField(TEXT("controlPoints"), SplineArray);
 	Result->SetNumberField(TEXT("count"), SplineArray.Num());
+	Result->SetArrayField(TEXT("segments"), SegmentArray);
+	Result->SetNumberField(TEXT("segmentCount"), SegmentArray.Num());
 	return MCPResult(Result);
 }
 
@@ -1838,7 +1825,8 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::RefreshPhysicalMaterialCollision(cons
 	});
 
 #if !UE_MCP_HAS_5_8_API
-	return MCPError(TEXT("Landscape physical-material collision refresh requires Unreal Engine 5.8 or newer"));
+	return MCPUnsupportedEngineError(TEXT("Landscape physical-material collision refresh"), TEXT("5.8"),
+		TEXT("On this engine, Build > Build Landscape Physical Material in the editor rebuilds it"));
 #else
 	const double StartedAt = FPlatformTime::Seconds();
 	if (!GEditor)
@@ -1847,7 +1835,7 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::RefreshPhysicalMaterialCollision(cons
 	}
 	if (GEditor->PlayWorld != nullptr || GEditor->bIsSimulatingInEditor)
 	{
-		return MCPError(TEXT("Stop PIE or SIE before refreshing landscape physical-material collision"));
+		return MCPError(TEXT("Stop PIE or SIE before refreshing landscape physical-material collision. ") + MCPStopPlayInEditorStep());
 	}
 
 	REQUIRE_EDITOR_WORLD(World);
@@ -1863,7 +1851,8 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::RefreshPhysicalMaterialCollision(cons
 	const int32 MaxActors = OptionalInt(Params, TEXT("maxActors"), 256);
 	if (MaxActors < 1 || MaxActors > 1024)
 	{
-		return MCPError(TEXT("'maxActors' must be between 1 and 1024"));
+		return MCPError(TEXT("'maxActors' must be between 1 and 1024. ")
+			+ MCPHardCeilingNote(TEXT("maxActors"), 1024, TEXT("Split the work across several calls, each narrowed by actorLabels, guids or bounds.")));
 	}
 	if (OptionalBool(Params, TEXT("save"), false))
 	{
@@ -1957,8 +1946,10 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::RefreshPhysicalMaterialCollision(cons
 	if (Matches.Num() > MaxActors)
 	{
 		return MCPError(FString::Printf(
-			TEXT("%d loaded LandscapeStreamingProxy actors matched, above the maxActors limit of %d. Narrow actorLabels/guids/bounds or raise maxActors deliberately."),
-			Matches.Num(), MaxActors));
+			TEXT("%d loaded LandscapeStreamingProxy actors matched, above the maxActors limit of %d. %s"),
+			Matches.Num(), MaxActors,
+			*MCPRaiseOrSplitNote(TEXT("maxActors"), MaxActors, 1024,
+				TEXT("Split the work across several calls, each narrowed by actorLabels, guids or bounds."))));
 	}
 	for (ALandscapeStreamingProxy* Proxy : Matches)
 	{
@@ -2155,10 +2146,11 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::RefreshPhysicalMaterialCollision(cons
 
 	// BuildPhysicalMaterial advances an asynchronous GPU readback. Re-enter the
 	// exported build method after flushing render commands until it finalizes
-	// every matched proxy, or until there is enough time left to return a useful
-	// failure report before the handler's 600-second bridge timeout. Time spent
-	// preparing texture resources counts too.
-	const double BuildDeadline = StartedAt + 420.0;
+	// every matched proxy, or until 70% of the request's budget is spent, which
+	// leaves time to return a useful failure report before the bridge gives up.
+	// Time spent preparing texture resources counts too. 600 s is the declared
+	// timeout, for a call made outside a bridge request.
+	const double BuildDeadline = StartedAt + MCPRequestContext::BudgetSeconds(600.0) * 0.7;
 	bool bBuildTimedOut = false;
 	while (Refreshed > 0)
 	{

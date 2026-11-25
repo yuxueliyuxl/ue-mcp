@@ -12,7 +12,7 @@
  * unexpected key would be the next defect.
  */
 import { describe, expect, it } from "vitest";
-import type { ToolContext, ToolDef } from "../../src/core/types.js";
+import type { ToolContext, ToolDef } from "../../src/surface/tool-types.js";
 import { categoryTool, bp } from "../../src/surface/category-tool.js";
 import { takeTimeout } from "../../src/dispatch/call-pipeline.js";
 import { MAX_BRIDGE_TIMEOUT_MS } from "../../src/bridge/bridge-timeouts.js";
@@ -37,7 +37,8 @@ describe("timeoutMs on a category call (#989)", () => {
     expect(fixture().schema.timeoutMs.safeParse(600_000).success).toBe(true);
     expect(fixture().schema.timeoutMs.safeParse(0).success).toBe(false);
     expect(fixture().schema.timeoutMs.safeParse(-1).success).toBe(false);
-    expect(fixture().schema.timeoutMs.safeParse(MAX_BRIDGE_TIMEOUT_MS + 1).success).toBe(false);
+    // Past the ceiling it is accepted and capped where the call is made, never refused (#1952).
+    expect(fixture().schema.timeoutMs.safeParse(MAX_BRIDGE_TIMEOUT_MS + 1).success).toBe(true);
   });
 
   it("reaches bridge.call as the timeout, not as a parameter", async () => {

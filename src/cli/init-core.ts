@@ -1,3 +1,4 @@
+// @session per-session: Plans and applies setup for the one project it is handed.
 /**
  * `ue-mcp init` as two pure steps: plan() reads the machine and the project
  * and says what would change, apply() makes those changes. The interactive
@@ -7,9 +8,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { EPIC_CATEGORIES } from "../tools/epic/index.js";
+import { ALL_TOOLS } from "../tools.js";
 import { projectConfigPath, readConfigDoc, writeConfigDoc } from "../config/ue-mcp-config.js";
 import { ProjectContext } from "../config/project.js";
-import { deploy, projectEngineVersion } from "../editor/deployer.js";
+import type { ContextStrategy } from "../config/context-strategy.js";
+import { deploy } from "../editor/deployer.js";
+import { projectEngineVersion } from "../editor/engine-root.js";
 import { installBinaryPlugin, resolveBinarySource, describeBinarySource } from "../editor/bridge-binaries.js";
 import {
   defaultPluginDir,
@@ -27,21 +31,52 @@ import {
   conflictMessages,
   syncPluginSkills,
 } from "../extensions/skills.js";
+import { AGENT_GUIDE_FILES, hasGuide, removeGuide, writeGuide } from "../integrations/agent-guides.js";
 import { installClaudeHooks, uninstallClaudeHooks } from "../integrations/claude-code/hook-installer.js";
-import { getFeedbackModeScopes, getInstalledHooks, setFeedbackMode, type FeedbackMode } from "../config/user-state.js";
+import { getInstalledHooks } from "../config/hook-state.js";
+import { FEEDBACK_MODE, type FeedbackMode } from "../config/modes.js";
 import {
+  CLIENT_IDS,
+  clientId,
   detectMcpClients,
   isProjectScopedClient,
   readUeMcpEntry,
   writeMcpConfig,
+  projectScopedClientsAt,
   type McpClient,
   type ServerLaunch,
-} from "../integrations/claude-code/mcp-client-config.js";
+} from "../integrations/mcp-clients/mcp-client-config.js";
+import {
+  describeUnrealMcpEntry,
+  findUnrealMcpEntries,
+  removeUnrealMcpEntries,
+  sourceBuildConfigRoot,
+  type UnrealMcpEntry,
+} from "../integrations/epic/unreal-mcp-entries.js";
+import { protectedEngineRoots } from "../editor/engine-root.js";
+import {
+  writeUnrealMcpServerSettings,
+  type UnrealMcpServerChange,
+  type UnrealMcpServerStatus,
+} from "../integrations/epic/unreal-mcp-server.js";
+import {
+  attachUnrealAssistant,
+  detachUnrealAssistant,
+  editorServerDescriptor,
+  ueMcpAssistantDescriptor,
+  type UnrealAssistantStatus,
+} from "../integrations/epic/unreal-assistant.js";
+import {
+  bridgePort,
+  projectEngineRoot,
+  projectEpicIntegrations,
+  type BridgePort,
+} from "../integrations/epic/project-status.js";
 import { packageVersion } from "../core/package-root.js";
 import { warn as logWarn } from "../core/log.js";
-import { readEnv } from "../core/env.js";
-import { deriveProjectPort } from "../bridge/port.js";
-import { readUserAuthSync } from "../feedback/github-auth.js";
+import { resolveSetting } from "../core/env.js";
+import { editDisableEntries, isScopeOff, parseDisableEntry, readCategoryState } from "../surface/category-state.js";
+import { readUserAuthSync } from "../github/auth.js";
 
 /* ------------------------------------------------------------------ */
 /*  Tool categories                                                    */
@@ -55,47 +90,20 @@ export interface ToolCategory {
   alwaysOn?: boolean;
 }
 
-export const CATEGORIES: ToolCategory[] = [
-  { name: "project",    label: "project",       alwaysOn: true },
-  { name: "editor",     label: "editor",        alwaysOn: true },
-  { name: "reflection", label: "reflection",    alwaysOn: true },
-  { name: "level",      label: "levels",        description: "spawn/move/select actors, sublevels, world settings" },
-  { name: "blueprint",  label: "blueprints",    description: "Blueprint classes: variables, functions, components, nodes" },
-  { name: "material",   label: "materials",     description: "Materials, Material Functions, parameters" },
-  { name: "asset",      label: "assets",        description: "import/move/rename/delete content browser assets" },
-  { name: "animation",  label: "animation",     description: "anim sequences, montages, AnimBPs, skeletons" },
-  { name: "niagara",    label: "vfx (niagara)", description: "VFX systems, emitters, modules", requiredPlugins: ["Niagara"] },
-  { name: "landscape",  label: "landscape",     description: "terrain edit, layers, paint, sculpt" },
-  { name: "pcg",        label: "pcg",           description: "procedural content graphs", requiredPlugins: ["PCG"] },
-  { name: "foliage",    label: "foliage",       description: "instanced foliage placement and types" },
-  { name: "audio",      label: "audio",         description: "MetaSounds, sound cues, sound classes" },
-  { name: "widget",     label: "ui (widgets)",  description: "UMG widgets, editor utility widgets" },
-  { name: "gameplay",   label: "gameplay / ai", description: "input mappings, collision, navmesh, PIE", requiredPlugins: ["EnhancedInput"] },
-  { name: "gas",        label: "gas",           description: "Gameplay Ability System abilities, effects, attributes", requiredPlugins: ["GameplayAbilities"] },
-  { name: "networking", label: "networking",    description: "replication, dormancy, RPCs" },
-  { name: "demo",       label: "demo",          description: "tutorial / demo project scaffolding" },
-  // feedback has its own toggle: enabling it gives the agent a tool that can
-  // post to a public issue tracker, behind user approval.
-  { name: "feedback",   label: "feedback",      alwaysOn: true },
-];
+/** Every category, as its `label` option describes it to a person choosing categories. */
+export const CATEGORIES: ToolCategory[] = ALL_TOOLS.map((tool) => {
+  const label = tool.options?.label;
+  return {
+    name: tool.name,
+    label: label?.text ?? tool.name,
+    ...(label?.description ? { description: label.description } : {}),
+    ...(label?.requiredPlugins ? { requiredPlugins: [...label.requiredPlugins] } : {}),
+    ...(label?.alwaysOn ? { alwaysOn: true } : {}),
+  };
+});
 
 /** Categories that carry wrapped engine tools, read from the generated modules. */
 export const ENRICHABLE_CATEGORIES = Object.keys(EPIC_CATEGORIES).sort();
-
-export type ContextStrategy = "micro" | "lean" | "full";
-
-/** Stable ids for `--clients`, mapped to the names detectMcpClients uses. */
-export const CLIENT_IDS: Record<string, string> = {
-  "claude-code": "Claude Code (project)",
-  "claude-code-global": "Claude Code (global)",
-  "claude-desktop": "Claude Desktop",
-  cursor: "Cursor",
-  codex: "Codex",
-};
-
-export function clientId(name: string): string {
-  return Object.entries(CLIENT_IDS).find(([, n]) => n === name)?.[0] ?? name;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Choices and plan                                                   */
@@ -119,6 +127,12 @@ export interface InitChoices {
   feedbackMode?: FeedbackMode;
   promptHook?: boolean;
   skills?: boolean;
+  /**
+   * Write the ue-mcp block into the instruction file each selected client
+   * reads (AGENTS.md, GEMINI.md, .github/copilot-instructions.md). Unset is
+   * true; false removes every block init wrote.
+   */
+  agentGuides?: boolean;
   /** auto picks binary when there is no toolchain and keeps whatever is installed. */
   install?: "auto" | InstallKind;
   /** Where prebuilt binaries come from; see resolveBinarySource. */
@@ -127,27 +141,13 @@ export interface InitChoices {
   pin?: boolean;
   /** Replaces npx in written client configs. */
   command?: string | null;
+  /** Whether Epic's Unreal MCP server auto-starts for this project. Unset keeps its setting. */
+  unrealMcpAutoStart?: boolean;
+  /** The port Epic's Unreal MCP server listens on for this project. Unset keeps it. */
+  unrealMcpPort?: number;
+  /** true attaches ue-mcp to Epic's Unreal Assistant, false detaches it, unset leaves it as it is. */
+  unrealAssistant?: boolean;
 }
-
-/** The bridge port a project uses, and what decided it. */
-export interface BridgePort {
-  port: number;
-  /** What the project path derives, which is the port when nothing pins one. */
-  derivedPort: number;
-  /** "env" for UE_MCP_PORT, "config" for ue-mcp.bridge.port, null when derived. */
-  pinnedBy: "env" | "config" | null;
-}
-
-export function bridgePort(project: ProjectContext): BridgePort {
-  const derivedPort = deriveProjectPort(project.projectDir!);
-  const envPort = Number.parseInt(readEnv("port") ?? "", 10);
-  if (Number.isFinite(envPort) && envPort > 0) return { port: envPort, derivedPort, pinnedBy: "env" };
-  const configPort = project.config.bridge?.port;
-  if (configPort) return { port: configPort, derivedPort, pinnedBy: "config" };
-  return { port: derivedPort, derivedPort, pinnedBy: null };
-}
-
-export const FEEDBACK_MODES: readonly FeedbackMode[] = ["interactive", "auto-approve", "defer"];
 
 /** The feedback approval mode in effect, and which setting decided it. */
 export interface PlannedFeedbackMode {
@@ -160,13 +160,10 @@ export interface PlannedFeedbackMode {
 
 /** The effective feedback mode for a project, counting a mode about to be stored for it. */
 export function feedbackModeOf(projectDir: string, set: FeedbackMode | null = null): PlannedFeedbackMode {
-  const env = (readEnv("feedbackMode") ?? "").trim().toLowerCase() as FeedbackMode;
-  if (FEEDBACK_MODES.includes(env)) return { mode: env, scope: "env", set };
-  const scopes = getFeedbackModeScopes(projectDir);
-  const project = set ?? scopes.project;
-  if (project) return { mode: project, scope: "project", set };
-  if (scopes.user) return { mode: scopes.user, scope: "user", set };
-  return { mode: "interactive", scope: "default", set };
+  const scopes = FEEDBACK_MODE.scopes(projectDir);
+  const resolved = resolveSetting("feedbackMode", { project: set ?? scopes.project, user: scopes.user });
+  const scope = resolved.source === "env" || resolved.source === "project" || resolved.source === "user" ? resolved.source : "default";
+  return { mode: resolved.value ?? "interactive", scope, set };
 }
 
 export interface PlannedClient {
@@ -176,6 +173,34 @@ export interface PlannedClient {
   detected: boolean;
   projectScoped: boolean;
   selected: boolean;
+  /** Unreal MCP entries in this config that writing the ue-mcp entry replaces. */
+  replaces: UnrealMcpEntry[];
+  /** The same client's config in a source build's root, when it holds Unreal MCP entries; see engineConfigRoot. */
+  engineRootConfig: { configPath: string; replaces: UnrealMcpEntry[] } | null;
+}
+
+/**
+ * Where the editor writes client configs for this project's engine when that
+ * is a source build: the folder holding Engine/. Null for an installed engine,
+ * which writes into the project directory.
+ */
+export function engineConfigRoot(project: ProjectContext): string | null {
+  return sourceBuildConfigRoot(projectEngineRoot(project), project.projectDir!);
+}
+
+function insideDir(child: string, dir: string): boolean {
+  const rel = path.relative(path.resolve(dir), path.resolve(child));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/** Client configs in the engine root that hold Unreal MCP entries, by client name. */
+export function engineRootReplacements(root: string | null): Map<string, { client: McpClient; replaces: UnrealMcpEntry[] }> {
+  const found = new Map<string, { client: McpClient; replaces: UnrealMcpEntry[] }>();
+  for (const client of root ? projectScopedClientsAt(root) : []) {
+    const replaces = findUnrealMcpEntries(client);
+    if (replaces.length > 0) found.set(client.name, { client, replaces });
+  }
+  return found;
 }
 
 export interface InitPlan {
@@ -207,6 +232,11 @@ export interface InitPlan {
   feedbackMode: PlannedFeedbackMode;
   promptHook: boolean;
   skills: boolean;
+  /**
+   * The agent instruction files: `write` for each one a selected client reads,
+   * otherwise removed when it holds init's block. Files with neither are left out.
+   */
+  agentGuides: Array<{ file: string; write: boolean }>;
   /** Reasons apply() would refuse to run. */
   blockers: string[];
   /** The optional tool categories, in the order init offers them. */
@@ -214,8 +244,19 @@ export interface InitPlan {
   /** Categories that can carry native Unreal tools (engine 5.8 and later). */
   nativeCategories: string[];
   bridge: BridgePort;
+  /** A source build's root, where the editor also writes client configs; null otherwise. */
+  engineConfigRoot: string | null;
   /** The GitHub account feedback issues author as, from `ue-mcp auth`; null when not signed in. */
   feedbackAuth: { login: string | null };
+  /**
+   * Epic's Unreal MCP server for this project, and what apply() writes to its
+   * per-user settings (`change` is empty when nothing). Null when the engine has none.
+   */
+  unrealMcp: (UnrealMcpServerStatus & { change: UnrealMcpServerChange }) | null;
+  /** Epic's Unreal Assistant, and whether apply() attaches ue-mcp to it, detaches it, or leaves it. */
+  unrealAssistant: UnrealAssistantStatus & { action: "attach" | "detach" | "keep" };
+  /** Requests about Epic's server or assistant that this project's engine cannot honour; apply() reports them. */
+  epicNotes: string[];
 }
 
 function readUpluginVersion(pluginDir: string): string | null {
@@ -244,7 +285,7 @@ export function plan(choices: InitChoices, hooks: ProbeHooks = DEFAULT_PROBE_HOO
   const feedback = choices.feedback ?? (isReInit && !existingDisabled.has("feedback"));
 
   const existingNative = (project.config.nativeTools ?? {}) as { enabled?: boolean; exclude?: string[] };
-  const nativeTools = choices.nativeTools ?? { enabled: existingNative.enabled !== false, exclude: existingNative.exclude ?? [] };
+  const nativeTools = choices.nativeTools ?? { enabled: existingNative.enabled !== false, exclude: [...readCategoryState(project.config).epic] };
   const contextStrategy = choices.contextStrategy ?? project.config.context?.strategy ?? "micro";
 
   const requiredPlugins = new Set(["PythonScriptPlugin"]);
@@ -307,24 +348,72 @@ export function plan(choices: InitChoices, hooks: ProbeHooks = DEFAULT_PROBE_HOO
     if (!detected.some((c) => c.name === name)) blockers.push(`unknown client '${name}' (known: ${Object.keys(CLIENT_IDS).join(", ")})`);
   }
   const configured = detected.filter((c) => readUeMcpEntry(c).configured).map((c) => c.name);
-  const clients: PlannedClient[] = detected.map((c) => ({
-    id: clientId(c.name),
-    name: c.name,
-    configPath: c.configPath,
-    detected: c.detected,
-    projectScoped: isProjectScopedClient(c.name),
-    selected: wantedClients
-      ? wantedClients.includes(c.name)
-      : configured.length > 0
-        ? configured.includes(c.name)
-        : c.detected && isProjectScopedClient(c.name),
-  }));
+  const engineRoot = projectEngineRoot(project);
+  const configRoot = sourceBuildConfigRoot(engineRoot, projectDir);
+  const atEngineRoot = engineRootReplacements(configRoot);
+  const clients: PlannedClient[] = detected.map((c) => {
+    const replaces = findUnrealMcpEntries(c);
+    const engine = atEngineRoot.get(c.name);
+    return {
+      id: clientId(c.name),
+      name: c.name,
+      configPath: c.configPath,
+      detected: c.detected,
+      projectScoped: isProjectScopedClient(c.name),
+      // A config holding an Unreal MCP entry is selected unless --clients says otherwise.
+      selected: wantedClients
+        ? wantedClients.includes(c.name)
+        : replaces.length > 0 || !!engine
+          || (configured.length > 0 ? configured.includes(c.name) : c.detected && isProjectScopedClient(c.name)),
+      replaces,
+      engineRootConfig: engine ? { configPath: engine.client.configPath, replaces: engine.replaces } : null,
+    };
+  });
 
   const claudeCode = clients.some((c) => c.selected && c.name.startsWith("Claude Code"));
   const settingsPath = path.join(projectDir, ".claude", "settings.json");
   const hookInstalled = new Set(getInstalledHooks(projectDir).map((p) => path.resolve(p))).has(path.resolve(settingsPath));
   const promptHook = claudeCode && feedback && (choices.promptHook ?? hookInstalled);
   const skills = claudeCode && (choices.skills ?? coreSkillsInstalled(projectDir));
+  const selectedNames = new Set(clients.filter((c) => c.selected).map((c) => c.name));
+  const agentGuides = AGENT_GUIDE_FILES
+    .map((g) => ({ file: g.file, write: choices.agentGuides !== false && g.clients.some((c) => selectedNames.has(c)) }))
+    .filter((g) => g.write || hasGuide(projectDir, g.file));
+
+  // Epic's own MCP server and assistant. A request the engine cannot honour is
+  // a note at apply time, not a blocker, so one script can init any project.
+  const epic = projectEpicIntegrations(project, engineRoot);
+  const bridge = bridgePort(project);
+  const epicNotes: string[] = [];
+  if (choices.unrealMcpPort !== undefined) {
+    const port = choices.unrealMcpPort;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) blockers.push(`--unreal-mcp-port must be a port from 1 to 65535, not '${port}'`);
+    else if (port === bridge.port) blockers.push(`--unreal-mcp-port ${port} is the ue-mcp bridge port for this project`);
+  }
+  let unrealMcp: InitPlan["unrealMcp"] = null;
+  if (epic.unrealMcp) {
+    const change: UnrealMcpServerChange = {};
+    if (choices.unrealMcpAutoStart !== undefined && choices.unrealMcpAutoStart !== epic.unrealMcp.autoStart) change.autoStart = choices.unrealMcpAutoStart;
+    if (choices.unrealMcpPort !== undefined && choices.unrealMcpPort !== epic.unrealMcp.port) change.port = choices.unrealMcpPort;
+    unrealMcp = { ...epic.unrealMcp, change };
+  } else if (choices.unrealMcpAutoStart !== undefined || choices.unrealMcpPort !== undefined) {
+    epicNotes.push(`${project.projectName}'s engine has no Unreal MCP server (UE 5.8 and later), so its settings were left alone.`);
+  }
+  const assistant = epic.unrealAssistant;
+  let assistantAction: InitPlan["unrealAssistant"]["action"] = "keep";
+  if (choices.unrealAssistant === true) {
+    if (assistant.available) assistantAction = "attach";
+    else epicNotes.push(`Epic's Unreal Assistant was not attached: ${assistant.reason}.`);
+  } else if (choices.unrealAssistant === false && assistant.attached) {
+    assistantAction = "detach";
+  }
+  if (assistantAction === "attach" && assistant.invalid) {
+    blockers.push(`${assistant.configPath} is not a JSON object, which the Unreal Assistant ignores too; fix or remove it before attaching ue-mcp`);
+  }
+  if (assistantAction !== "keep" && assistant.configPath) {
+    const denied = protectedEngineRoots().find((root) => insideDir(assistant.configPath!, root));
+    if (denied) blockers.push(`${assistant.configPath} is inside the protected engine root ${denied}`);
+  }
 
   return {
     version,
@@ -356,11 +445,16 @@ export function plan(choices: InitChoices, hooks: ProbeHooks = DEFAULT_PROBE_HOO
     feedbackMode: feedbackModeOf(projectDir, choices.feedbackMode ?? null),
     promptHook,
     skills,
+    agentGuides,
     blockers,
     categories: CATEGORIES.filter((c) => !c.alwaysOn).map(({ name, label, description, requiredPlugins }) => ({ name, label, description, requiredPlugins })),
     nativeCategories: ENRICHABLE_CATEGORIES,
-    bridge: bridgePort(project),
+    bridge,
+    engineConfigRoot: configRoot,
     feedbackAuth: { login: readUserAuthSync()?.login ?? null },
+    unrealMcp,
+    unrealAssistant: { ...assistant, action: assistantAction },
+    epicNotes,
   };
 }
 
@@ -487,17 +581,29 @@ export function writeProjectConfig(
   const block = ((existing["ue-mcp"] as Record<string, unknown>) ?? {});
   if (typeof block.version !== "number") block.version = 1;
 
-  if (disabled.length > 0) block.disable = disabled;
+  // Whole categories come from the choices. A scoped entry (`level:native`)
+  // is kept, and the Epic exclusions are written as `<category>:epic`, the
+  // spelling that replaced nativeTools.exclude.
+  const previous = Array.isArray(block.disable) ? (block.disable as unknown[]).filter((e): e is string => typeof e === "string") : [];
+  let entries: string[] = [...disabled];
+  for (const raw of previous) {
+    const e = parseDisableEntry(raw);
+    if (!e || e.scope === "all") continue;
+    if (nativeTools && e.scope === "epic") continue;
+    entries = editDisableEntries(entries, e.category, e.scope, false);
+  }
+  const priorNative = (block.nativeTools && typeof block.nativeTools === "object" ? block.nativeTools : {}) as { enabled?: boolean; exclude?: string[] };
+  const exclude = nativeTools ? nativeTools.exclude : (priorNative.exclude ?? []);
+  for (const c of exclude) {
+    if (!isScopeOff(readCategoryState({ disable: entries }), c, "epic")) entries = editDisableEntries(entries, c, "epic", false);
+  }
+  if (entries.length > 0) block.disable = entries;
   else delete block.disable;
 
-  // Only persisted when it differs from the default (on, nothing excluded).
-  if (nativeTools) {
-    const nt: Record<string, unknown> = {};
-    if (!nativeTools.enabled) nt.enabled = false;
-    else if (nativeTools.exclude.length > 0) nt.exclude = nativeTools.exclude;
-    if (Object.keys(nt).length > 0) block.nativeTools = nt;
-    else delete block.nativeTools;
-  }
+  // Only persisted when it differs from the default (on).
+  const enabled = nativeTools ? nativeTools.enabled : priorNative.enabled !== false;
+  if (!enabled) block.nativeTools = { enabled: false };
+  else delete block.nativeTools;
 
   // micro is the default (#1172), so only lean and full are written.
   if (contextStrategy === "lean" || contextStrategy === "full") block.context = { strategy: contextStrategy };
@@ -513,6 +619,18 @@ export function writeProjectConfig(
 
   writeConfigDoc(configPath, existing);
   return fs.readFileSync(configPath, "utf-8") !== before;
+}
+
+/**
+ * Set up a project that is not set up yet, as `init --yes` does, with
+ * prebuilt binaries when it has no bridge so nothing has to compile before
+ * the editor opens. Null when it already has a bridge and ue-mcp.yml.
+ */
+export async function ensureSetUp(uproject: string): Promise<InitResult | null> {
+  const projectDir = path.dirname(path.resolve(uproject));
+  const hasBridge = resolvePluginDir(projectDir) !== null;
+  if (hasBridge && fs.existsSync(projectConfigPath(projectDir))) return null;
+  return apply(plan({ project: uproject, pin: true, install: hasBridge ? "auto" : "binary" }));
 }
 
 /** Make the changes a plan describes. Never throws; a failed step ends the run with ok=false. */
@@ -576,14 +694,28 @@ export async function apply(p: InitPlan): Promise<InitResult> {
       steps.push({ id: "gitignore", status: "changed", target: path.join(projectDir, ".gitignore"), detail: "ignored ue-mcp.local.yml" });
     }
 
-    // 4. MCP client configs.
+    // 4. MCP client configs, and the same client's config in a source build's root.
     const detected = detectMcpClients(projectDir);
-    for (const c of p.clients.filter((x) => x.selected)) {
-      const client = detected.find((d) => d.name === c.name) as McpClient;
+    const atEngineRoot = engineRootReplacements(p.engineConfigRoot);
+    const writeClient = (client: McpClient, id: string, label: string): void => {
       const before = fs.existsSync(client.configPath) ? fs.readFileSync(client.configPath, "utf-8") : null;
+      const replaced = removeUnrealMcpEntries(client);
+      if (replaced.backup) {
+        steps.push({
+          id: `replace:${id}`,
+          status: "changed",
+          target: client.configPath,
+          detail: `replaced Unreal MCP entry ${replaced.removed.map(describeUnrealMcpEntry).join(", ")} with ue-mcp; the previous file is saved as ${replaced.backup}`,
+        });
+      }
       writeMcpConfig(client, uproject, p.launch);
       const after = fs.readFileSync(client.configPath, "utf-8");
-      steps.push({ id: `client:${c.id}`, status: after === before ? "unchanged" : "changed", target: client.configPath, detail: `${c.name} MCP server entry` });
+      steps.push({ id: `client:${id}`, status: after === before ? "unchanged" : "changed", target: client.configPath, detail: label });
+    };
+    for (const c of p.clients.filter((x) => x.selected)) {
+      writeClient(detected.find((d) => d.name === c.name) as McpClient, c.id, `${c.name} MCP server entry`);
+      const engine = atEngineRoot.get(c.name);
+      if (engine) writeClient(engine.client, `${c.id}:engine-root`, `${c.name} MCP server entry in the engine source root`);
     }
 
     // 5. Claude Code hook and skills, which only mean something with Claude Code configured.
@@ -610,6 +742,16 @@ export async function apply(p: InitPlan): Promise<InitResult> {
       }
     }
 
+    // 5b. The instruction files other clients read: one delimited block each.
+    for (const g of p.agentGuides) {
+      const target = path.join(projectDir, g.file);
+      if (g.write) {
+        steps.push({ id: `guide:${g.file}`, status: writeGuide(projectDir, g.file), target, detail: "ue-mcp agent guide block" });
+      } else if (removeGuide(projectDir, g.file)) {
+        steps.push({ id: `guide:${g.file}`, status: "removed", target, detail: "ue-mcp agent guide block removed" });
+      }
+    }
+
     // 6. ue-mcp.yml choices, last, so the feedback toggle is captured.
     const disabled = p.feedback ? p.disable : [...p.disable, "feedback"];
     const configChanged = writeProjectConfig(projectDir, disabled, p.nativeTools, p.contextStrategy);
@@ -622,13 +764,52 @@ export async function apply(p: InitPlan): Promise<InitResult> {
 
     // 7. The project's feedback approval mode, a per-user setting kept in ~/.ue-mcp/state.json.
     if (p.feedbackMode.set) {
-      const before = getFeedbackModeScopes(projectDir).project;
-      if (before !== p.feedbackMode.set) setFeedbackMode(p.feedbackMode.set, projectDir);
+      const before = FEEDBACK_MODE.scopes(projectDir).project;
+      if (before !== p.feedbackMode.set) FEEDBACK_MODE.set(p.feedbackMode.set, projectDir);
       steps.push({
         id: "feedback-mode",
         status: before === p.feedbackMode.set ? "unchanged" : "changed",
         target: projectDir,
         detail: `feedback mode ${p.feedbackMode.set}`,
+      });
+    }
+
+    // 8. Epic's Unreal MCP server: its per-user settings for this project.
+    warnings.push(...p.epicNotes);
+    const mcp = p.unrealMcp;
+    if (mcp && (mcp.change.autoStart !== undefined || mcp.change.port !== undefined)) {
+      const changed = writeUnrealMcpServerSettings(mcp, mcp.change);
+      const what = [
+        mcp.change.autoStart !== undefined ? `auto-start ${mcp.change.autoStart ? "on" : "off"}` : null,
+        mcp.change.port !== undefined ? `port ${mcp.change.port}` : null,
+      ].filter(Boolean).join(", ");
+      steps.push({ id: "unreal-mcp", status: changed ? "changed" : "unchanged", target: mcp.userIni, detail: `Epic's Unreal MCP server: ${what}` });
+      if (changed) warnings.push("Epic's Unreal MCP server reads its settings when the editor starts, so restart an editor open on this project.");
+    }
+
+    // 9. Epic's Unreal Assistant: ue-mcp in the MCP server list of its per-user config.
+    const ua = p.unrealAssistant;
+    if (ua.action === "attach" && ua.configPath) {
+      // Stands in for the default a list would turn off, at the port this run leaves it on.
+      const editor = mcp?.pluginEnabled ? editorServerDescriptor(`http://127.0.0.1:${mcp.change.port ?? mcp.port}${mcp.urlPath}`) : null;
+      const r = attachUnrealAssistant(ua.configPath, ueMcpAssistantDescriptor(uproject, p.launch), editor);
+      steps.push({
+        id: "unreal-assistant",
+        status: r.changed ? "changed" : "unchanged",
+        target: ua.configPath,
+        detail: `ue-mcp in Epic's Unreal Assistant MCP servers${r.backup ? `; the previous file is saved as ${r.backup}` : ""}`,
+      });
+      if (ua.shadowedBy) warnings.push(`The Unreal Assistant reads ${ua.shadowedBy} first and ignores ${ua.configPath}; add the ue-mcp entry there, or remove that file.`);
+      if (ua.attachedProject && path.resolve(ua.attachedProject) !== path.resolve(uproject)) {
+        warnings.push(`${ua.configPath} is per user, not per project: its ue-mcp entry served ${ua.attachedProject} and now serves ${uproject}.`);
+      }
+    } else if (ua.action === "detach" && ua.configPath) {
+      const r = detachUnrealAssistant(ua.configPath);
+      steps.push({
+        id: "unreal-assistant",
+        status: r.changed ? "removed" : "unchanged",
+        target: ua.configPath,
+        detail: `ue-mcp removed from Epic's Unreal Assistant MCP servers${r.backup ? `; the previous file is saved as ${r.backup}` : ""}`,
       });
     }
 

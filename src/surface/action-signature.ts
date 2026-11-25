@@ -1,3 +1,4 @@
+// @session independent: Renders one action's compact signature from whichever tool graph it is handed; its cache is keyed by the action object, never by editor.
 /**
  * One-line action signatures, the unit the compact context seed is built from
  * (#1172).
@@ -20,7 +21,7 @@ import type { ParamChoice, ParamSpec, ParamType, ValueForm } from "./handler-spe
 import { clauseItems } from "./handler-spec.js";
 import { actionSchema, ROUTING_PARAMS } from "./action-schema.js";
 import type { EpicInputSchema } from "./epic-input.js";
-import type { ActionSpec, ToolDef } from "../core/types.js";
+import type { ActionSpec, ToolDef } from "./tool-types.js";
 
 /** The notation, written once in `instructions` rather than in every tool. */
 export const SIGNATURE_LEGEND =
@@ -238,6 +239,16 @@ function declaredItems(tool: ToolDef, action: string): SigItem[] {
 
 /** The structured items of one action's signature, from the best source it has. */
 function signatureItems(tool: ToolDef, action: string, spec: ActionSpec): SigItem[] {
+  const items = sourceItems(tool, action, spec);
+  // An image-writing action takes `inline`, which dispatch consumes rather
+  // than the editor, so no recorded spec lists it.
+  if (spec.imageOutputs && !items.some((i) => i.kind === "param" && i.param.label === "inline")) {
+    return [...items, { kind: "param", param: { label: "inline", type: "b/i", required: false } }];
+  }
+  return items;
+}
+
+function sourceItems(tool: ToolDef, action: string, spec: ActionSpec): SigItem[] {
   if (spec.paramSpec) return specItems(spec.paramSpec, spec.paramChoices);
   if (spec.kind === "bridge" && spec.epicSchema) return epicItems(spec.epicSchema);
   try {

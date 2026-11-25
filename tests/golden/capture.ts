@@ -58,6 +58,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { bridgeTokenDir } from "../../src/bridge/bridge-token.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -120,6 +121,7 @@ function recordingEnv(sandbox: string, host: string, port: number): NodeJS.Proce
   env.UE_MCP_USER_STATE = path.join(sandbox, "state.json");
   env.UE_MCP_AUTH_DIR = path.join(sandbox, "auth");
   env.UE_MCP_DISABLE_UPDATE_CHECK = "1";
+  env.UE_MCP_NATIVE_DIALOGS = "off";
   env.UE_MCP_LOG_LEVEL = "error";
   // The full strategy, pinned. Micro is the default since #1172, and it
   // advertises one gateway whose schema names no action at all; full is the
@@ -419,7 +421,12 @@ export async function captureSurface(options: CaptureOptions): Promise<GoldenRec
     command: process.execPath,
     args: ["--import", "tsx", path.join(REPO_ROOT, "src", "index.ts"), uproject],
     cwd: REPO_ROOT,
-    env: recordingEnv(sandbox, host, options.port) as Record<string, string>,
+    env: {
+      ...recordingEnv(sandbox, host, options.port),
+      // A live editor publishes its session token under the real home, which
+      // the sandbox hides. Only the connected half reads it.
+      ...(options.scenario === "editor-connected" ? { UE_MCP_BRIDGE_TOKEN_DIR: bridgeTokenDir() } : {}),
+    } as Record<string, string>,
     stderr: logFd,
   });
 

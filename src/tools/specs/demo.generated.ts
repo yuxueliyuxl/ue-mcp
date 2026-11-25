@@ -1,3 +1,4 @@
+// @session independent: Generated parameter declarations from the recorded C++ specs; data only, with no editor state.
 // GENERATED FILE - do not edit.
 //
 // Written by scripts/generate-handler-specs.mjs from tests/golden/handler-specs.json,
@@ -20,8 +21,21 @@ export const handlerSpecs: HandlerSpecs = {
   },
   "demo_go_home": {
     "category": "demo",
-    "params": [],
-    "contractExempt": "Takes no parameters and acts unconditionally: creates the home level if missing and opens it"
+    "params": [
+      {
+        "name": "discardUnsaved",
+        "type": "boolean",
+        "required": false,
+        "description": "Switch even though the open map has unsaved changes, discarding them (default false)"
+      },
+      {
+        "name": "endPIE",
+        "type": "boolean",
+        "required": false,
+        "description": "End a running play session and switch; without it the switch is refused while one is up (default false)"
+      }
+    ],
+    "contractExempt": "Creates the home level if missing and opens it before the contract path can fail"
   },
   "demo_step": {
     "category": "demo",
@@ -39,19 +53,13 @@ export const handlerSpecs: HandlerSpecs = {
   }
 };
 
-/** The Params: clause of each spec'd bridge method. */
-export const paramsClauses: Readonly<Record<string, string>> = {
-  demo_cleanup: "Params: none",
-  demo_get_steps: "Params: none",
-  demo_go_home: "Params: none",
-  demo_step: "Params: step? (or stepIndex)",
-};
-
 /** Every key the spec'd demo handlers declare, aliases included. */
 export const schema: Record<string, z.ZodType> = {
+  discardUnsaved: z.boolean().optional().describe("Switch even though the open map has unsaved changes, discarding them (default false)"),
+  endPIE: z.boolean().optional().describe("End a running play session and switch; without it the switch is refused while one is up (default false)"),
   step: z.number().int().optional().describe("Step index to execute, 1 to 19. Omit for the step list"),
   stepIndex: z.number().int().optional().describe("Alias for step"),
 };
 
 /** Declare an action for a spec'd bridge method: effect, summary, method. */
-export const specBp = makeSpecBp(paramsClauses, handlerSpecs);
+export const specBp = makeSpecBp(handlerSpecs);

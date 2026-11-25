@@ -2,6 +2,7 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerAssetDelete.h"
+#include "HandlerLevelSwitch.h"
 
 #include "Handlers/VolumeHelpers_Internal.h"
 
@@ -126,15 +127,90 @@ void FDemoHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("demo_get_steps"), &DemoGetSteps, {});
 	Registry.RegisterHandler(TEXT("demo_cleanup"), &DemoCleanup, TArray<FMCPParamSpec>(),
 		MCPSpec::ContractExempt(TEXT("Takes no parameters and acts unconditionally: switches levels and deletes the demo scene")));
-	Registry.RegisterHandler(TEXT("demo_go_home"), &DemoGoHome, TArray<FMCPParamSpec>(),
-		MCPSpec::ContractExempt(TEXT("Takes no parameters and acts unconditionally: creates the home level if missing and opens it")));
+	Registry.RegisterHandler(TEXT("demo_go_home"), &DemoGoHome, {
+		MCPParam::Optional(TEXT("discardUnsaved"), EType::Boolean, TEXT("Switch even though the open map has unsaved changes, discarding them (default false)")),
+		MCPParam::Optional(TEXT("endPIE"), EType::Boolean, TEXT("End a running play session and switch; without it the switch is refused while one is up (default false)")),
+	}, MCPSpec::ContractExempt(TEXT("Creates the home level if missing and opens it before the contract path can fail")));
+}
+
+namespace DemoHome
+{
+	/** A package the demo owns: under /Game/Demo, or one of its level's external packages. */
+	static bool IsDemoPackage(const FString& PackageName)
+	{
+		return PackageName.StartsWith(DemoConstants::MAT_DIR + TEXT("/"))
+			|| PackageName.StartsWith(TEXT("/Game/__ExternalActors__/Demo/"))
+			|| PackageName.StartsWith(TEXT("/Game/__ExternalObjects__/Demo/"));
+	}
 }
 
 // Ensures /Game/MCP_Home exists on disk and loads it. Idempotent.
-bool FDemoHandlers::EnsureHomeLevelLoaded(FString& OutError)
+//
+// #1851: the engine's LoadLevel refuses on unsaved changes from UE 5.9 and
+// its answer used to be ignored, so a dirty never-saved startup map was
+// reported as home while the editor stayed on it. Unsaved changes are now
+// answered for first, by Discard, and the open map is checked afterwards.
+bool FDemoHandlers::EnsureHomeLevelLoaded(FString& OutError, EMCPHomeDiscard Discard, TArray<FString>* OutDirty, TArray<FString>* OutDiscarded)
 {
 	ULevelEditorSubsystem* LevelSub = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
 	if (!LevelSub) { OutError = TEXT("LevelEditorSubsystem not available"); return false; }
+
+	// Already standing in it: reloading would only throw away its own unsaved edits.
+	if (MCPLevelSwitch::OpenMapPackageName() == DemoConstants::HOME_LEVEL)
+	{
+		return true;
+	}
+
+	// The switch would end a running play session; demo_go_home ends it first
+	// when asked to, so reaching here with one up means nobody asked (#1912).
+	// Checked after the unsaved-changes refusal and before anything is discarded.
+	const auto RefusePlaySession = [&OutError]()
+	{
+		if (!MCPLevelSwitch::IsPlaySessionActive()) return false;
+		OutError = FString::Printf(TEXT("A play session (%s) is running, and switching to %s would end it, so the editor was left where it is. %s"),
+			*MCPLevelSwitch::PlaySessionMode(), *DemoConstants::HOME_LEVEL, *MCPStopPlayInEditorStep());
+		return true;
+	};
+
+	const TArray<UPackage*> Dirty = MCPLevelSwitch::CollectDirtyPackages(GetEditorWorld());
+	const TArray<FString> DirtyNames = MCPLevelSwitch::PackageNames(Dirty);
+	if (DirtyNames.Num() == 0 && RefusePlaySession()) return false;
+	if (DirtyNames.Num() > 0)
+	{
+		TArray<FString> NotDiscardable;
+		if (Discard == EMCPHomeDiscard::Refuse)
+		{
+			NotDiscardable = DirtyNames;
+		}
+		else if (Discard == EMCPHomeDiscard::DemoPackagesOnly)
+		{
+			NotDiscardable = DirtyNames.FilterByPredicate([](const FString& Name) { return !DemoHome::IsDemoPackage(Name); });
+		}
+		if (NotDiscardable.Num() > 0)
+		{
+			if (OutDirty) *OutDirty = DirtyNames;
+			const bool bUnsavedMap = NotDiscardable.ContainsByPredicate([](const FString& Name) { return MCPLevelSwitch::IsUnsavedMapPackage(Name); });
+			OutError = FString::Printf(
+				TEXT("The open map has %d unsaved package(s) that switching to %s would discard (%s), so the editor was left where it is. ")
+				TEXT("Pass discardUnsaved=true to drop them, or save them first%s."),
+				NotDiscardable.Num(), *DemoConstants::HOME_LEVEL, *FString::Join(NotDiscardable, TEXT(", ")),
+				bUnsavedMap
+					? TEXT("; a never-saved map has no file to save to, so for it discarding is the only way off")
+					: TEXT(" with level(save) or editor(save_dirty)"));
+			return false;
+		}
+		if (RefusePlaySession()) return false;
+		const TArray<FString> StillDirty = MCPLevelSwitch::DiscardChanges(Dirty);
+		if (StillDirty.Num() > 0)
+		{
+			if (OutDirty) *OutDirty = StillDirty;
+			OutError = FString::Printf(
+				TEXT("Could not discard %d unsaved package(s): each was dirty again as soon as its flag was cleared (%s). The editor was left where it is."),
+				StillDirty.Num(), *FString::Join(StillDirty, TEXT(", ")));
+			return false;
+		}
+		if (OutDiscarded) *OutDiscarded = DirtyNames;
+	}
 
 	if (!UEditorAssetLibrary::DoesAssetExist(DemoConstants::HOME_LEVEL))
 	{
@@ -151,9 +227,19 @@ bool FDemoHandlers::EnsureHomeLevelLoaded(FString& OutError)
 			return false;
 		}
 	}
-	else
+	else if (!MCPLevelSwitch::LoadLevel(*LevelSub, DemoConstants::HOME_LEVEL, /*bDiscardUnsaved*/ DirtyNames.Num() > 0))
 	{
-		LevelSub->LoadLevel(DemoConstants::HOME_LEVEL);
+		OutError = FString::Printf(TEXT("The engine refused to load %s; the output log carries its reason."), *DemoConstants::HOME_LEVEL);
+		return false;
+	}
+
+	// The open world is the proof, not the subsystem's answer.
+	const FString OpenMap = MCPLevelSwitch::OpenMapPackageName();
+	if (OpenMap != DemoConstants::HOME_LEVEL)
+	{
+		OutError = FString::Printf(TEXT("The editor reported %s loaded, but the open map is '%s'. Check the output log."),
+			*DemoConstants::HOME_LEVEL, *OpenMap);
+		return false;
 	}
 	return true;
 }
@@ -180,13 +266,41 @@ TSharedPtr<FJsonValue> FDemoHandlers::DemoGoHome(const TSharedPtr<FJsonObject>& 
 		}
 	}
 
-	FString Err;
-	if (!EnsureHomeLevelLoaded(Err))
+	const bool bDiscardUnsaved = OptionalBool(Params, TEXT("discardUnsaved"), false);
+	// Switching home replaces the editor world, which ends a play session, so
+	// it is refused unless the caller asked for that (#1912). Already standing
+	// in the home level switches nothing and needs no session ended.
+	bool bEndedPlaySession = false;
+	if (MCPLevelSwitch::IsPlaySessionActive() && MCPLevelSwitch::OpenMapPackageName() != DemoConstants::HOME_LEVEL)
 	{
-		return MCPError(Err);
+		if (!OptionalBool(Params, TEXT("endPIE"), false))
+		{
+			TSharedPtr<FJsonObject> Refusal = MCPLevelSwitch::PlaySessionRefusal(FString::Printf(TEXT("switching to %s"), *DemoConstants::HOME_LEVEL));
+			Refusal->SetStringField(TEXT("openMap"), MCPLevelSwitch::OpenMapPackageName());
+			return MCPResult(Refusal);
+		}
+		// A refusal over unsaved changes, which comes next, must leave the session running.
+		const bool bDirtyRefusalComing = !bDiscardUnsaved && MCPLevelSwitch::CollectDirtyPackages(GetEditorWorld()).Num() > 0;
+		if (!bDirtyRefusalComing) bEndedPlaySession = MCPLevelSwitch::EndPlaySession();
+	}
+	FString Err;
+	TArray<FString> Dirty;
+	TArray<FString> Discarded;
+	if (!EnsureHomeLevelLoaded(Err, bDiscardUnsaved ? EMCPHomeDiscard::Everything : EMCPHomeDiscard::Refuse, &Dirty, &Discarded))
+	{
+		TSharedPtr<FJsonObject> Refusal = MCPErrorObject(Err);
+		if (Dirty.Num() > 0) Refusal->SetArrayField(TEXT("dirtyPackages"), MCPStringListToJson(Dirty));
+		Refusal->SetStringField(TEXT("openMap"), MCPLevelSwitch::OpenMapPackageName());
+		if (Discarded.Num() > 0) Refusal->SetArrayField(TEXT("discardedPackages"), MCPStringListToJson(Discarded));
+		Refusal->SetBoolField(TEXT("playSessionActive"), MCPLevelSwitch::IsPlaySessionActive());
+		Refusal->SetBoolField(TEXT("endedPlaySession"), bEndedPlaySession);
+		return MCPResult(Refusal);
 	}
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("levelPath"), DemoConstants::HOME_LEVEL);
+	Result->SetBoolField(TEXT("endedPlaySession"), bEndedPlaySession);
+	// Said whichever way it went, so a caller never has to infer that unsaved work was dropped.
+	Result->SetArrayField(TEXT("discardedPackages"), MCPStringListToJson(Discarded));
 	Result->SetStringField(TEXT("previousLevelPath"), PreviousLevelPath);
 	Result->SetBoolField(TEXT("homeLevelCreated"), !bHomeExisted);
 	// Idempotency: already standing in the home level means this opened nothing.
@@ -201,13 +315,23 @@ TSharedPtr<FJsonValue> FDemoHandlers::DemoGoHome(const TSharedPtr<FJsonObject>& 
 		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 		Payload->SetStringField(TEXT("levelPath"), PreviousLevelPath);
 		MCPSetRollback(Result, TEXT("load_level"), Payload);
-		Result->SetBoolField(TEXT("rollbackLossy"), !bHomeExisted);
+		Result->SetBoolField(TEXT("rollbackLossy"), !bHomeExisted || Discarded.Num() > 0);
+		FString LossNote;
 		if (!bHomeExisted)
 		{
-			Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+			LossNote = FString::Printf(
 				TEXT("The previous level is reopened, but '%s' was created on disk by this call and stays there. "
 					 "Delete it with asset(delete) as well if the rollback has to leave no trace."),
-				*DemoConstants::HOME_LEVEL));
+				*DemoConstants::HOME_LEVEL);
+		}
+		if (Discarded.Num() > 0)
+		{
+			if (!LossNote.IsEmpty()) LossNote += TEXT(" ");
+			LossNote += TEXT("The previous level is reopened from disk; the unsaved changes discarded by this call do not come back.");
+		}
+		if (!LossNote.IsEmpty())
+		{
+			Result->SetStringField(TEXT("rollbackNote"), LossNote);
 		}
 	}
 	else
@@ -394,7 +518,9 @@ TSharedPtr<FJsonValue> FDemoHandlers::DemoCleanup(const TSharedPtr<FJsonObject>&
 	// Untitled-map trap described above, so a failed anchor stops the cleanup.
 	{
 		FString HomeErr;
-		if (!EnsureHomeLevelLoaded(HomeErr))
+		// The demo level is deleted below, so its unsaved changes are the
+		// cleanup's to drop. Anybody else's are not.
+		if (!EnsureHomeLevelLoaded(HomeErr, EMCPHomeDiscard::DemoPackagesOnly))
 		{
 			return MCPError(FString::Printf(
 				TEXT("Cleanup stopped before deleting anything: the editor could not be moved to %s (%s)."),
@@ -665,6 +791,28 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepCreateLevel()
 	if (!LevelSub)
 	{
 		return DemoStepFailed(Result, TEXT("LevelEditorSubsystem not available"));
+	}
+
+	// Opening the demo level replaces the editor world. A play session or
+	// unsaved work outside the demo would be lost without being asked, so the
+	// step stops and names the call that clears the way (#1912).
+	if (MCPLevelSwitch::OpenMapPackageName() != DemoConstants::DEMO_LEVEL)
+	{
+		if (MCPLevelSwitch::IsPlaySessionActive())
+		{
+			return DemoStepFailed(Result, FString::Printf(
+				TEXT("A play session (%s) is running, and opening %s would end it. Run demo_go_home with endPIE=true, or %s"),
+				*MCPLevelSwitch::PlaySessionMode(), *DemoConstants::DEMO_LEVEL, *MCPStopPlayInEditorStep()));
+		}
+		TArray<FString> Unsaved = MCPLevelSwitch::PackageNames(MCPLevelSwitch::CollectDirtyPackages(GetEditorWorld()));
+		Unsaved.RemoveAll([](const FString& Name) { return DemoHome::IsDemoPackage(Name); });
+		if (Unsaved.Num() > 0)
+		{
+			Result->SetArrayField(TEXT("dirtyPackages"), MCPStringListToJson(Unsaved));
+			return DemoStepFailed(Result, FString::Printf(
+				TEXT("The open map has %d unsaved package(s) that opening %s would discard. Save them with level(save), or drop them with demo_go_home(discardUnsaved=true), then run the step again."),
+				Unsaved.Num(), *DemoConstants::DEMO_LEVEL));
+		}
 	}
 
 	UEditorAssetLibrary::MakeDirectory(DemoConstants::MAT_DIR);
@@ -955,7 +1103,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepMoonlight()
 	UWorld* World = GetEditorWorld();
 	if (!World)
 	{
-		return DemoStepFailed(Result, TEXT("Editor world not available"));
+		return DemoStepFailed(Result, MCPEditorWorldUnavailableMessage());
 	}
 
 	FTransform SpawnTransform(FRotator(-30.0, 210.0, 0.0), FVector::ZeroVector);
@@ -990,7 +1138,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepSkyLight()
 	UWorld* World = GetEditorWorld();
 	if (!World)
 	{
-		return DemoStepFailed(Result, TEXT("Editor world not available"));
+		return DemoStepFailed(Result, MCPEditorWorldUnavailableMessage());
 	}
 
 	FTransform SpawnTransform(FRotator::ZeroRotator, FVector(0.0, 0.0, 500.0));
@@ -1024,7 +1172,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepFog()
 	UWorld* World = GetEditorWorld();
 	if (!World)
 	{
-		return DemoStepFailed(Result, TEXT("Editor world not available"));
+		return DemoStepFailed(Result, MCPEditorWorldUnavailableMessage());
 	}
 
 	FTransform SpawnTransform(FRotator::ZeroRotator, FVector::ZeroVector);
@@ -1059,7 +1207,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepPostProcess()
 	UWorld* World = GetEditorWorld();
 	if (!World)
 	{
-		return DemoStepFailed(Result, TEXT("Editor world not available"));
+		return DemoStepFailed(Result, MCPEditorWorldUnavailableMessage());
 	}
 
 	FTransform SpawnTransform(FRotator::ZeroRotator, FVector::ZeroVector);
@@ -1099,7 +1247,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepNiagaraVfx()
 	UWorld* World = GetEditorWorld();
 	if (!World)
 	{
-		return DemoStepFailed(Result, TEXT("Editor world not available"));
+		return DemoStepFailed(Result, MCPEditorWorldUnavailableMessage());
 	}
 
 	// Clean up any existing asset
@@ -1129,13 +1277,11 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepNiagaraVfx()
 		return DemoStepFailed(Result, TEXT("Could not create Niagara system factory"));
 	}
 
-#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
 	UNiagaraSystemFactoryNew* NiagaraFactory = static_cast<UNiagaraSystemFactoryNew*>(Factory);
 	FVersionedNiagaraEmitter VersionedEmitter;
 	VersionedEmitter.Emitter = FountainEmitter;
 	VersionedEmitter.Version = FountainEmitter->GetExposedVersion().VersionGuid;
 	NiagaraFactory->EmittersToAddToNewSystem.Add(VersionedEmitter);
-#endif
 
 	UObject* NSAsset = AssetTools.CreateAsset(
 		TEXT("NS_Demo_Aura"), DemoConstants::MAT_DIR,
@@ -1196,7 +1342,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepPcgScatter()
 	UWorld* World = GetEditorWorld();
 	if (!World)
 	{
-		return DemoStepFailed(Result, TEXT("Editor world not available"));
+		return DemoStepFailed(Result, MCPEditorWorldUnavailableMessage());
 	}
 
 	// Spawn PCG Volume on floor
@@ -1240,7 +1386,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepOrbitRings()
 	UWorld* World = GetEditorWorld();
 	if (!World)
 	{
-		return DemoStepFailed(Result, TEXT("Editor world not available"));
+		return DemoStepFailed(Result, MCPEditorWorldUnavailableMessage());
 	}
 
 	UMaterialInterface* GlowMat = LoadDemoMat(TEXT("M_Demo_Glow"));
@@ -1317,7 +1463,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepLevelSequence()
 	UWorld* World = GetEditorWorld();
 	if (!World)
 	{
-		return DemoStepFailed(Result, TEXT("Editor world not available"));
+		return DemoStepFailed(Result, MCPEditorWorldUnavailableMessage());
 	}
 
 	// Create LevelSequence asset

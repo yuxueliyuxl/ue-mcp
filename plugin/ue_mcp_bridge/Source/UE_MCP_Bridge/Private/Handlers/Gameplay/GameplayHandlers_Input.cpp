@@ -210,7 +210,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::CreateInputAction(const TSharedPtr<FJs
 	UClass* InputActionClass = FindObject<UClass>(nullptr, TEXT("/Script/EnhancedInput.InputAction"));
 	if (!InputActionClass)
 	{
-		return MCPError(TEXT("InputAction class not found. Enable EnhancedInput plugin."));
+		return MCPPluginUnavailableError(TEXT("InputAction class"), TEXT("EnhancedInput"));
 	}
 
 	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("InputAction"), InputActionClass, nullptr);
@@ -280,7 +280,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::CreateInputMappingContext(const TShare
 	UClass* IMCClass = FindObject<UClass>(nullptr, TEXT("/Script/EnhancedInput.InputMappingContext"));
 	if (!IMCClass)
 	{
-		return MCPError(TEXT("InputMappingContext class not found. Enable EnhancedInput plugin."));
+		return MCPPluginUnavailableError(TEXT("InputMappingContext class"), TEXT("EnhancedInput"));
 	}
 
 	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("InputMappingContext"), IMCClass, nullptr);
@@ -1687,14 +1687,12 @@ TSharedPtr<FJsonValue> FGameplayHandlers::SetActionTriggers(const TSharedPtr<FJs
 		for (UObject* Instance : NewModifiers) Action->Modifiers.Add(Cast<UInputModifier>(Instance));
 	}
 
-#if WITH_EDITOR
 	// A running player caches the instanced triggers off this action, and the
 	// engine tracks which actions changed theirs so it can rebuild those
 	// caches. Writing the array without going through PostEditChange leaves
 	// that bookkeeping stale, so an already-applied context keeps the old
 	// trigger behaviour with no error anywhere.
 	Action->PostEditChange();
-#endif
 	Action->MarkPackageDirty();
 
 	MCPSetExisted(Result);
@@ -1744,7 +1742,11 @@ namespace ImcEdit_Internal
 		if (HasParam(Params, TEXT("inputActionPath"))) return MCPError(TEXT("Choose inputActionPath or imcPath plus mappingIndex"));
 		UInputMappingContext* IMC = LoadAssetByPath<UInputMappingContext>(ImcPath);
 		if (!IMC) return MCPAssetLoadError(ImcPath, TEXT("InputMappingContext"));
-		if (MCPIsProtectedAssetPath(ImcPath)) return MCPError(TEXT("Cannot edit a protected mapping context"));
+		if (MCPIsProtectedAssetPath(ImcPath))
+		{
+			return MCPError(TEXT("Cannot edit a protected mapping context. ") + MCPProtectedMountWayForward()
+				+ TEXT(" To override its bindings without a copy, add a project mapping context at a higher priority."));
+		}
 		auto& Mappings = const_cast<TArray<FEnhancedActionKeyMapping>&>(IMC->GetMappings());
 		if (!FMath::IsFinite(RawIndex) || RawIndex < 0 || RawIndex >= Mappings.Num())
 			return MCPError(TEXT("mappingIndex must be an integer identifying an existing row"));
@@ -2016,9 +2018,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::SetPlayerMappableSettings(const TShare
 	if (bHasDisplayName) Settings->DisplayName = FText::FromString(DisplayName);
 	if (bHasDisplayCategory) Settings->DisplayCategory = FText::FromString(DisplayCategory);
 
-#if WITH_EDITOR
 	Action->PostEditChange();
-#endif
 	auto Result = MCPSuccess();
 	if (bCreated)
 	{

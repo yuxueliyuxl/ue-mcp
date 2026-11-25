@@ -1,8 +1,9 @@
+// @session per-session: Owns one session's last valid YAML guard declarations, merged from its project and user-global config layers.
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { readEnv } from "../core/env.js";
 import { configLayerFiles, selectedOverlay } from "../config/ue-mcp-config.js";
-import type { ToolDef } from "../core/types.js";
+import type { ToolDef } from "../surface/tool-types.js";
 import type { GuardDeclarations } from "./guard-schema.js";
 import type { GuardSource } from "./guards.js";
 import { loadFlowConfig, type PluginContribution } from "./loader.js";
@@ -58,8 +59,9 @@ function assertRegisteredStructure(next: GuardDeclarations, registered: GuardDec
     const declaration = next[name];
     const original = registered[name];
     if (!original || !declaration || declaration.scope !== original.scope || declaration.order !== original.order
+      || declaration.allowsOverride !== original.allowsOverride
       || (["before", "after"] as const).some((phase) => declaration[phase]?.class_path !== original[phase]?.class_path)) {
-      throw new Error(`Guard '${name}' changed its registration; restart ue-mcp to add or remove guards or hooks, or change class_path, scope or order`);
+      throw new Error(`Guard '${name}' changed its registration; restart ue-mcp to add or remove guards or hooks, or change class_path, scope, order or allowsOverride`);
     }
   }
 }

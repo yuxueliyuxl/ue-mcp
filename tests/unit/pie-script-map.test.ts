@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { pieTool } from "../../src/tools/pie.js";
-import { handlerSpecs, paramsClauses } from "../../src/tools/specs/pie.generated.js";
-import type { ToolContext } from "../../src/core/types.js";
+import { handlerSpecs } from "../../src/tools/specs/pie.generated.js";
+import type { ToolContext } from "../../src/surface/tool-types.js";
 import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
 const WITH_MAP = ["pie_script_create", "pie_script_update", "pie_script_validate", "pie_script_run"] as const;
@@ -10,7 +10,6 @@ describe("a test script names the level it plays in", () => {
   it.each(WITH_MAP)("%s takes an optional string map", (method) => {
     const map = handlerSpecs[method].params.find((p) => p.name === "map");
     expect(map).toMatchObject({ type: "string", required: false });
-    expect(paramsClauses[method]).toContain("map?");
   });
 
   it("registers map in C++ under the same name for every action that takes it", () => {

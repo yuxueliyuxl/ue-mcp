@@ -10,9 +10,15 @@ public:
 	// Register all asset handlers
 	static void RegisterHandlers(class FMCPHandlerRegistry& Registry);
 
+	// asset(save, assetPaths)'s targeted save, for a handler in another
+	// category that must write exactly the packages it changed and no others.
+	// Same rows and statuses (saved, notDirty, failed, refused) as that action.
+	static TSharedPtr<FJsonValue> SaveNamedPackages(const TArray<TSharedPtr<FJsonValue>>& PathValues);
+
 private:
 	// Handler implementations
 	static TSharedPtr<FJsonValue> ListAssets(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReadMeshMaterials(const TSharedPtr<FJsonObject>& Params);
 
 	// UV authoring and inspection, in AssetHandlers_UV.cpp. There was no UV
 	// surface at all: one read-only peek at a single channel off render data.
@@ -108,6 +114,11 @@ private:
 	static TSharedPtr<FJsonValue> SetDataTableRow(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CloneDataTableRows(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveDataTableRows(const TSharedPtr<FJsonObject>& Params);
+	// #1999: every handler removes a DataTable row through this, never through
+	// UDataTable::RemoveRow. On UE 5.6 that call ends in
+	// HandleDataTableChanged(<removed row>), which looks the removed row up and
+	// asserts when the row struct is native. Returns whether a row was removed.
+	static bool RemoveDataTableRowSafely(class UDataTable* Table, FName RowName);
 	static TSharedPtr<FJsonValue> EditCollectionEntry(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveDataTableRow(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetDataTableRow(const TSharedPtr<FJsonObject>& Params);
@@ -128,6 +139,8 @@ private:
 	static TSharedPtr<FJsonValue> GetCurveTableKeys(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetCurveTableKeys(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddCurveTableKey(const TSharedPtr<FJsonObject>& Params);
+	// #1687: keys of one channel of a CurveFloat, CurveVector or CurveLinearColor.
+	static TSharedPtr<FJsonValue> SetCurveAssetKeys(const TSharedPtr<FJsonObject>& Params);
 
 	// FBX import handlers
 	static TSharedPtr<FJsonValue> ImportStaticMesh(const TSharedPtr<FJsonObject>& Params);
@@ -163,6 +176,7 @@ private:
 	static TSharedPtr<FJsonValue> CompareTextures(const TSharedPtr<FJsonObject>& Params);
 	// #430: one-call batch of texture imports - loops AssetImportTasks inside the editor.
 	static TSharedPtr<FJsonValue> ImportTextureBatch(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RestoreTextureImport(const TSharedPtr<FJsonObject>& Params);
 	// Create and persist a TextureRenderTarget2D with explicit render settings.
 	static TSharedPtr<FJsonValue> CreateRenderTarget2D(const TSharedPtr<FJsonObject>& Params);
 
@@ -173,6 +187,8 @@ private:
 	static TSharedPtr<FJsonValue> GetStringTableEntry(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetStringTableEntry(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveStringTableEntry(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetStringTableEntryMetaData(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RemoveStringTableEntryMetaData(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ImportStringTable(const TSharedPtr<FJsonObject>& Params);
 	// CSV import with key-set validation and an explicit save result (#978).
 	static TSharedPtr<FJsonValue> ImportStringTableCsv(const TSharedPtr<FJsonObject>& Params);
@@ -195,6 +211,7 @@ private:
 	// Append prevalidated JSON values to a reflected TArray without replacing
 	// existing entries. Supports native and user-defined struct elements.
 	static TSharedPtr<FJsonValue> AppendAssetArrayElements(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RemoveAssetArrayElements(const TSharedPtr<FJsonObject>& Params);
 	// Batch counterpart to SetAssetProperty. Preflights every asset/property
 	// before mutating any package and emits a replayable rollback payload.
 	static TSharedPtr<FJsonValue> BulkSetAssetProperties(const TSharedPtr<FJsonObject>& Params);
@@ -208,6 +225,14 @@ private:
 	// Ranked asset search over the Asset Registry
 	static TSharedPtr<FJsonValue> SearchAssetsFTS(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReindexAssetsFTS(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> QuickSearch(const TSharedPtr<FJsonObject>& Params);
+
+	// Epic's Semantic Search plugin through its module interface, never linked
+	// (#1829). AssetHandlers_SemanticSearch.cpp.
+	static void RegisterSemanticSearchHandlers(class FMCPHandlerRegistry& Registry);
+	static TSharedPtr<FJsonValue> SemanticSearchStatus(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SemanticSearchQuery(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SemanticSearchIndex(const TSharedPtr<FJsonObject>& Params);
 
 	// v0.7.19 issue #150 - AssetRegistry referencers for a set of packages
 	static TSharedPtr<FJsonValue> GetReferencers(const TSharedPtr<FJsonObject>& Params);
@@ -229,6 +254,8 @@ private:
 	// #593: list bones (names + rest-pose transforms) from a SkeletalMesh/Skeleton asset.
 	static TSharedPtr<FJsonValue> ListSkeletonBones(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetMeshCollision(const TSharedPtr<FJsonObject>& Params);
+	// Write explicit box, sphere and capsule shapes into a StaticMesh's body setup.
+	static TSharedPtr<FJsonValue> SetMeshSimpleCollision(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> MoveFolder(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetMeshNav(const TSharedPtr<FJsonObject>& Params);
 	// #212: create empty content browser folders

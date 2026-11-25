@@ -1,3 +1,4 @@
+// @session independent: Types and pure conversions of an asset diff the bridge returned. The service that calls the editor passes its answer in.
 /**
  * Asset diffs for checkpoints: each version of a package loaded in the editor
  * with DiffUtils::LoadPackageForDiff, and Unreal's own diff code run on them
@@ -5,145 +6,61 @@
  * produces them: FSingleObjectDiffEntry from DiffUtils::CompareUnrelatedObjects
  * with both values exported as text, FDiffSingleResult from
  * FGraphDiffControl::DiffGraphs with its DisplayString and ToolTip, and
- * FSCSDiffEntry from DiffUtils::CompareUnrelatedSCS. Facts about each version
+ * FSCSDiffEntry from DiffUtils::CompareUnrelatedSCS, and the Blueprint type's own
+ * FDiffSingleResults from UBlueprint::FindDiffs (a Widget Blueprint's widget
+ * tree, each paired widget compared property by property). Facts about each version
  * (LOD counts, texture size) are context beside them, never a diff of their own.
  *
  * Each version also gets a picture rendered with ThumbnailTools::RenderThumbnail
  * on the object loaded for diff, kept per blob id, so a version always has the
- * same picture.
+ * same picture. A level is drawn from the level itself, framed on the actors
+ * that changed, so its pictures are kept per pair (pictureId). A Blueprint changed only in its
+ * graphs is pictured by the changed graph instead, drawn for the pair.
  */
 import { unifiedDiff } from "./text-diff.js";
+import type { AssetDiff, AssetDiffRecord, AssetDiffSection, AssetFact, AssetThumbnail, AssetVersion } from "../contract/daemon.js";
+import * as crypto from "node:crypto";
+import * as path from "node:path";
 
-/** Bumped when the bridge's records change shape, so cached diffs are recomputed. */
-export const ASSET_DIFF_FORMAT = 2;
+/** Bumped when the bridge's records or pictures change, so cached diffs are recomputed. */
+export const ASSET_DIFF_FORMAT = 5;
+
+/**
+ * Bumped when the bridge's pictures change, so a picture kept for a version is
+ * rendered again. 2: the bridge no longer writes a blank picture (a Blueprint
+ * loaded for diff is not compiled, so its renderer drew nothing but black).
+ * 3: an Actor Blueprint loaded for diff is drawn, rather than its saved thumbnail.
+ * 4: a level is drawn from the level, framed on the actors that changed.
+ */
+export const THUMBNAIL_FORMAT = 4;
+
+/** Where the picture (png) of a version, or what is known about it (json), is kept. */
+export function thumbnailFile(dir: string, version: string, ext: "png" | "json" = "png"): string {
+  return path.join(dir, `${version}.v${THUMBNAIL_FORMAT}.${ext}`);
+}
+
+/**
+ * The id one side's picture is kept under. Most pictures depend on the version
+ * alone, so they are kept per blob id. A level's picture is framed on the actors
+ * that changed between the two versions, so it is kept per pair and side.
+ */
+export function pictureId(packagePath: string, a: string | null, b: string | null, side: "before" | "after"): string | null {
+  const version = side === "before" ? a : b;
+  if (!version) return null;
+  if (!/\.umap$/i.test(packagePath)) return version;
+  return crypto.createHash("sha1").update(["level", a ?? "-", b ?? "-", side].join("\n")).digest("hex");
+}
+
+/**
+ * The id of a graph picture: one side of one diffed pair, since the region drawn
+ * depends on both versions. Forty hex digits, as the thumbnail route requires.
+ */
+export function graphPictureId(pairKey: string, side: "before" | "after"): string {
+  return crypto.createHash("sha1").update(`graph\n${pairKey}\n${side}`).digest("hex");
+}
 
 /** How many packages one list_changes diffs up front; the rest are diffed on request, per path. */
 export const MAX_ASSET_DIFFS = 25;
-
-/** One record of Unreal's diff, as the engine produced it. */
-export interface AssetDiffRecord {
-  /** The engine's own message for it, such as "Base Color changed value in M_Blue" or "Added Node Constant". */
-  displayString: string;
-  /** EPropertyDiffType (PropertyValueChanged, PropertyAddedToA, PropertyAddedToB), EDiffType (NODE_ADDED, PIN_LINKEDTO_NODE...) or ETreeDiffType (NODE_ADDED...). */
-  diffType: string;
-  /** EDiffType::Category of a graph record: ADDITION, SUBTRACTION, MODIFICATION, MINOR. */
-  category?: string;
-  toolTip?: string;
-  /** The actor, component, variable or row a record belongs to. */
-  group?: string;
-  /** A difference under a property the details panel does not show. */
-  hidden?: boolean;
-  /** FPropertySoftPath::ToDisplayName of a property record. */
-  path?: string;
-  property?: string;
-  /** Both values exported with FProperty::ExportText; null where the path does not exist on that side. */
-  before?: string | null;
-  after?: string | null;
-  graph?: string;
-  node1?: AssetDiffNode;
-  node2?: AssetDiffNode;
-  pin1?: { name: string; direction: string; nodeGuid?: string; defaultValue: string; linkedTo: string[] };
-  pin2?: { name: string; direction: string; nodeGuid?: string; defaultValue: string; linkedTo: string[] };
-  /** For a NODE_PROPERTY graph record: the property records behind it. */
-  properties?: AssetDiffRecord[];
-  /** For an added or removed actor: its class, label and transform. */
-  facts?: AssetFact[];
-  treeLocation?: number[];
-  owningObjectPath?: string;
-  propertyDiffType?: string;
-}
-
-/** A graph node a record names. */
-export interface AssetDiffNode {
-  guid: string;
-  name: string;
-  class: string;
-  /** ENodeTitleType::ListView, the short title the engine's DisplayString uses. */
-  title: string;
-  /** ENodeTitleType::FullTitle. Set on NODE_ADDED and NODE_REMOVED records only, as are pins and properties. */
-  fullTitle?: string;
-  /** Visible input pins (exec pins left out) with their default values. */
-  pins?: AssetDiffNodePin[];
-  /** Class of the object whose properties are listed: the UMaterialExpression for a material node, the node otherwise. */
-  propertiesOf?: string;
-  /** The details panel's properties (CPF_Edit) of that object, exported as text, in class order (most derived first). */
-  properties?: AssetDiffNodeProperty[];
-  /** Properties past the per-node limit, counted. */
-  propertiesDropped?: number;
-}
-
-export interface AssetDiffNodePin {
-  name: string;
-  displayName: string;
-  defaultValue: string;
-  /** Wired to another node, so the default is not what the node reads. */
-  linked: boolean;
-}
-
-export interface AssetDiffNodeProperty {
-  name: string;
-  /** The details panel's label, such as "Value" for a Constant's R. */
-  displayName: string;
-  /** FProperty::ExportText of the value. */
-  value: string;
-  /** Still the class default. */
-  isDefault: boolean;
-}
-
-/** A group of records under one of the engine's own diff categories (Graph: EventGraph, Components, Defaults, Details...). */
-export interface AssetDiffSection {
-  category: string;
-  kind: "properties" | "graph" | "components";
-  /** The engine API the records came from. */
-  engineSource: string;
-  entries: AssetDiffRecord[];
-  /** How many of the records are under properties the details panel does not show (marked hidden). */
-  hiddenChanges?: number;
-}
-
-export interface AssetFact {
-  name: string;
-  value: string;
-}
-
-export type AssetThumbnail =
-  | { id: string; url: string; source: "rendered" | "saved"; note?: string }
-  | { error: string };
-
-/** One version of the package, as the editor loaded it. */
-export interface AssetVersion {
-  class: string;
-  objectName?: string;
-  facts: AssetFact[];
-  thumbnail?: AssetThumbnail;
-}
-
-export interface AssetDiff {
-  /** ready: diffed. deferred: over the up-front limit, diff it by path. error: see error. */
-  state: "ready" | "deferred" | "error";
-  error?: string;
-  packageName?: string;
-  assetClass?: string;
-  status?: "added" | "modified" | "deleted";
-  /** Which of Unreal's diffs serves this class, and what these records are. */
-  engine?: { tool: string; note: string; native: "window" | "details" | "text"; nativeAvailable?: boolean; nativeReason?: string };
-  /** null: the version did not exist. */
-  before?: AssetVersion | null;
-  after?: AssetVersion | null;
-  classChanged?: string;
-  sections?: AssetDiffSection[];
-  /** The engine's own text form of the diff where its diff is a text diff (a DataTable's CSV), as a unified diff. */
-  textDiff?: { format: string; diff: string };
-  /** blueprint(diff)'s structural summary, for a Blueprint. */
-  blueprint?: Record<string, unknown>;
-  recordCount?: number;
-  /** Records past maxRecords, counted. */
-  recordsDropped?: number;
-  /** One line to decide on. */
-  summary: string;
-  /** Whether Unreal's own diff view can open this, and why not. */
-  nativeDiff: { available: boolean; reason?: string };
-}
 
 type Json = Record<string, unknown>;
 
@@ -159,9 +76,15 @@ function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
+/** A property record's name: its group, then the details panel's label for the path. */
+function recordName(r: AssetDiffRecord): string {
+  const name = r.label ?? r.path ?? r.displayString;
+  return r.group && r.group !== r.path && r.group !== name ? `${r.group} > ${name}` : name;
+}
+
 /** The record's own words, with the values when it has them. */
 export function describeRecord(r: AssetDiffRecord): string {
-  const label = r.path ? (r.group && r.group !== r.path ? `${r.group} ${r.path}` : r.path) : r.displayString;
+  const label = r.path ? recordName(r) : r.displayString;
   if (r.path && (r.before !== undefined || r.after !== undefined)) {
     if (r.diffType === "PropertyAddedToB") return `${label} added: ${short(r.after)}`;
     if (r.diffType === "PropertyAddedToA") return `${label} removed: ${short(r.before)}`;
@@ -205,6 +128,15 @@ export function summarizeAssetDiff(d: AssetDiff): string {
   }
   if (records.length === 0) {
     if (d.textDiff?.diff) return `${cls}: the engine's ${d.textDiff.format.toUpperCase()} export changed`;
+    if (!hidden && widgetTreeNotCompared(d)) return `${cls}: the file changed; this bridge does not compare the widget tree, so open Unreal's diff to see it`;
+    // No property differs, but a fact does (a sound's duration, a mesh's triangles): that is the change.
+    const before = new Map((d.before?.facts ?? []).map((f) => [f.name, f.value]));
+    const facts = (d.after?.facts ?? []).filter((f) => before.has(f.name) && before.get(f.name) !== f.value);
+    if (!hidden && facts.length) {
+      const shown = facts.slice(0, 2).map((f) => `${f.name}: ${short(before.get(f.name), 40)} to ${short(f.value, 40)}`);
+      const more = facts.length - shown.length;
+      return `${cls} changed. ${shown.join("; ")}${more > 0 ? `; and ${plural(more, "more fact")}` : ""}`;
+    }
     return hidden
       ? `${cls}: ${plural(hidden, "difference")}, all in properties the details panel does not show`
       : `${cls}: the file changed, and Unreal's diff finds no difference`;
@@ -217,7 +149,7 @@ export function summarizeAssetDiff(d: AssetDiff): string {
   const shown: string[] = [];
   for (const r of ordered) {
     const line = describeRecord(r);
-    const name = r.path ? (r.group && r.group !== r.path ? `${r.group} ${r.path}` : r.path) : line;
+    const name = r.path ? recordName(r) : line;
     if (shown.some((x) => x.startsWith(name))) continue;
     shown.push(line);
     if (shown.length === 2) break;
@@ -227,10 +159,32 @@ export function summarizeAssetDiff(d: AssetDiff): string {
   return `${plural(total, "difference")}: ${shown.join("; ")}${rest > 0 ? `; and ${rest} more` : ""}${hiddenNote}`;
 }
 
+/** A Widget Blueprint diffed by a bridge that does not run UBlueprint::FindDiffs, which is where its widget tree is compared. */
+export function widgetTreeNotCompared(d: Pick<AssetDiff, "assetClass" | "engine">): boolean {
+  return /WidgetBlueprint/.test(d.assetClass ?? "") && d.engine?.blueprintTypeDiff === undefined;
+}
+
 /** Whether Unreal's own diff view can open this item, and why not, as the bridge decided it. */
 export function nativeDiffOf(d: Pick<AssetDiff, "state" | "engine">): AssetDiff["nativeDiff"] {
   if (d.state !== "ready" || !d.engine) return { available: false, reason: "The asset has not been diffed." };
   return d.engine.nativeAvailable === false ? { available: false, reason: d.engine.nativeReason ?? "Unreal cannot open a diff of this type." } : { available: true };
+}
+
+/**
+ * The pictures of one version: the changed graph when the bridge drew one (a
+ * graph-only Blueprint change), with the asset's own picture kept beside it;
+ * otherwise the asset's picture, with the reason the graph could not be drawn.
+ */
+export function versionPictures(
+  thumbnail: AssetThumbnail | undefined,
+  graph: AssetThumbnail | undefined,
+): Pick<AssetVersion, "thumbnail" | "classThumbnail"> {
+  if (graph && "id" in graph) return { thumbnail: graph, ...(thumbnail ? { classThumbnail: thumbnail } : {}) };
+  if (!graph) return thumbnail ? { thumbnail } : {};
+  const why = `${graph.error.replace(/\.$/, "")}. The asset's own picture is shown, and a graph edit does not change it.`;
+  if (!thumbnail) return { thumbnail: { error: why } };
+  if ("error" in thumbnail) return { thumbnail: { error: `${thumbnail.error}; ${why}` } };
+  return { thumbnail: { ...thumbnail, note: thumbnail.note ? `${thumbnail.note}. ${why}` : why } };
 }
 
 /** The bridge's answer as an AssetDiff, with the CSV export turned into a unified diff and the pictures mapped to ids. */
@@ -238,17 +192,19 @@ export function assetDiffFromBridge(
   raw: Json,
   key: string,
   picture: (side: "before" | "after", thumb: Json | undefined) => AssetThumbnail | undefined,
+  graphPicture?: (side: "before" | "after", graph: Json) => AssetThumbnail | undefined,
 ): AssetDiff {
   const version = (side: "before" | "after"): AssetVersion | null => {
     const v = raw[side];
     if (!v || typeof v !== "object") return null;
     const o = v as Json;
     const thumbnail = picture(side, o.thumbnail as Json | undefined);
+    const graph = graphPicture && o.graphPicture && typeof o.graphPicture === "object" ? graphPicture(side, o.graphPicture as Json) : undefined;
     return {
       class: str(o.class) ?? "",
       ...(str(o.objectName) ? { objectName: str(o.objectName) } : {}),
       facts: Array.isArray(o.facts) ? (o.facts as AssetFact[]) : [],
-      ...(thumbnail ? { thumbnail } : {}),
+      ...versionPictures(thumbnail, graph),
     };
   };
   const d: AssetDiff = {

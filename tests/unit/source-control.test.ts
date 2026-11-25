@@ -35,7 +35,7 @@ const ACTIONS: Record<string, { bridge: string; effect: "read" | "mutate"; param
   checkout: { bridge: "source_control_checkout", effect: "mutate", params: ["paths"], method: "Checkout" },
   add: { bridge: "source_control_add", effect: "mutate", params: ["paths"], method: "MarkForAdd" },
   revert: { bridge: "source_control_revert", effect: "mutate", params: ["paths", "dryRun", "discardUnsaved", "restoreFrom"], method: "Revert" },
-  diff: { bridge: "source_control_diff", effect: "read", params: ["path", "openEditor", "contextLines", "maxLines"], method: "Diff" },
+  diff: { bridge: "source_control_diff", effect: "read", params: ["path", "revision", "openEditor", "contextLines", "maxLines"], method: "Diff" },
   submit: { bridge: "source_control_submit", effect: "mutate", params: ["paths", "description"], method: "Submit" },
   set_checkout_mode: { bridge: "source_control_set_checkout_mode", effect: "mutate", params: ["mode"], method: "SetCheckoutMode" },
   mark_for_delete: { bridge: "source_control_mark_for_delete", effect: "mutate", params: ["paths"], method: "MarkForDelete" },
@@ -56,7 +56,8 @@ describe("source_control", () => {
   it("is one category tool in ALL_TOOLS, named apart from the p4 plugin's category", () => {
     expect(ALL_TOOLS.filter((t) => t.name === "source_control")).toHaveLength(1);
     expect(sourceControlTool.name).not.toBe("p4");
-    expect(Object.keys(sourceControlTool.actions).sort()).toEqual(Object.keys(ACTIONS).sort());
+    // ue-mcp's own actions; Epic's SourceControlHelpers toolset (UE 5.9) adds epic_* ones beside them.
+    expect(Object.keys(sourceControlTool.actions).filter((a) => !a.startsWith("epic_")).sort()).toEqual(Object.keys(ACTIONS).sort());
   });
 
   it.each(Object.entries(ACTIONS))("%s dispatches to its spec'd handler and forwards the bag as sent", (name, want) => {
@@ -110,14 +111,10 @@ describe("source_control", () => {
     expect(method.indexOf("RequireOperation("), name).toBeLessThan(method.indexOf("Execute("));
   });
 
-  it("asks CanExecuteOperation only on engines that have it, and never names a provider in code", () => {
-    expect(HANDLERS).toMatch(/#define UE_MCP_SCC_HAS_CAN_EXECUTE \(ENGINE_MAJOR_VERSION > 5 \|\| \(ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3\)\)/);
-    for (const call of HANDLERS.matchAll(/CanExecuteOperation\(/g)) {
-      const guard = HANDLERS.lastIndexOf("#if UE_MCP_SCC_HAS_CAN_EXECUTE", call.index);
-      const close = HANDLERS.indexOf("#endif", guard);
-      expect(guard, "CanExecuteOperation outside the version guard").toBeGreaterThan(-1);
-      expect(close).toBeGreaterThan(call.index!);
-    }
+  it("asks CanExecuteOperation, which every supported engine has, and never names a provider in code", () => {
+    // CanExecuteOperation arrived in 5.3, below the oldest supported engine, so it needs no gate.
+    expect(HANDLERS).toMatch(/CanExecuteOperation\(/);
+    expect(HANDLERS).not.toMatch(/UE_MCP_SCC_HAS_CAN_EXECUTE/);
     // Behaviour follows the provider's answers, not its name.
     expect(HANDLERS).not.toMatch(/GetName\(\)\s*(==|!=|\.Equals|\.ToString\(\)\s*==)/);
   });
@@ -165,12 +162,12 @@ describe("source_control", () => {
 
 describe("checkout on write", () => {
   it("is off unless the session or UE_MCP_CHECKOUT_MODE turns it on", () => {
-    expect(HANDLERS).toMatch(/GetEnvironmentVariable\(TEXT\("UE_MCP_CHECKOUT_MODE"\)\)\.Equals\(TEXT\("auto"\)/);
+    expect(HANDLERS).toMatch(/GetEnvironmentVariable\(UEMCPWire::EnvVar::CheckoutMode\)\.Equals\(TEXT\("auto"\)/);
     expect(sourceControlTool.actions.set_checkout_mode.description).toMatch(/manual \(the default\)/);
   });
 
   it("is asked before a read-only package is refused, and the refusal names source_control(checkout)", () => {
-    const save = read("Public/HandlerPackageSave.h");
+    const save = read("Private/HandlerPackageSave.h");
     const tryAt = save.indexOf("MCPSourceControl::TryAutoCheckout(PackageFileName, CheckoutNote)");
     expect(tryAt).toBeGreaterThan(-1);
     expect(tryAt).toBeLessThan(save.indexOf("is read-only on disk. Check it out with source_control(checkout)"));

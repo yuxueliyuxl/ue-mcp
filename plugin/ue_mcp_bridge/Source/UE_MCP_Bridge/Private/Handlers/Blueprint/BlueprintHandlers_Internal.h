@@ -23,6 +23,10 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "HandlerUtils.h"
+#include "BlueprintHandlers.h"
+#include "Engine/Blueprint.h"
+#include "EdGraphSchema_K2.h"
+#include "Logging/TokenizedMessage.h"
 
 class UBlueprint;
 class UActorComponent;
@@ -259,6 +263,11 @@ inline TSharedPtr<FJsonObject> MCPDescribeGraphNode(const UEdGraphNode* Node, co
 		TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
 		PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
 		PinObj->SetStringField(TEXT("type"), Pin->PinType.PinCategory.ToString());
+		// #2004: `type` is the category alone, so an object array and a single
+		// object both read "object". typeSpec is the full type, container and
+		// element class included, in the spelling add_variable accepts.
+		bool bTypeRoundTrips = true;
+		PinObj->SetStringField(TEXT("typeSpec"), FBlueprintHandlers::PinTypeSpec(Pin->PinType, bTypeRoundTrips));
 		PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("Input") : TEXT("Output"));
 		if (Options.bDefaults)
 		{
@@ -358,6 +367,91 @@ inline USCS_Node* MCPFindSCSNode(USimpleConstructionScript* SCS, const FString& 
 	return nullptr;
 }
 
+/** One link on a pin, recorded by identity before a schema connection so the
+ *  links the connection removed can be named afterwards (#1905). A pin that
+ *  takes one link (a pose or exec output, a data input) answers
+ *  CONNECT_RESPONSE_BREAK_OTHERS_A or _B, and TryCreateConnection then drops
+ *  the old link with no flag asking for it. Pin is compared, never
+ *  dereferenced after the connection, because the connection can rebuild pins. */
+struct FMCPPinLinkRecord
+{
+	const UEdGraphPin* Pin = nullptr;
+	FGuid PinId;
+	FGuid NodeGuid;
+	FName PinName;
+	EEdGraphPinDirection Direction = EGPD_Input;
+};
+
+inline FMCPPinLinkRecord MCPRecordPin(const UEdGraphPin* Pin)
+{
+	FMCPPinLinkRecord Rec;
+	Rec.Pin = Pin;
+	if (!Pin) return Rec;
+	Rec.PinId = Pin->PinId;
+	const UEdGraphNode* Owner = Pin->GetOwningNode();
+	Rec.NodeGuid = Owner ? Owner->NodeGuid : FGuid();
+	Rec.PinName = Pin->PinName;
+	Rec.Direction = Pin->Direction;
+	return Rec;
+}
+
+/** Same logical pin: the pointer, the pin id, or the owning node's guid with
+ *  the pin's name and direction, which survives a pin rebuild. */
+inline bool MCPPinMatchesRecord(const UEdGraphPin* Pin, const FMCPPinLinkRecord& Rec)
+{
+	if (!Pin) return false;
+	if (Pin == Rec.Pin) return true;
+	if (Pin->PinId.IsValid() && Rec.PinId.IsValid() && Pin->PinId == Rec.PinId) return true;
+	const UEdGraphNode* Owner = Pin->GetOwningNode();
+	return Owner && Rec.NodeGuid.IsValid() && Owner->NodeGuid == Rec.NodeGuid
+		&& Pin->PinName == Rec.PinName && Pin->Direction == Rec.Direction;
+}
+
+/** Every link on Pin except the one to Except. */
+inline TArray<FMCPPinLinkRecord> MCPRecordPinLinks(const UEdGraphPin* Pin, const UEdGraphPin* Except)
+{
+	TArray<FMCPPinLinkRecord> Out;
+	if (!Pin) return Out;
+	const FMCPPinLinkRecord ExceptRec = MCPRecordPin(Except);
+	for (const UEdGraphPin* Linked : Pin->LinkedTo)
+	{
+		if (!Linked || (Except && MCPPinMatchesRecord(Linked, ExceptRec))) continue;
+		Out.Add(MCPRecordPin(Linked));
+	}
+	return Out;
+}
+
+inline TSharedPtr<FJsonValue> MCPDescribePinLinkRecord(const FMCPPinLinkRecord& Rec)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetStringField(TEXT("nodeId"), Rec.NodeGuid.IsValid() ? Rec.NodeGuid.ToString() : FString());
+	O->SetStringField(TEXT("pinName"), Rec.PinName.ToString());
+	O->SetStringField(TEXT("direction"), Rec.Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+/** The recorded links that Self (found again on its node by name and
+ *  direction) no longer holds, described as connect_pins takes them back. */
+inline TArray<TSharedPtr<FJsonValue>> MCPPinLinksSevered(const UEdGraphNode* Node, const FMCPPinLinkRecord& Self,
+	const TArray<FMCPPinLinkRecord>& Before)
+{
+	TArray<TSharedPtr<FJsonValue>> Out;
+	const UEdGraphPin* Now = Node ? Node->FindPin(Self.PinName, Self.Direction) : nullptr;
+	for (const FMCPPinLinkRecord& Rec : Before)
+	{
+		bool bStill = false;
+		if (Now)
+		{
+			for (const UEdGraphPin* Linked : Now->LinkedTo)
+			{
+				if (MCPPinMatchesRecord(Linked, Rec)) { bStill = true; break; }
+			}
+		}
+		if (!bStill) Out.Add(MCPDescribePinLinkRecord(Rec));
+	}
+	return Out;
+}
+
 /** Reports whether a node-level write compiled, or left it to blueprint(compile) (#1346). */
 inline void MCPNoteCompileDeferred(const TSharedPtr<FJsonObject>& Result, bool bDeferred)
 {
@@ -367,4 +461,72 @@ inline void MCPNoteCompileDeferred(const TSharedPtr<FJsonObject>& Result, bool b
 		Result->SetBoolField(TEXT("compileDeferred"), true);
 		Result->SetStringField(TEXT("compileWith"), TEXT("blueprint(compile)"));
 	}
+}
+
+/** Pins whose type is still a wildcard after a compile (#2004).
+ *
+ *  The Kismet compiler prunes every node not reachable from an entry point
+ *  before it checks for wildcard pins, so a node that is wired into a graph
+ *  but not yet onto its execution path compiles to "0 errors" and fails the
+ *  moment it is reached. A wildcard pin on a node with any link is reported as
+ *  an error: wiring is what fixes a wildcard, so a wired node that still has one
+ *  is broken. A wildcard on a node with no links at all is only a warning. Nodes
+ *  the compiler already flagged with an error are skipped so nothing is counted
+ *  twice. Returns the number of errors; OutPins and OutMessages get one entry
+ *  per pin. */
+inline int32 MCPCollectUndeterminedPins(UBlueprint* Blueprint, TArray<TSharedPtr<FJsonValue>>& OutPins, TArray<FString>& OutMessages, int32& OutWarnings)
+{
+	int32 Errors = 0;
+	OutWarnings = 0;
+	if (!Blueprint) return 0;
+	// A macro graph is compiled only where it is instanced, and its wildcard
+	// parameters are legitimate until then, so macro graphs are not read.
+	TSet<UEdGraph*> MacroGraphs;
+	for (UEdGraph* Macro : Blueprint->MacroGraphs)
+	{
+		if (!Macro) continue;
+		MacroGraphs.Add(Macro);
+		TArray<UEdGraph*> Children;
+		Macro->GetAllChildrenGraphs(Children);
+		MacroGraphs.Append(Children);
+	}
+	TArray<UEdGraph*> Graphs;
+	Blueprint->GetAllGraphs(Graphs);
+	for (UEdGraph* Graph : Graphs)
+	{
+		if (!Graph || MacroGraphs.Contains(Graph)) continue;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			if (Node->bHasCompilerMessage && Node->ErrorType <= EMessageSeverity::Error) continue;
+			bool bLinked = false;
+			for (const UEdGraphPin* Pin : Node->Pins)
+			{
+				if (Pin && Pin->LinkedTo.Num() > 0) { bLinked = true; break; }
+			}
+			for (const UEdGraphPin* Pin : Node->Pins)
+			{
+				if (!Pin || Pin->bHidden || Pin->bOrphanedPin) continue;
+				if (Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Wildcard) continue;
+				const FString NodeTitle = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+				const FString Message = FString::Printf(
+					TEXT("%s: the type of pin '%s' on '%s' in graph '%s' is undetermined. %s"),
+					bLinked ? TEXT("Error") : TEXT("Warning"),
+					*Pin->GetDisplayName().ToString(), *NodeTitle, *Graph->GetName(),
+					bLinked
+						? TEXT("The compiler skipped this node because nothing on the execution path reaches it; once it is reached the compile fails. Wire a typed pin into it, or recreate the node.")
+						: TEXT("The node has no connections, so the compiler skipped it."));
+				TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+				Entry->SetStringField(TEXT("graph"), Graph->GetName());
+				Entry->SetStringField(TEXT("nodeId"), Node->NodeGuid.ToString());
+				Entry->SetStringField(TEXT("node"), NodeTitle);
+				Entry->SetStringField(TEXT("pin"), Pin->PinName.ToString());
+				Entry->SetStringField(TEXT("severity"), bLinked ? TEXT("error") : TEXT("warning"));
+				OutPins.Add(MakeShared<FJsonValueObject>(Entry));
+				OutMessages.Add(Message);
+				if (bLinked) ++Errors; else ++OutWarnings;
+			}
+		}
+	}
+	return Errors;
 }

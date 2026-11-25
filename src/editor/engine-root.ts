@@ -1,3 +1,4 @@
+// @session per-session: Resolves the engine one project builds, launches and reads source from, out of that project's own layout and config.
 /**
  * One resolver for "which engine does this project use" (#959, #961, #962, #974).
  *
@@ -36,10 +37,12 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { debug, warn } from "../core/log.js";
 import { readEngineRootFromLog } from "./engine-observer.js";
 import { readEnv } from "../core/env.js";
+import { engineMajorMinor } from "./install-marker.js";
+import type { ProjectContext } from "../config/project.js";
 
 /** Where a candidate engine came from. Printed verbatim in failures. */
 export type EngineCandidateSource =
@@ -142,7 +145,7 @@ const WINDOWS_INSTALL_BASES = [
 ];
 
 /** Engine versions probed in the default install locations, newest first. */
-const DEFAULT_VERSIONS = ["5.8", "5.7", "5.6", "5.5", "5.4", "5.3"];
+export const DEFAULT_ENGINE_VERSIONS = ["5.9", "5.8", "5.7", "5.6", "5.5", "5.4", "5.3"];
 
 function pathImpl(platform: NodeJS.Platform): path.PlatformPath {
   return platform === "win32" ? path.win32 : path.posix;
@@ -364,7 +367,7 @@ function defaultInstallRoots(
       probed.push(`${base} (no engine install directory there)`);
       continue;
     }
-    for (const version of DEFAULT_VERSIONS) roots.push(impl.join(base, `UE_${version}`));
+    for (const version of DEFAULT_ENGINE_VERSIONS) roots.push(impl.join(base, `UE_${version}`));
   }
 
   // Linux and macOS source builds live in the home directory with no version
@@ -413,12 +416,12 @@ export function engineCandidates(lookup: EngineLookup = {}, probed: string[] = [
 
   // 1-5: everything a person configured on purpose.
   pushRoot("UE_MCP_TEST_ENGINE_ROOT", trimmed(readEnv("testEngineRoot", env)), true);
-  pushTool("UE_BUILD_TOOL_PATH", trimmed(env.UE_BUILD_TOOL_PATH));
+  pushTool("UE_BUILD_TOOL_PATH", trimmed(readEnv("buildToolPath", env)));
   pushTool("editor.buildToolPath", trimmed(lookup.configBuildToolPath));
   // An editor binary names its tree, but it is a statement about the editor,
   // not about the build tool: a tree that cannot build is not the user's typo,
   // so these are not treated as explicit build pins.
-  pushRoot("UE_EDITOR_PATH", engineRootFromEnginePath(trimmed(env.UE_EDITOR_PATH) ?? "", platform));
+  pushRoot("UE_EDITOR_PATH", engineRootFromEnginePath(trimmed(readEnv("editorPath", env)) ?? "", platform));
   pushRoot("editor.path", engineRootFromEnginePath(trimmed(lookup.configEditorPath) ?? "", platform));
 
   // 6-7: what the project itself says, which is the half that was missing.
@@ -593,6 +596,18 @@ export function resolveEngineRoot(lookup: EngineLookup = {}): string | null {
   return trySelectEngine(lookup, "engineRoot")?.engineRoot ?? null;
 }
 
+/** Engine major.minor the project builds against, or its raw association. */
+export function projectEngineVersion(context: ProjectContext): string | null {
+  const assoc = context.engineAssociation;
+  if (assoc && /^\d+\.\d+$/.test(assoc)) return assoc;
+  try {
+    const engine = trySelectEngine(engineLookupFor(context.projectPath, assoc, context.config.editor), "engineRoot");
+    return engineMajorMinor(engine?.engineRoot) ?? assoc;
+  } catch {
+    return assoc;
+  }
+}
+
 /**
  * The engine a launcher association names: a source build's registry GUID,
  * or a launcher version found in LauncherInstalled.dat or the default bases.
@@ -612,16 +627,24 @@ function findEngineInstall(
   return findLauncherEngine(normalizedAssociation);
 }
 
+/**
+ * The `reg query` argv that reads a registered engine build, or null for an
+ * association that is not a GUID. It runs without a shell, and only a GUID
+ * ever reaches it.
+ */
+export function registryQueryArgs(guid: string): string[] | null {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(guid)) return null;
+  return ["query", "HKCU\\SOFTWARE\\Epic Games\\Unreal Engine\\Builds", "/v", guid];
+}
+
 function findEngineByGuid(guid: string): string | null {
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(guid)) {
+  const args = registryQueryArgs(guid);
+  if (!args) {
     debug("engine-root", `refusing registry lookup for non-GUID engine association '${guid}'`);
     return null;
   }
   try {
-    const output = execSync(
-      `reg query "HKCU\\SOFTWARE\\Epic Games\\Unreal Engine\\Builds" /v "${guid}"`,
-      { windowsHide: true, stdio: "pipe", encoding: "utf-8" },
-    );
+    const output = execFileSync("reg", args, { windowsHide: true, stdio: "pipe", encoding: "utf-8" });
     const match = output.match(/REG_SZ\s+(.+)/);
     if (match) {
       const p = match[1].trim();

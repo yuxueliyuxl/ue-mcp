@@ -1,3 +1,4 @@
+// @session per-session: Owns the session registry, each session's load, guards and bridge, and the targeting baked into the tool graph.
 /**
  * Everything one server process owns once, whatever number of MCP clients
  * talk to it: the editor sessions and their bridges, each session's surface,
@@ -11,28 +12,40 @@
 import { SessionRegistry, type EditorSession } from "../sessions/session.js";
 import { ueMcpConfigRejections, describeConfigRejections, type ProjectContext } from "../config/project.js";
 import { attach, attachSummary } from "../editor/deployer.js";
-import { resolveContextStrategy } from "../surface/context/lean-context.js";
+import { resolveContextStrategy } from "../config/context-strategy.js";
 import {
   injectEditorTarget,
   removeEditorTarget,
   injectMigrateTarget,
   removeMigrateTarget,
 } from "../surface/target-params.js";
-import type { InProcessCallOptions, ToolContext, ToolDef } from "../core/types.js";
-import { dispatchCategoryCall, dispatchFlowCall, type DispatchDeps, type ToolResult } from "../dispatch/server-dispatch.js";
-import { DialogGuard, guardFor, sessionGuardDeps } from "../editor/dialog-guard.js";
+import type { InProcessCallOptions } from "./call-options.js";
+import type { ToolContext, ToolDef } from "../surface/tool-types.js";
+import {
+  categoryCallOutcome,
+  dispatchCategoryCall,
+  dispatchFlowCall,
+  flowCallOutcome,
+  toToolResult,
+  type DispatchDeps,
+  type Served,
+  type ToolResult,
+} from "./server-dispatch.js";
+import { DialogGuard, existingGuard, guardFor, sessionGuardDeps } from "../editor/dialog-guard.js";
+import { EDITOR_TARGET_PARAM } from "../surface/routing-params.js";
 import { info, warn, error } from "../core/log.js";
 import { GuardRegistry } from "../flow/guard.js";
 import { loadFlowConfig } from "../flow/loader.js";
 import { createFlowTool } from "../flow/flow-tool.js";
 import { resolveLockingConfig, type LockingConfig } from "../dispatch/locking.js";
+import { resolveLeaseConfig } from "../dispatch/leases.js";
 import { collapsingEnvWarnings } from "../config/session-env.js";
 import { checkPluginFreshness } from "../editor/bridge-freshness.js";
 import { unionSurface } from "../sessions/session-surface.js";
 import { registeredUnion } from "../surface/registered-surface.js";
 import { packageVersion } from "../core/package-root.js";
 import { SessionLoads, type SessionLoad } from "../sessions/session-load.js";
-import type { ContextStrategy } from "../surface/context/lean-context.js";
+import type { ContextStrategy } from "../config/context-strategy.js";
 import { checkpointsFor } from "../checkpoints/service.js";
 
 export interface Runtime {
@@ -75,6 +88,20 @@ export interface Runtime {
     args?: Record<string, unknown>,
     opts?: InProcessCallOptions,
   ): Promise<ToolResult>;
+  /** callAction, answered as the pipeline's outcome rather than as MCP content. */
+  callActionOutcome(
+    category: string,
+    action: string,
+    args?: Record<string, unknown>,
+    opts?: InProcessCallOptions,
+  ): Promise<Served>;
+  /** One flow call made in process, as the pipeline's outcome. */
+  callFlowOutcome(input: Record<string, unknown>, opts?: InProcessCallOptions): Promise<Served>;
+  /**
+   * One flow call from the flow HTTP routes, as an outcome. Nobody is asked:
+   * there is no person on an HTTP request.
+   */
+  flowRequest(input: Record<string, unknown>, approval?: { approver: string; token: string }): Promise<Served>;
   /**
    * Run one call to a tool as a client would send it, in process, through the
    * same dispatch and with the same prompts as callAction. The flow tool goes
@@ -86,6 +113,11 @@ export interface Runtime {
     input: Record<string, unknown>,
     opts?: InProcessCallOptions & { envelope?: boolean; loadView?: (load: SessionLoad) => SessionLoad },
   ): Promise<ToolResult>;
+}
+
+/** The caller's cancel signal, carried to the pipeline the way an MCP request's is. */
+function cancelExtra(opts: InProcessCallOptions): { signal?: AbortSignal } {
+  return opts.signal ? { signal: opts.signal } : {};
 }
 
 /**
@@ -189,9 +221,12 @@ export async function createRuntime(projectArgs: string[]): Promise<Runtime> {
   // At one editor, that editor's list. Beyond one, the union, so an action only
   // one project has is still addressable; dispatch to a session that lacks it
   // is refused by name.
-  const advertisedTools: ToolDef[] = sessions.size > 1
+  const computeAdvertised = (): ToolDef[] => sessions.size > 1
     ? unionSurface(loads.all().map((l) => ({ ...l.surface, tools: l.advertisedTools }))).tools
     : primaryLoad.advertisedTools;
+  // One array for the life of the runtime, refilled when a category is turned
+  // on or off, so every reader holding it sees the new surface.
+  const advertisedTools: ToolDef[] = [...computeAdvertised()];
   if (contextStrategy !== "full") {
     info("context", `Context strategy: ${contextStrategy}`);
   }
@@ -201,6 +236,10 @@ export async function createRuntime(projectArgs: string[]): Promise<Runtime> {
   if (lockingCfg.enabled) {
     info("locking", `Per-asset locking enabled (TTL ${lockingCfg.ttlSeconds}s)`);
   }
+
+  // Asset leases for agents sharing this server's editors. The mode is the
+  // first project's, like every process-level choice.
+  sessions.leases.config = resolveLeaseConfig(project.config.leases);
 
   // One task registry and guard pipeline per session, built from its own graph.
   await loads.finishStartup();
@@ -280,6 +319,19 @@ export async function createRuntime(projectArgs: string[]): Promise<Runtime> {
     syncEditorTargeting();
     notify();
   };
+
+  // A category turned on or off at runtime (project(set_category_enabled)):
+  // the advertised list is rebuilt from every session's load, targeting is put
+  // back on any category object the rebuild created, and each MCP server
+  // re-advertises, which is what sends tools/list_changed.
+  loads.onSurfaceRebuilt = () => {
+    const next = computeAdvertised();
+    advertisedTools.splice(0, advertisedTools.length, ...next);
+    targetable.splice(0, targetable.length, ...next, flowTool);
+    targetingSignature = "\u0000";
+    syncEditorTargeting();
+    notify();
+  };
   syncEditorTargeting();
   for (const s of sessions.list()) watchParity(s);
 
@@ -289,6 +341,7 @@ export async function createRuntime(projectArgs: string[]): Promise<Runtime> {
   ): DispatchDeps => {
     const prompt = opts.dialogPrompt;
     return {
+      origin: "in-process",
       sessions,
       loads,
       lockingCfg,
@@ -305,8 +358,48 @@ export async function createRuntime(projectArgs: string[]): Promise<Runtime> {
         : dialogGuardFor,
       elicit: () => opts.elicit,
       client: () => undefined,
+      flow: { tool: flowTool, ctx: baseCtx },
+      ...(opts.access ? { access: () => opts.access! } : {}),
       ...(opts.loadView ? { loadView: opts.loadView } : {}),
     };
+  };
+
+  /**
+   * One category action in process, as an outcome. The category is read from
+   * the graph of the editor the call addresses, not the advertised one (in
+   * micro mode only the gateway is advertised) and not the first project's.
+   */
+  const callActionOutcome = async (
+    category: string,
+    action: string,
+    args: Record<string, unknown> = {},
+    opts: InProcessCallOptions = {},
+  ): Promise<Served> => {
+    let load: SessionLoad | undefined;
+    try {
+      load = loads.get(sessions.resolve(args[EDITOR_TARGET_PARAM]));
+    } catch {
+      // A stale name is the pipeline's to refuse; the category is looked up where it would have run.
+    }
+    const tool = (load ?? primaryLoad).surface.tools.find((t) => t.name === category);
+    if (!tool) throw new Error(`unknown category '${category}'`);
+    return categoryCallOutcome(inProcessDeps(opts), tool, false, { ...args, action }, cancelExtra(opts));
+  };
+
+  /**
+   * Deps for the flow HTTP routes. Nobody is on the other end of a request,
+   * so nobody is asked, and the editor's guard is read without replacing the
+   * dependencies the MCP client last gave it.
+   */
+  const httpDeps: DispatchDeps = {
+    origin: "http",
+    sessions,
+    loads,
+    lockingCfg,
+    dialogGuardFor: (forSession) => existingGuard(forSession) ?? dialogGuardFor(forSession),
+    elicit: () => undefined,
+    client: () => undefined,
+    flow: { tool: flowTool, ctx: baseCtx },
   };
 
   return {
@@ -340,16 +433,21 @@ export async function createRuntime(projectArgs: string[]): Promise<Runtime> {
         session.bridge.startReconnecting();
       }
     },
-    callAction(category, action, args = {}, opts = {}) {
-      // The full graph, not the advertised one: in micro mode only the gateway is advertised.
-      const tool = primaryLoad.surface.tools.find((t) => t.name === category);
-      if (!tool) return Promise.reject(new Error(`unknown category '${category}'`));
-      return dispatchCategoryCall(inProcessDeps(opts), tool, false, { ...args, action }, {});
+    async callAction(category, action, args = {}, opts = {}) {
+      const { outcome, session } = await callActionOutcome(category, action, args, opts);
+      return toToolResult(outcome, sessions, session);
     },
+    callActionOutcome,
     callTool(tool, input, opts = {}) {
       const deps = inProcessDeps(opts);
-      if (tool === flowTool) return dispatchFlowCall(deps, flowTool, baseCtx, input);
-      return dispatchCategoryCall(deps, tool, opts.envelope ?? false, input, {});
+      if (tool === flowTool) return dispatchFlowCall(deps, input, cancelExtra(opts));
+      return dispatchCategoryCall(deps, tool, opts.envelope ?? false, input, cancelExtra(opts));
+    },
+    callFlowOutcome(input, opts = {}) {
+      return flowCallOutcome(inProcessDeps(opts), input, cancelExtra(opts));
+    },
+    async flowRequest(input, approval) {
+      return flowCallOutcome(httpDeps, input, {}, approval);
     },
     logSummary() {
       const disabled = primaryLoad.surface.disabled;

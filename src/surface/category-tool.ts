@@ -1,16 +1,17 @@
+// @session independent: Builds category tools and their routing parameters; holds nothing per editor.
 /**
  * Category tool construction: the `categoryTool` dispatcher, the `bp` action
  * builder and the routing parameters every category tool offers.
  */
 import { z } from "zod";
 import { McpError, ErrorCode } from "../core/errors.js";
-import { MAX_BRIDGE_TIMEOUT_MS } from "../bridge/bridge-timeouts.js";
+import { DEFAULT_BRIDGE_TIMEOUT_MS, MAX_BRIDGE_TIMEOUT_MS } from "../bridge/bridge-timeouts.js";
 import { unknownActionMessage } from "./action-schema.js";
 import { stripAction } from "./routing-params.js";
 import { stripEditorTarget } from "./target-params.js";
 import type { FlowContext } from "../flow/context.js";
 import { runAction, actionPreparation } from "../flow/run-action.js";
-import type { ActionEffect, ActionSpec, BridgeActionSpec, CategoryOptions, ToolDef } from "../core/types.js";
+import type { ActionEffect, ActionSpec, BridgeActionSpec, CategoryOptions, ToolDef } from "./tool-types.js";
 
 /**
  * An independent copy of one tool. Prefers the rebuilder so the copy's
@@ -35,6 +36,38 @@ export function cloneToolDef(tool: ToolDef): ToolDef {
     schema: { ...tool.schema },
     actions: { ...tool.actions },
   };
+}
+
+/**
+ * A category's description: its summary, then one line per action, the
+ * actions a plugin injected listed apart under "Plugin actions". The only
+ * writer of the text; code that adds or removes actions calls
+ * `refreshDescription` instead of editing lines.
+ */
+export function renderToolDescription(summary: string, actions: Readonly<Record<string, ActionSpec>>): string {
+  const line = ([name, spec]: [string, ActionSpec]): string => (spec.description ? `- ${name}: ${spec.description}` : `- ${name}`);
+  const entries = Object.entries(actions);
+  const own = entries.filter(([, s]) => !s.providedBy).map(line);
+  const provided = entries.filter(([, s]) => s.providedBy).map(line);
+  return `${summary}\n\nActions:\n${own.join("\n")}${provided.length ? `\n\nPlugin actions:\n${provided.join("\n")}` : ""}`;
+}
+
+/**
+ * A category's description for a given set of its actions. A tool built by
+ * hand (the flow tool) writes its own and keeps it.
+ */
+export function descriptionFor(tool: ToolDef, actions: Readonly<Record<string, ActionSpec>> = tool.actions): string {
+  return tool.summary !== undefined && tool.rebuild ? renderToolDescription(tool.summary, actions) : tool.description;
+}
+
+/** Re-render a category's description from its summary and current actions. */
+export function refreshDescription(tool: ToolDef): void {
+  tool.description = descriptionFor(tool);
+}
+
+/** A tool's summary: the categoryTool summary, or the whole description of a tool built by hand. */
+export function summaryOf(tool: Pick<ToolDef, "summary" | "description">): string {
+  return (tool.summary ?? tool.description).trim();
 }
 
 /** An independent copy of a whole tool graph. */
@@ -109,16 +142,19 @@ export const OMIT_PARAM = z
  * It is a routing instruction, never a handler parameter: the dispatcher reads
  * it and strips it, so it cannot reach a bridge method as an argument.
  */
+// Not bounded in the schema: a larger value is capped at the ceiling where the
+// call is made (call-pipeline, the bridge and the plugin all clamp, and the
+// plugin's answer reports timeoutMsCappedTo), rather than refused here (#1952).
 export const TIMEOUT_PARAM = z
   .number()
   .int()
   .positive()
-  .max(MAX_BRIDGE_TIMEOUT_MS)
   .optional()
   .describe(
-    "How long to wait for this call, in milliseconds. Omitted, the wait is 30s, "
+    `How long to wait for this call, in milliseconds. Omitted, the wait is ${DEFAULT_BRIDGE_TIMEOUT_MS / 1000}s, `
     + "or longer for the actions the editor itself allows longer. Raise it for a "
-    + "large batch or an editor busy compiling shaders. A timeout never means the "
+    + "large batch or an editor busy compiling shaders; it is capped at "
+    + `${MAX_BRIDGE_TIMEOUT_MS} (one hour), and longer work is split into several calls. A timeout never means the `
     + "call did not happen: read the state back before retrying.",
   );
 
@@ -160,13 +196,6 @@ export function categoryTool(
   const actionNames = Object.keys(actions) as [string, ...string[]];
   const routing = routingSchema(actionNames);
 
-  const docs = actionNames
-    .map((a) => {
-      const desc = actions[a].description;
-      return desc ? `- ${a}: ${desc}` : `- ${a}`;
-    })
-    .join("\n");
-
   // Spread twice: the first sets the order, the last wins, so a category
   // cannot replace a parameter the dispatcher consumes.
   const schema: Record<string, z.ZodType> = { ...routing, ...extraSchema, ...routing };
@@ -175,7 +204,8 @@ export function categoryTool(
   const def: ToolDef = {
     name,
     options,
-    description: `${summary}\n\nActions:\n${docs}`,
+    summary,
+    description: renderToolDescription(summary, actions),
     schema,
     actions,
     handler: async (ctx, rawParams) => {

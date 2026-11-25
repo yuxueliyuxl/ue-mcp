@@ -1,12 +1,29 @@
 # Collection and input editing
 
-For a single nested field in a struct array, `asset(set_property)` already accepts a key selector:
+For a single nested field in a struct array, `asset(set_property)` accepts a key selector:
 
 ```json
 {"action":"set_property","assetPath":"/Game/Data/DA_Weapons","propertyName":"WeaponProfiles[WeaponId=Rifle].DisplayName","value":"Service rifle","save":false}
 ```
 
-The selector must match exactly one element. `asset(read_properties)` accepts the same path. Use `asset(bulk_set_properties)` for several keyed field writes with preflight and read-back.
+The selector must match exactly one element. `asset(read_properties)` accepts the same path. See [Property paths](tool-reference.md#property-paths) for the selector rules. Use `asset(bulk_set_properties)` for several keyed field writes with preflight and read-back.
+
+`bulk_read_properties` rows report `resolvedPropertyNames` and `missingReasons` for keyed selectors.
+## Add or remove one array element
+
+`asset(append_array_elements)` adds values to the end of a TArray and leaves the existing elements alone. With `unique=true` a value the array already holds is skipped and listed in `skippedElements`; when every value is already there, nothing is written or saved. To add a map name to an allow-list on several data assets, call it once per asset:
+
+```json
+{"action":"append_array_elements","assetPath":"/Game/Data/DA_BuildList_Spikes","propertyName":"OnlyInMaps","elements":["/Game/Maps/SurvivalArena"],"unique":true}
+```
+
+`asset(remove_array_elements)` takes out elements by `indices` or by value with `elements`, keeping the order of the rest. Every index must exist, or nothing is removed. A value removes every element equal to it; a value that matches nothing removes nothing.
+
+```json
+{"action":"remove_array_elements","assetPath":"/Game/Data/DA_BuildList_Spikes","propertyName":"OnlyInMaps","elements":["/Game/Maps/OldArena"]}
+```
+
+Both actions save by default, return `value` read back from the asset, and carry a rollback that restores the whole array with the same `save` option. Values compare the way the property type compares them, so `FString` and `FName` entries match without regard to case. Replace one element with `asset(set_property)` and an indexed path such as `OnlyInMaps[1]`.
 
 ## Update or clone a collection entry
 
@@ -34,6 +51,18 @@ Use `asset(read_datatable)` with `rowFilter` and `columns`, or `asset(get_datata
 
 Every source must exist before the call; a later clone cannot use a destination created by the same batch. Every destination must be unused, including case-insensitive row-name collisions. Rows containing instanced subobjects are refused. The complete batch is preflighted before mutation. `dryRun=true` returns `proposedRows`; a write returns `rows` with actual fields, `clonedCount`, `rowCount`, and persistence fields. `save` defaults to true. Editor undo covers the transaction. Rollback calls `remove_datatable_row` with the cloned `rowNames` and the same `save` policy. It is marked lossy because row change hook side effects are not reversed. Replay it before further edits to the cloned rows. The removal action accepts either one `rowName` or an array of `rowNames`; batch or unsaved removals use editor undo to restore deleted values.
 
+## Remove DataTable rows
+
+`asset(remove_datatable_rows)` removes the named rows in one undoable transaction:
+
+```json
+{"action":"remove_datatable_rows","assetPath":"/Game/Data/DT_Recipes","rowNames":["Recipe_Old","Recycle_Old","Recipe_Typo"],"dryRun":true}
+```
+
+Names match the way row lookups do, without regard to case, and `removedRows` reports the table's spelling. Names the table lacks are listed in `missingRowNames`; the call still removes the rest. `dryRun=true` returns `wouldRemove` and `rowCountAfter` and changes nothing. After removing, every kept row is checked for its place and value. If one changed, the table is restored from a copy taken before the call, the response has `rolledBack=true`, and nothing is saved. `save` defaults to true. Rollback re-adds the removed rows with `fill_datatable_from_json`, which appends them to the end of the table; editor undo puts them back in place.
+
+Rows are removed the way the DataTable editor's Delete Row removes them, which is safe on tables with a native C++ row struct. On UE 5.6, the engine's own `UDataTable::RemoveRow` crashes the editor on such tables.
+
 ## Per-mapping input settings
 
 `gameplay(read_imc)` reports each row's `mappingIndex`, `settingBehavior`, local `playerMappableKeySettings` and `effectivePlayerMappableKeySettings`. The local value is null when no override subobject exists. Effective settings follow `InheritSettingsFromAction`, `OverrideSettings`, or `IgnoreSettings`.
@@ -44,8 +73,10 @@ Every source must exist before the call; a later clone cannot use a destination 
 
 Supply reflected settings fields in `playerMappableKeySettings`, or use the existing `mappingName`, `displayName` and `displayCategory` parameters. Omitted fields retain their values. A new settings object needs a non-empty `Name` or `mappingName`. Set `playerMappableKeySettings` to null to clear the local object. Setting only the behavior preserves the local object. `dryRun` validates without writing; `save` defaults to true. Rollback addresses the same mapping index, so replay it before reordering mappings. Clearing an override may recreate its object on rollback; clearing a custom settings subclass requires editor undo.
 
-InputAction settings still use `inputActionPath` and `mappingName`. To duplicate an InputAction together with its triggers, modifiers and settings, use `asset(duplicate)` with `sourcePath`, `destinationPath` and `onConflict="error"`, then inspect it with `gameplay(read_input_action)`.
+To let a settings menu list and rebind every key of a context on its own row (a keyboard key and a gamepad key on one action, for example), call this once per row from `read_imc`, each with its own `mappingName` and with `settingBehavior` set to `OverrideSettings`. Enhanced Input numbers the key slots of a shared name across mappings, so rows that share a name rebind together. A row left on `InheritSettingsFromAction` keeps reporting the action's settings, whatever its local object holds.
+
+InputAction-level settings use `inputActionPath` instead of `imcPath` and `mappingIndex`. To duplicate an InputAction together with its triggers, modifiers and settings, use `asset(duplicate)` with `sourcePath`, `destinationPath` and `onConflict="error"`, then inspect it with `gameplay(read_input_action)`.
 
 ## Static editor functions
 
-`reflection(reflect_class)` describes a project's reflected functions. Call a static BlueprintCallable function with `editor(invoke_static_function)` using `className`, `functionName` and an `args` object keyed by reflected parameter names. The class can be a component or another reflected class, as well as a function library. Use the reflected C++ function spelling. Return and output parameters appear under `returnValues`. These calls can have arbitrary side effects; persistence and undo depend on the called function.
+`reflection(reflect_class)` describes a project's reflected functions. Call a static BlueprintCallable function with `editor(invoke_static_function)` using `className`, `functionName` and an `args` object keyed by reflected parameter names. The class can be a component or another reflected class, as well as a function library. Use the reflected C++ function spelling. Return and output parameters appear under `returnValues`. These calls can have arbitrary side effects; persistence and undo depend on the called function. The reply reads the target world again after the call: `worldPath` names the world that is current when the call returns, and `worldReplaced` is true (with `previousWorldPath`) when the call loaded another level or otherwise swapped the world.

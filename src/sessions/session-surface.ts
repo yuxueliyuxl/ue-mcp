@@ -1,3 +1,4 @@
+// @session per-session: One tool graph per editor, and the union advertised from them.
 /**
  * Per-session tool surface (#817, plan items 4.1 and 4.2).
  *
@@ -14,8 +15,8 @@
  * of those graphs, with each action remembering which sessions provide it, so
  * dispatch to a session that lacks one can say which sessions have it.
  */
-import type { ToolDef, ActionSpec } from "../core/types.js";
-import { actionEnum, cloneToolDef, cloneToolGraph } from "../surface/category-tool.js";
+import type { ToolDef, ActionSpec } from "../surface/tool-types.js";
+import { actionEnum, cloneToolDef, cloneToolGraph, refreshDescription } from "../surface/category-tool.js";
 import type { EditorSession } from "./session.js";
 import type { PluginRecord } from "../extensions/loader.js";
 
@@ -31,6 +32,9 @@ export interface SessionSurface {
   /** Per-category markdown this session's plugins contribute. */
   knowledgeByCategory: Record<string, string[]>;
 }
+
+/** A surface as its project builds it, before any session holds it. */
+export type ProjectSurface = Omit<SessionSurface, "session">;
 
 /** Which sessions provide one action, and which of them disabled its category. */
 export interface ActionProviders {
@@ -120,27 +124,8 @@ function mergeActions(target: ToolDef, added: Record<string, ActionSpec>, donor:
     if (key === "action") continue;
     if (!(key in target.schema)) target.schema[key] = schema;
   }
-  if (target.description.includes(ACTIONS_MARKER) && donor.description.includes(ACTIONS_MARKER)) {
-    target.description = insertActionLines(target.description, added);
-  }
+  refreshDescription(target);
   rebuildActionEnum(target);
-}
-
-const ACTIONS_MARKER = "\n\nActions:\n";
-const PLUGIN_ACTIONS_MARKER = "\n\nPlugin actions:\n";
-
-/**
- * Add catalog lines for merged actions to the end of the `Actions:` list, above
- * any `Plugin actions:` section, so they are not presented as plugin actions.
- */
-function insertActionLines(description: string, added: Record<string, ActionSpec>): string {
-  const lines = Object.entries(added)
-    .map(([name, spec]) => `\n- ${name}${spec.description ? `: ${spec.description}` : ""}`)
-    .join("");
-  const start = description.indexOf(ACTIONS_MARKER);
-  const plugin = description.indexOf(PLUGIN_ACTIONS_MARKER, start + ACTIONS_MARKER.length);
-  if (plugin === -1) return description + lines;
-  return description.slice(0, plugin) + lines + description.slice(plugin);
 }
 
 /** Re-derive a category's `action` enum from its live action keys. */
@@ -181,7 +166,7 @@ export function explainMissingAction(
 }
 
 /** Union of every session's plugin knowledge, first contributor wins per blob. */
-export function unionKnowledge(surfaces: SessionSurface[]): Record<string, string[]> {
+export function unionKnowledge(surfaces: ProjectSurface[]): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   const seen = new Set<string>();
   for (const surface of surfaces) {

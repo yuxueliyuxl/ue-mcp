@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @session per-session: Reports every project the configured invocation names.
 /**
  * `ue-mcp doctor` - diagnose every ue-mcp version source and flag the failure
  * mode nothing else surfaces: a project-local `node_modules/ue-mcp` that
@@ -11,8 +12,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
 
-import { takeEditorTarget, EditorFlagError } from "./editor-flag.js";
-import { distTagForVersion, isNewer } from "../core/version-check.js";
+import { selectProjectOrExit } from "./editor-flag.js";
+import { distTagForVersion, isNewer, npmResolvedLatest } from "../core/version-check.js";
 import {
   NPX_AGE_GATE_OVERRIDE,
   UE_MCP_LAUNCH,
@@ -23,13 +24,19 @@ import {
   pinnedVersionOf,
   readUeMcpEntry,
   removeUeMcpEntry,
-} from "../integrations/claude-code/mcp-client-config.js";
+} from "../integrations/mcp-clients/mcp-client-config.js";
 import { packageVersion } from "../core/package-root.js";
+import { powershellEnv } from "../core/powershell-env.js";
 import { findUProject, isUProjectPath, projectDirOf } from "../config/uproject-path.js";
-import { RESET, BOLD, DIM, GREEN, RED, CYAN, YELLOW } from "./ui/ansi.js";
+import { RESET, BOLD, DIM, GREEN, RED, CYAN, YELLOW } from "../terminal/ansi.js";
 import { cliCommandNames } from "./cli-commands.js";
 import type { CliUsage } from "./cli-main.js";
 import { defaultPluginDir, installKindOf, resolvePluginDir, type InstallKind } from "../editor/install-marker.js";
+import { ProjectContext } from "../config/project.js";
+import { projectEpicIntegrations } from "../integrations/epic/project-status.js";
+import { describeUnrealMcpServer, type UnrealMcpServerStatus } from "../integrations/epic/unreal-mcp-server.js";
+import type { UnrealAssistantStatus } from "../integrations/epic/unreal-assistant.js";
+import { UNREAL_CANVAS_BRIDGE_PLUGIN, type UnrealCanvasStatus } from "../integrations/epic/unreal-canvas.js";
 
 export interface DoctorReport {
   selfVersion: string;            // the ue-mcp currently executing this command
@@ -60,6 +67,28 @@ export interface DoctorReport {
   npmAgeGate?: NpmAgeGate | null;
   /** Client entries whose npx launch that gate refuses for a new release. */
   ageGatedLaunches?: AgeGatedLaunch[];
+  /** Epic's Unreal MCP server for the target project; null when its engine has none. */
+  unrealMcpServer?: UnrealMcpServerStatus | null;
+  /** Epic's Unreal Assistant for the target project, and whether ue-mcp is attached to it. */
+  unrealAssistant?: UnrealAssistantStatus | null;
+  /** Unreal Canvas for the target project: whether its Bridge is enabled and which ue-mcp ports clash with its own. */
+  unrealCanvas?: UnrealCanvasStatus | null;
+}
+
+type EpicStatusFields = Pick<DoctorReport, "unrealMcpServer" | "unrealAssistant" | "unrealCanvas">;
+
+/** Epic's Unreal MCP server, Unreal Assistant and Unreal Canvas for a project, or nulls when it cannot be read. */
+function epicStatus(uproject: string | null): EpicStatusFields {
+  const none: EpicStatusFields = { unrealMcpServer: null, unrealAssistant: null, unrealCanvas: null };
+  if (!uproject) return none;
+  try {
+    const project = new ProjectContext();
+    project.setProject(uproject);
+    const epic = projectEpicIntegrations(project);
+    return { unrealMcpServer: epic.unrealMcp, unrealAssistant: epic.unrealAssistant, unrealCanvas: epic.unrealCanvas };
+  } catch {
+    return none;
+  }
 }
 
 export interface NpmAgeGate {
@@ -179,7 +208,7 @@ export function removeDeadClientEntries(projectDir: string, dead: DeadClientEntr
 
 function safeExec(cmd: string): string | null {
   try {
-    return execSync(cmd, { windowsHide: true, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    return execSync(cmd, { windowsHide: true, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], env: powershellEnv() }).trim();
   } catch {
     return null;
   }
@@ -193,10 +222,6 @@ function readJsonVersion(pkgJsonPath: string): string | null {
   } catch {
     return null;
   }
-}
-
-function registryLatest(): string | null {
-  return safeExec("npm view ue-mcp version");
 }
 
 function npmGlobal(): { version: string | null; dir: string | null } {
@@ -433,7 +458,7 @@ export function collectDoctor(projectArg?: string, cwd: string = process.cwd()):
     );
     return { ...s, servesTarget };
   });
-  const latest = registryLatest();
+  const latest = npmResolvedLatest();
   const effectiveNpxSource = shadow ? "local" : global.version ? "global" : latest ? "registry" : null;
   return {
     selfVersion: packageVersion(),
@@ -452,6 +477,7 @@ export function collectDoctor(projectArg?: string, cwd: string = process.cwd()):
     deadClientEntries: findDeadClientEntries(targetProjectDir ?? cwd),
     npmAgeGate: gate,
     ageGatedLaunches: findAgeGatedLaunches(targetProjectDir ?? cwd, gate),
+    ...epicStatus(uproject),
   };
 }
 
@@ -528,7 +554,39 @@ export function formatDoctor(d: DoctorReport): string {
     lines.push(row("bridge plugin:", `${v}${kind}  ${DIM}${path.basename(d.bridgePlugin.project)}${RESET}`));
   }
 
+  const epicMcp = d.unrealMcpServer;
+  if (epicMcp) {
+    const text = describeUnrealMcpServer(epicMcp);
+    lines.push(row("epic mcp:", epicMcp.runsBeside ? `${YELLOW}${text}${RESET}` : `${DIM}${text}${RESET}`));
+  }
+  const ua = d.unrealAssistant;
+  if (ua?.available) {
+    lines.push(row("epic assistant:", ua.attached
+      ? `${GREEN}ue-mcp attached${RESET}  ${DIM}${ua.configPath}${RESET}`
+      : `${DIM}ue-mcp not attached (ue-mcp init --unreal-assistant)${RESET}`));
+  }
+
+  const canvas = d.unrealCanvas;
+  if (canvas?.bridgeEnabled) {
+    const ports = canvas.reservedPorts.map((r) => r.port).join(" and ");
+    const by = canvas.enabledBy && canvas.enabledBy !== "uproject" ? ` (through ${canvas.enabledBy})` : "";
+    lines.push(row("epic canvas:", canvas.portConflicts.length > 0
+      ? `${YELLOW}${UNREAL_CANVAS_BRIDGE_PLUGIN} enabled${by}; it claims ${ports}${RESET}`
+      : `${DIM}${UNREAL_CANVAS_BRIDGE_PLUGIN} enabled${by}; it claims ${ports}, which ue-mcp keeps off${RESET}`));
+  }
+
   lines.push("");
+
+  // Facts worth knowing that are not wrong, so they do not spoil the verdict.
+  const notes: string[] = [];
+  if (epicMcp?.runsBeside) {
+    notes.push(
+      `Epic's Unreal MCP server starts with this project's editor on ${epicMcp.url}, beside ue-mcp. ` +
+      `Both read the same Toolset Registry, so they can run together: ue-mcp reaches every registered toolset too, ` +
+      `including ones it has no epic_* action for, through epic(list_toolsets) and epic(call_tool). ` +
+      `\`ue-mcp init --yes --no-unreal-mcp-autostart\` stops it starting for this project, and \`--unreal-mcp-port <n>\` moves it.`,
+    );
+  }
 
   const problems: string[] = [];
   if (d.localShadow && behindLatest(d.localShadow.version, latest)) {
@@ -573,6 +631,19 @@ export function formatDoctor(d: DoctorReport): string {
         : `${launch.client} (${launch.config}) runs \`npx ${launch.spec}\`, which npm's ${describeGate(gate)} refuses for a release newer than the cutoff, even when ue-mcp is in min-release-age-exclude (npx ignores it). Run \`ue-mcp doctor --fix\` to add \`${NPX_AGE_GATE_OVERRIDE}\` to the launch.`,
     );
   }
+  for (const conflict of epicMcp?.portConflicts ?? []) {
+    problems.push(`Epic's Unreal MCP server listens on ${epicMcp!.port}, and ${conflict}. Move it with \`ue-mcp init --yes --unreal-mcp-port <n>\`.`);
+  }
+  for (const conflict of canvas?.portConflicts ?? []) {
+    problems.push(
+      `This project enables ${UNREAL_CANVAS_BRIDGE_PLUGIN}, and ${conflict}. The two cannot share a port: ` +
+      `remove the bridge.port pin or UE_MCP_PORT (ue-mcp then uses the port derived from the project path), ` +
+      `and restart the editor so the bridge binds again.`,
+    );
+  }
+  if (ua?.available && ua.attached && ua.shadowedBy) {
+    problems.push(`The Unreal Assistant reads ${ua.shadowedBy} first and ignores ${ua.configPath}, where ue-mcp is attached. Add the ue-mcp entry there, or remove that file.`);
+  }
   for (const cfg of d.bareNpxConfigs) {
     const rel = path.relative(process.cwd(), cfg).replace(/\\/g, "/") || cfg;
     problems.push(`${rel} launches with bare \`npx ue-mcp\`. Use \`${UE_MCP_LAUNCH}\` so the server self-heals to latest on each launch.`);
@@ -600,6 +671,11 @@ export function formatDoctor(d: DoctorReport): string {
     lines.push(`  ${BOLD}${YELLOW}Findings${RESET}`);
     for (const p of problems) lines.push(`  ${RED}!${RESET} ${p}`);
   }
+  if (notes.length > 0) {
+    lines.push("");
+    lines.push(`  ${BOLD}${CYAN}Notes${RESET}`);
+    for (const n of notes) lines.push(`  ${CYAN}i${RESET} ${n}`);
+  }
   lines.push("");
   return lines.join("\n");
 }
@@ -616,14 +692,8 @@ export const usage: CliUsage = {
 
 /** Entry point for `ue-mcp doctor [project.uproject] [--editor <name-or-path>]`. */
 export async function run(argv: string[]): Promise<number | void> {
-  let target: { projectPath?: string; rest: string[] };
-  try {
-    target = takeEditorTarget(argv);
-  } catch (e) {
-    console.error(`  ${RED}${e instanceof EditorFlagError ? e.message : String(e)}${RESET}`);
-    process.exit(1);
-  }
-  const projectArg = target.projectPath ?? target.rest.find((a) => !a.startsWith("-"));
+  const target = selectProjectOrExit(argv, { positional: true });
+  const projectArg = target.projectPath;
   const report = collectDoctor(projectArg);
   console.log(formatDoctor(report));
   if (!target.rest.includes("--fix")) return;

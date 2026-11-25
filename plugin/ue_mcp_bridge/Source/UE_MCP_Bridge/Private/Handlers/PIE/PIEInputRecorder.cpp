@@ -6,6 +6,7 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/PlayerController.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformTime.h"
@@ -84,9 +85,13 @@ namespace MCPPIE
 		}
 		OnEndFrameHandle.Reset();
 		bEndFrameBound = false;
+		FPSPin.Restore();
+		StopUICapture();
+		UICapture.Reset();
 		State = ERecorderState::Idle;
 		bArmed = false;
 		TargetWorld.Reset();
+		TargetPlayerController.Reset();
 		ResolvedPIEInstance = INDEX_NONE;
 		bTargetResolved = false;
 		TargetResolveStartSeconds = 0.0;
@@ -148,6 +153,10 @@ namespace MCPPIE
 		if (!bArmed) return;
 		bArmed = false;
 		TargetWorld.Reset();
+		TargetPlayerController.Reset();
+		StopUICapture();
+		UICapture.Reset();
+		FirstRowRealTime = -1.0;
 		ResolvedPIEInstance = INDEX_NONE;
 		bTargetResolved = false;
 		TargetResolveStartSeconds = FPlatformTime::Seconds();
@@ -193,11 +202,21 @@ namespace MCPPIE
 
 	void FPIEInputRecorder::ApplyFPSPin(UWorld* PIEWorld)
 	{
-		if (Pending.PinFPS <= 0) return;
-		if (!PIEWorld || !GEngine) return;
-		const FString Cmd = FString::Printf(TEXT("t.MaxFPS %d"), Pending.PinFPS);
-		GEngine->Exec(PIEWorld, *Cmd);
-		UE_LOG(LogMCPPIE, Log, TEXT("[PIE-REC] %s"), *Cmd);
+		if (Pending.PinFPS <= 0 || !PIEWorld) return;
+		if (FPSPin.Apply(Pending.PinFPS))
+		{
+			UE_LOG(LogMCPPIE, Log, TEXT("[PIE-REC] t.MaxFPS pinned to %d"), Pending.PinFPS);
+		}
+	}
+
+	void FPIEInputRecorder::StopUICapture()
+	{
+		// Unregisters from Slate but keeps the samples, which the sequence
+		// is built from after the recording stops.
+		if (UICapture.IsValid())
+		{
+			FPIEUIPointerCapture::Stop(UICapture);
+		}
 	}
 
 	void FPIEInputRecorder::OnEndFrame()
@@ -220,6 +239,7 @@ namespace MCPPIE
 				return;
 			}
 			TargetWorld = Target.World;
+			TargetPlayerController = Target.PlayerController;
 			ResolvedPIEInstance = Target.PIEInstance;
 			bTargetResolved = true;
 			TargetResolveError.Reset();
@@ -245,6 +265,13 @@ namespace MCPPIE
 				CSVHeader = BuildCSVHeader(CSVHdr);
 				CSVBody.Reset();
 
+				if (Pending.bCaptureUIPointer)
+				{
+					UICapture = FPIEUIPointerCapture::Start(PIEWorld, TargetPlayerController.Get());
+					UE_LOG(LogMCPPIE, Log, TEXT("[PIE-REC] ui pointer capture %s"),
+						UICapture.IsValid() ? TEXT("on") : TEXT("unavailable (Slate not initialised)"));
+				}
+
 				State = ERecorderState::Recording;
 			}
 			return;
@@ -255,6 +282,10 @@ namespace MCPPIE
 			const double GameTime = PIEWorld->GetTimeSeconds();
 			const double Dt = PIEWorld->GetDeltaSeconds();
 			const uint64 FrameNum = static_cast<uint64>(Rows.Num());
+			if (FrameNum == 0)
+			{
+				FirstRowRealTime = PIEWorld->GetRealTimeSeconds();
+			}
 			FCSVRow Row = Sampler.SampleFrame(PIEWorld, FrameNum, GameTime, Dt);
 
 			// Lift mark:* edge events into the manifest markers list.
@@ -316,6 +347,26 @@ namespace MCPPIE
 		const double BaseTime = Rows[0].Time;
 		const int32 GapTol = FMath::Max(0, Pending.RunGapFrames);
 
+		// A tape plays one entry per 1/SampleHz of world time, so the run is
+		// resampled at that rate rather than taken one entry per frame (#1657).
+		auto ResampleRun = [this](const FString& ActionName, int32 First, int32 Last, TArray<FVector>& OutValues)
+		{
+			const int32 Hz = FMath::Max(1, Pending.SampleHz);
+			const double T0 = Rows[First].Time;
+			const int32 Count = FMath::FloorToInt((Rows[Last].Time - T0) * Hz + 1e-6) + 1;
+			int32 Cursor = First;
+			for (int32 k = 0; k < Count; ++k)
+			{
+				const double T = T0 + static_cast<double>(k) / Hz;
+				while (Cursor < Last && FMath::Abs(Rows[Cursor + 1].Time - T) <= FMath::Abs(Rows[Cursor].Time - T))
+				{
+					++Cursor;
+				}
+				const FVector* V = Rows[Cursor].ActionValues.Find(ActionName);
+				OutValues.Add(V ? *V : FVector::ZeroVector);
+			}
+		};
+
 		// Group rows by action.
 		for (const FActionSpec& A : Sampler.GetActions())
 		{
@@ -375,11 +426,7 @@ namespace MCPPIE
 						S.Type = EStepType::InputTape;
 						S.Action = A.Path;
 						S.DelayMs = static_cast<int32>(FMath::RoundToInt((Rows[RunStart].Time - BaseTime) * 1000.0));
-						for (int32 i = RunStart; i <= RunEnd; ++i)
-						{
-							const FVector* V = Rows[i].ActionValues.Find(A.Name);
-							S.TapeValues.Add(V ? *V : FVector::ZeroVector);
-						}
+						ResampleRun(A.Name, RunStart, RunEnd, S.TapeValues);
 						Out.Steps.Add(S);
 						RunStart = Idx;
 					}
@@ -390,11 +437,7 @@ namespace MCPPIE
 				S.Type = EStepType::InputTape;
 				S.Action = A.Path;
 				S.DelayMs = static_cast<int32>(FMath::RoundToInt((Rows[RunStart].Time - BaseTime) * 1000.0));
-				for (int32 i = RunStart; i <= RunEnd; ++i)
-				{
-					const FVector* V = Rows[i].ActionValues.Find(A.Name);
-					S.TapeValues.Add(V ? *V : FVector::ZeroVector);
-				}
+				ResampleRun(A.Name, RunStart, RunEnd, S.TapeValues);
 				Out.Steps.Add(S);
 			}
 		}
@@ -409,7 +452,15 @@ namespace MCPPIE
 			Out.Steps.Add(S);
 		}
 
-		Out.Steps.Sort([](const FStep& A, const FStep& B) { return A.DelayMs < B.DelayMs; });
+		// Cursor / UMG pointer events, on the real-time clock from the first row.
+		if (UICapture.IsValid() && FirstRowRealTime >= 0.0)
+		{
+			BuildUIPointerSteps(UICapture->GetSamples(), FirstRowRealTime, Out.Steps);
+		}
+
+		// Stable: a press and its release, or a move and the click after it,
+		// can land on the same millisecond and must keep their order.
+		Out.Steps.StableSort([](const FStep& A, const FStep& B) { return A.DelayMs < B.DelayMs; });
 	}
 
 	FRecorderFinishResult FPIEInputRecorder::FinaliseCurrent()
@@ -421,6 +472,8 @@ namespace MCPPIE
 			return R;
 		}
 		const bool bHadData = Rows.Num() > 0 && Sampler.IsAttached();
+		FPSPin.Restore();
+		StopUICapture();
 		R.Id = CurrentId;
 		R.RecordingDir = CurrentDir;
 
@@ -466,6 +519,9 @@ namespace MCPPIE
 			TrackedActorCache.Reset();
 			Markers.Reset();
 			TargetWorld.Reset();
+			TargetPlayerController.Reset();
+			UICapture.Reset();
+			FirstRowRealTime = -1.0;
 			ResolvedPIEInstance = INDEX_NONE;
 			bTargetResolved = false;
 			TargetResolveStartSeconds = 0.0;
@@ -491,6 +547,10 @@ namespace MCPPIE
 
 		FSequence Seq;
 		BuildSequenceSteps(Seq);
+		for (const FStep& Step : Seq.Steps)
+		{
+			if (Step.Type == EStepType::UIInput) ++R.UIPointerSteps;
+		}
 		if (!SaveSequence(SeqPath, Seq, WriteErr))
 		{
 			R.Error = WriteErr;
@@ -517,6 +577,7 @@ namespace MCPPIE
 		M.Actions = Sampler.GetActions();
 		M.TrackedValues = Sampler.GetTrackedValues();
 		M.Markers = Markers;
+		M.Warnings = Sampler.GetWarnings();
 		M.CSVFile = TEXT("recording.csv");
 		M.SequenceFile = TEXT("sequence.json");
 
@@ -548,6 +609,7 @@ namespace MCPPIE
 		R.SequencePath = SeqPath;
 		R.TotalFrames = M.TotalFrames;
 		R.DurationSeconds = M.DurationSeconds;
+		R.Warnings = M.Warnings;
 
 		// Drive Take Recorder Stop in lockstep with the input recorder
 		// finalise. Report the outcome so the user knows what happened.
@@ -583,6 +645,9 @@ namespace MCPPIE
 		TrackedActorCache.Reset();
 		Markers.Reset();
 		TargetWorld.Reset();
+		TargetPlayerController.Reset();
+		UICapture.Reset();
+		FirstRowRealTime = -1.0;
 		ResolvedPIEInstance = INDEX_NONE;
 		bTargetResolved = false;
 		TargetResolveStartSeconds = 0.0;
@@ -605,6 +670,27 @@ namespace MCPPIE
 		S.ElapsedSeconds = (Rows.Num() >= 2) ? (Rows.Last().Time - Rows[0].Time) : 0.0;
 		S.TrackedActionCount = Sampler.GetActions().Num();
 		S.LastError = LastError;
+		S.Warnings = Sampler.GetWarnings();
+		S.PIEInstance = ResolvedPIEInstance;
+		S.bCaptureUIPointer = State != ERecorderState::Idle && Pending.bCaptureUIPointer;
+		S.UIPointerEvents = UICapture.IsValid() ? UICapture->GetSamples().Num() : 0;
+		if (State == ERecorderState::WaitingForPawn)
+		{
+			S.WaitingFor = !bTargetResolved
+				? (TargetResolveError.IsEmpty() ? FString(TEXT("a PIE world with the requested player")) : TargetResolveError)
+				: (Sampler.GetAttachBlocker().IsEmpty() ? FString(TEXT("the player's pawn")) : Sampler.GetAttachBlocker());
+		}
+		if (GEngine)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if ((Context.WorldType == EWorldType::PIE || Context.WorldType == EWorldType::Game) && Context.World())
+				{
+					S.bPIEActive = true;
+					break;
+				}
+			}
+		}
 		return S;
 	}
 

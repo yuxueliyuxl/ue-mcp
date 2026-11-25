@@ -535,7 +535,6 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveMontageSection(const TSharedPtr
 		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
 	}
 
-#if WITH_EDITOR
 	const int32 Index = Montage->GetSectionIndex(FName(*SectionName));
 	if (Index == INDEX_NONE)
 	{
@@ -616,9 +615,6 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveMontageSection(const TSharedPtr
 		Result->SetBoolField(TEXT("rollbackLossy"), false);
 	}
 	return MCPResult(Result);
-#else
-	return MCPError(TEXT("Montage section editing requires an editor build."));
-#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -847,7 +843,11 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddNotifyState(const TSharedPtr<FJson
 
 	FAnimNotifyEvent& NewEvent = AnimAsset->Notifies.AddDefaulted_GetRef();
 	NewEvent.NotifyName = NotifyFName;
+	// A unique Guid and the class's trigger weight threshold, for the same
+	// reasons add_anim_notify sets them.
+	NewEvent.Guid = FGuid::NewGuid();
 	NewEvent.NotifyStateClass = StateObject;
+	NewEvent.TriggerWeightThreshold = StateObject->GetDefaultTriggerWeightThreshold();
 	NewEvent.TrackIndex = 0;
 	// Link both ends to the asset before SetDuration, which moves EndLink by
 	// setting a time on it: an unlinked EndLink has no sequence to resolve
@@ -1106,10 +1106,8 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetSyncMarkers(const TSharedPtr<FJson
 			FAnimSyncMarker Marker;
 			Marker.MarkerName = P.Name;
 			Marker.Time = P.Time;
-#if WITH_EDITORONLY_DATA
 			Marker.TrackIndex = 0;
 			Marker.Guid = FGuid::NewGuid();
-#endif
 			Next.Add(Marker);
 		}
 	}
@@ -1133,10 +1131,8 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetSyncMarkers(const TSharedPtr<FJson
 				FAnimSyncMarker Marker;
 				Marker.MarkerName = P.Name;
 				Marker.Time = P.Time;
-#if WITH_EDITORONLY_DATA
 				Marker.TrackIndex = 0;
 				Marker.Guid = FGuid::NewGuid();
-#endif
 				Next.Add(Marker);
 			}
 		}
@@ -1179,7 +1175,6 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetSyncMarkers(const TSharedPtr<FJson
 		// sequence and the editor's marker picker cannot offer them, which reads
 		// as "the write did not work".
 		USkeleton* Skeleton = AnimSeq->GetSkeleton();
-#if WITH_EDITOR
 		if (Skeleton)
 		{
 			for (const FAnimSyncMarker& Marker : Next)
@@ -1200,7 +1195,6 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetSyncMarkers(const TSharedPtr<FJson
 				}
 			}
 		}
-#endif
 
 		// This is what turns the array into something the sync groups read.
 		AnimSeq->RefreshSyncMarkerDataFromAuthored();

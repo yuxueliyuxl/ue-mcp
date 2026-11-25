@@ -1,9 +1,15 @@
+// @session independent: The plugin registry token, per user.
 /**
  * Registry login for `ue-mcp login`.
  *
+ * The account is the registry user. It signs in with an email address and a
+ * one-time code (POST /api/auth/email/start, then /verify), or with GitHub.
+ * Sign-in calls go to authBase() (accounts.ue-mcp.com); the cached token's
+ * `registry` stays registryBase(), since the token is valid on both hosts.
+ *
  * Publishing to the plugin registry needs a per-author token. Rather than make
  * authors visit the site, mint a token, and paste it into an env var, this runs
- * the GitHub device flow already used for feedback authorship (src/feedback/github-auth.ts) and
+ * the GitHub device flow already used for feedback authorship (src/github/auth.ts) and
  * trades the resulting GitHub identity for a registry token via
  * POST /api/cli/exchange.
  *
@@ -20,17 +26,22 @@ import {
   startDeviceFlow,
   pollDeviceFlow,
   type UserAuth,
-} from "../feedback/github-auth.js";
+} from "../github/auth.js";
 import { registryBase } from "./registry-catalog.js";
 import { readEnv } from "../core/env.js";
+import { writePrivateFile } from "../core/private-file.js";
 
 const registryFile = () => join(authDir(), "registry.json");
 
 export interface RegistryAuth {
   /** Registry publish token (uemcp_...). */
   token: string;
-  /** GitHub login this token was minted for - shown by `plugin publish`. */
+  /** Account login as the registry reports it: a GitHub login, or the email for an email-only account. */
   login: string;
+  /** The account's email address, when the registry returned one. */
+  email?: string;
+  /** How this token was obtained. Absent in files written before email sign-in, which were all GitHub. */
+  method?: "email" | "github";
   registry: string;
   authorized_at: string;
 }
@@ -49,9 +60,16 @@ export async function readRegistryAuth(): Promise<RegistryAuth | null> {
   }
 }
 
-async function writeRegistryAuth(a: RegistryAuth): Promise<void> {
-  await fs.mkdir(authDir(), { recursive: true });
-  await fs.writeFile(registryFile(), JSON.stringify(a, null, 2), { mode: 0o600 });
+/**
+ * The account as shown to the user. Only a GitHub sign-in is a GitHub login, so
+ * only that gets the "@" prefix; an email sign-in is shown as the registry gave it.
+ */
+export function displayAccount(a: Pick<RegistryAuth, "login" | "method">): string {
+  return a.method === "email" ? a.login : `@${a.login}`;
+}
+
+export async function writeRegistryAuth(a: RegistryAuth): Promise<void> {
+  await writePrivateFile(registryFile(), JSON.stringify(a, null, 2));
 }
 
 export async function clearRegistryAuth(): Promise<void> {
@@ -65,16 +83,37 @@ export async function clearRegistryAuth(): Promise<void> {
  */
 export async function resolvePublishToken(flagToken?: string): Promise<string | null> {
   if (flagToken) return flagToken;
-  const env = readEnv("publishToken") ?? process.env.REGISTRY_PUBLISH_TOKEN;
+  const env = readEnv("publishToken") ?? readEnv("registryPublishToken");
   if (env) return env;
   const cached = await readRegistryAuth();
   return cached?.token ?? null;
 }
 
+const DEFAULT_AUTH_BASE = "https://accounts.ue-mcp.com";
+
+/** Origin of the sign-in endpoints: UE_MCP_AUTH_URL, else https://accounts.ue-mcp.com. */
+export function authBase(): string {
+  return (readEnv("authUrl") ?? DEFAULT_AUTH_BASE).replace(/\/+$/, "");
+}
+
+/**
+ * Fetch a sign-in endpoint. With UE_MCP_AUTH_URL unset, a network failure on
+ * the default host (no DNS record yet, connection refused) is retried once on
+ * the registry, which serves the same routes and tokens. An HTTP status is an
+ * answer and is never retried.
+ */
+async function authFetch(path: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(`${authBase()}${path}`, init);
+  } catch (e) {
+    if (readEnv("authUrl")) throw e;
+    return fetch(`${registryBase()}${path}`, init);
+  }
+}
+
 /** Trade a GitHub token for a registry publish token. */
-async function exchange(githubToken: string): Promise<{ token: string; login: string }> {
-  const base = registryBase();
-  const res = await fetch(`${base}/api/cli/exchange`, {
+async function exchange(githubToken: string): Promise<{ token: string; login: string; email?: string }> {
+  const res = await authFetch("/api/cli/exchange", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ githubToken }),
@@ -89,9 +128,9 @@ async function exchange(githubToken: string): Promise<{ token: string; login: st
     }
     throw new Error(`registry exchange failed (HTTP ${res.status}): ${msg}`);
   }
-  const data = JSON.parse(text) as { token?: string; login?: string };
+  const data = JSON.parse(text) as { token?: string; login?: string; email?: string | null };
   if (!data.token) throw new Error("registry did not return a token");
-  return { token: data.token, login: data.login ?? "unknown" };
+  return { token: data.token, login: data.login ?? "unknown", ...(data.email ? { email: data.email } : {}) };
 }
 
 /**
@@ -107,7 +146,7 @@ export async function loginToRegistry(
   if (!opts.force) {
     const existing = await readRegistryAuth();
     if (existing) {
-      log(`Already logged in to ${existing.registry} as @${existing.login}.`);
+      log(`Already logged in to ${existing.registry} as ${displayAccount(existing)}.`);
       log(`Re-run with --force to mint a fresh token.`);
       return existing;
     }
@@ -133,13 +172,114 @@ export async function loginToRegistry(
     log(`Authorized as @${gh.login}.`);
   }
 
-  const { token, login } = await exchange(gh.token);
+  const { token, login, email } = await exchange(gh.token);
   const auth: RegistryAuth = {
     token,
     login,
+    ...(email ? { email } : {}),
+    method: "github",
     registry: registryBase(),
     authorized_at: new Date().toISOString(),
   };
   await writeRegistryAuth(auth);
   return auth;
+}
+
+/** The sign-in methods a registry offers. */
+export interface AuthMethods {
+  email: boolean;
+  github: boolean;
+}
+
+/**
+ * GET /api/auth/methods. Null when the registry does not answer it (an older
+ * registry, or unreachable), which callers treat as GitHub only.
+ */
+export async function fetchAuthMethods(): Promise<AuthMethods | null> {
+  try {
+    const res = await authFetch("/api/auth/methods");
+    if (!res.ok) return null;
+    const data = (await res.json()) as { email?: unknown; github?: unknown };
+    return { email: data.email === true, github: data.github !== false };
+  } catch {
+    return null;
+  }
+}
+
+/** A refusal from the email sign-in endpoints, with the HTTP status and any wait. */
+export class EmailSignInError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    /** Seconds to wait before asking again, from a 429. */
+    readonly retryAfter?: number,
+  ) {
+    super(message);
+    this.name = "EmailSignInError";
+  }
+}
+
+async function postEmail<T>(path: string, body: Record<string, string>): Promise<T> {
+  const res = await authFetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let data: Record<string, unknown> = {};
+  try {
+    data = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    // Non-JSON body (a proxy error page); the status still says what happened.
+  }
+  if (res.ok) return data as T;
+  const error = typeof data.error === "string" ? data.error : text || `HTTP ${res.status}`;
+  if (res.status === 429) {
+    const fromBody = typeof data.retryAfter === "number" ? data.retryAfter : undefined;
+    const header = Number(res.headers.get("retry-after"));
+    const wait = fromBody ?? (Number.isFinite(header) && header > 0 ? header : undefined);
+    throw new EmailSignInError(error, 429, wait);
+  }
+  if (res.status === 404 || res.status === 405) {
+    throw new EmailSignInError("this registry does not offer email sign-in; run 'ue-mcp login --github'", res.status);
+  }
+  throw new EmailSignInError(error, res.status);
+}
+
+/** POST /api/auth/email/start: ask the registry to email a one-time code. */
+export async function startEmailSignIn(email: string): Promise<{ expiresInSeconds: number }> {
+  const data = await postEmail<{ expiresInSeconds?: number }>("/api/auth/email/start", { email });
+  return { expiresInSeconds: typeof data.expiresInSeconds === "number" ? data.expiresInSeconds : 600 };
+}
+
+/** POST /api/auth/email/verify: trade the code for a registry token. */
+export async function verifyEmailCode(
+  email: string,
+  code: string,
+): Promise<{ token: string; login: string; email: string; created: boolean }> {
+  const data = await postEmail<{ token?: string; login?: string; email?: string; created?: boolean }>(
+    "/api/auth/email/verify",
+    { email, code },
+  );
+  if (!data.token) throw new EmailSignInError("registry did not return a token", 200);
+  return { token: data.token, login: data.login ?? email, email: data.email ?? email, created: data.created === true };
+}
+
+/** Wrong tries the registry allows on one code before it stops accepting it. */
+export const EMAIL_CODE_TRIES = 5;
+
+/** A user-facing message for an email sign-in refusal. */
+export function describeEmailError(e: EmailSignInError): string {
+  if (e.status === 429) {
+    return e.retryAfter
+      ? `too many requests; try again in ${e.retryAfter} seconds`
+      : "too many requests; try again later";
+  }
+  if (e.status === 503) return `email sign-in is not available right now (${e.message}); run 'ue-mcp login --github' instead`;
+  return e.message;
+}
+
+/** True for something shaped like an email address. The registry has the final say. */
+export function looksLikeEmail(s: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
 }

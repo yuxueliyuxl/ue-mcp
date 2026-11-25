@@ -32,8 +32,8 @@ describe("server mode", () => {
       McpServer.start(sb, { projects: [inProcess], env }),
     ]);
     try {
-      expect(await a.toolNames()).toEqual(["flow", "tools"]);
-      expect(await b.toolNames()).toEqual(["flow", "tools"]);
+      expect(await a.toolNames()).toEqual(["tools"]);
+      expect(await b.toolNames()).toEqual(["tools"]);
       const d = readDiscovery(sb, viaDaemon)!;
       expect(d).not.toBeNull();
       expect((await call(d, "GET", "/v1/health")).body.clients).toBe(1);
@@ -43,7 +43,7 @@ describe("server mode", () => {
       // The variable wins over the file.
       const overridden = await McpServer.start(sb, { projects: [sb.makeProject("ModeOverride", { config: config("daemon") })], mode: "in-process" });
       try {
-        expect(await overridden.toolNames()).toEqual(["flow", "tools"]);
+        expect(await overridden.toolNames()).toEqual(["tools"]);
         expect(readDiscovery(sb, path.join(sb.root, "ModeOverride", "ModeOverride.uproject"))).toBeNull();
       } finally {
         await overridden.client.close();
@@ -74,6 +74,39 @@ describe("server mode", () => {
     }
   });
 
+  it("answers initialize before a slow daemon is listening, and lists tools once it is", async () => {
+    covers("server.mode.initialize-first");
+    const project = sb.makeProject("SlowDaemon");
+    // An extension whose activate holds the daemon's start well past what the
+    // initialize below is allowed. A daemon listens only after its extensions load.
+    const holdMs = 15_000;
+    const extensions = sb.path("slow-extensions");
+    const ext = path.join(extensions, "slowstart@1.0.0");
+    fs.mkdirSync(ext, { recursive: true });
+    fs.writeFileSync(path.join(ext, "package.json"), JSON.stringify({
+      name: "slowstart", version: "1.0.0", main: "index.mjs", ueMcpExtension: { name: "slowstart", api: { min: 1, max: 2 } },
+    }));
+    fs.writeFileSync(path.join(ext, "index.mjs"), `export default { async activate() { await new Promise((r) => setTimeout(r, ${holdMs})); return { dispose() {} }; } };\n`);
+
+    const t0 = Date.now();
+    const server = await McpServer.start(sb, { projects: [project], mode: "daemon", env: { UE_MCP_EXTENSIONS_DIR: extensions, UE_MCP_LOG_LEVEL: "info" } });
+    try {
+      expect(Date.now() - t0).toBeLessThan(holdMs);
+      expect(readDiscovery(sb, project), "the daemon was already listening, so this proves nothing").toBeNull();
+      expect(server.client.getServerCapabilities()?.tools?.listChanged).toBe(true);
+      expect(server.instructions.length).toBeGreaterThan(0);
+
+      // Asked before the daemon is up, answered by it once it is.
+      expect(await server.toolNames()).toEqual(["tools"]);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(holdMs);
+      expect(readDiscovery(sb, project)).not.toBeNull();
+      const r = await server.call("tools", { action: "call", category: "project", method: "get_status" });
+      expect(r.isError, r.text).toBe(false);
+    } finally {
+      await server.client.close();
+    }
+  });
+
   it("serves in process when the discovery directory cannot be created", async () => {
     covers("server.mode.fallback");
     const project = sb.makeProject("NoDaemonDir");
@@ -81,7 +114,7 @@ describe("server mode", () => {
     fs.writeFileSync(file, "not a directory");
     const server = await McpServer.start(sb, { projects: [project], mode: "daemon", env: { UE_MCP_DAEMON_DIR: path.join(file, "daemons"), UE_MCP_LOG_LEVEL: "warn" } });
     try {
-      expect(await server.toolNames()).toEqual(["flow", "tools"]);
+      expect(await server.toolNames()).toEqual(["tools"]);
       const r = await server.call("tools", { action: "call", category: "project", method: "get_status" });
       expect(r.isError, r.text).toBe(false);
       expect(server.log).toContain("daemon unavailable; serving in process");

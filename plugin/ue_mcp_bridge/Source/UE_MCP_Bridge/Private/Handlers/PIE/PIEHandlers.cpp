@@ -5,6 +5,7 @@
 #include "Handlers/PIE/PIEInputRecorder.h"
 #include "Handlers/PIE/PIEInputReplayer.h"
 #include "Handlers/PIE/PIEObserver.h"
+#include "Handlers/PIE/PIEPawnDrive.h"
 #include "Handlers/PIE/PIERemotePlayers.h"
 #include "Handlers/PIE/PIEScriptRunner.h"
 #include "Handlers/PIE/PIESessionLog.h"
@@ -68,6 +69,7 @@ void FPIEHandlers::StartupSystems()
 	MCPPIE::FPIEObserver::Get().Init();
 	MCPPIE::FPIESessionLog::Get().Init();
 	MCPPIE::FPIEScriptRunner::Get().Init();
+	MCPPIE::FPIEUatRunner::Get().Init();
 
 	if (IsSupersededPluginEnabled())
 	{
@@ -106,7 +108,8 @@ void FPIEHandlers::StartupSystems()
 				|| MCPPIE::FPIEInputReplayer::Get().IsActive()
 				|| MCPPIE::FPIEObserver::Get().IsActive()
 				|| MCPPIE::FPIEUatRunner::Get().IsRunning()
-				|| MCPPIE::FPIEScriptRunner::Get().IsActive();
+				|| MCPPIE::FPIEScriptRunner::Get().IsActive()
+				|| MCPPIE::PIEPawnDrive::IsActive();
 		});
 		GEditor->ShouldDisableCPUThrottlingDelegates.Add(Suppress);
 		GThrottleTicker.Reset();
@@ -130,6 +133,7 @@ void FPIEHandlers::ShutdownSystems()
 		SMCPPIEStudioPanel::UnregisterTab();
 		GPanelRegistered = false;
 	}
+	MCPPIE::PIEPawnDrive::Shutdown();
 	MCPPIE::FPIEScriptRunner::Get().Shutdown();
 	MCPPIE::FPIESessionLog::Get().Shutdown();
 	MCPPIE::FPIEObserver::Get().Shutdown();
@@ -155,6 +159,17 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	const TCHAR* const ValueYDoc = TEXT("Axis value Y (default 0)");
 	const TCHAR* const ValueZDoc = TEXT("Axis value Z (default 0)");
 
+	Registry.RegisterHandler(TEXT("pie_view_trace"), &ViewTrace, {
+		MCPParam::Optional(TEXT("playerIndex"), EType::Integer, TEXT("Local player index in the selected PIE world (default 0)")),
+		MCPSharedParam::PieInstance().Describe(TEXT("PIE instance id; omitted selects the active PIE world")),
+		MCPParam::Optional(TEXT("distance"), EType::Number, TEXT("Positive trace distance in cm (default 1000)")),
+		MCPParam::Optional(TEXT("channel"), EType::String, TEXT("Collision channel, including project-renamed channels (default Visibility)")),
+		MCPParam::Optional(TEXT("sweepRadius"), EType::Number, TEXT("Also sweep a sphere of this radius in cm when positive")),
+		MCPParam::Optional(TEXT("traceComplex"), EType::Boolean, TEXT("Trace per-triangle collision (default false)")),
+		MCPParam::Optional(TEXT("ignoreActors"), EType::Array, TEXT("Actor labels or paths to skip")).Items(EType::String),
+		MCPParam::Optional(TEXT("ignorePawn"), EType::Boolean, TEXT("Ignore the viewing player's pawn (default true)")),
+	});
+
 	// Input injection
 	Registry.RegisterHandler(TEXT("pie_inject_input"), &InjectInput, {
 		MCPParam::Required(TEXT("action_path"), EType::String, TEXT("InputAction asset path")),
@@ -171,6 +186,8 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("value_y"), EType::Number, ValueYDoc),
 		MCPParam::Optional(TEXT("value_z"), EType::Number, ValueZDoc),
 		MCPParam::Optional(TEXT("injection_id"), EType::String, TEXT("Caller-chosen hold id (minted when absent)")),
+		MCPParam::Optional(TEXT("duration_seconds"), EType::Number, TEXT("Game seconds after which the hold releases itself (default 0: held until inject_input_stop or PIE ends). Local player only")).Min(0),
+		MCPParam::Optional(TEXT("control_rotation"), EType::Rotator, TEXT("Player controller control rotation, re-applied every frame while the hold runs. Local player only")),
 		MCPParam::Optional(TEXT("client_id"), EType::Integer, ClientIdDoc).Min(0),
 		MCPParam::Optional(TEXT("pie_instance"), EType::Integer, PieInstanceDoc).Min(0),
 		MCPParam::Optional(TEXT("client"), EType::Integer, RemoteClientDoc).Min(0),
@@ -180,6 +197,7 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("value_x"), EType::Number, ValueXDoc),
 		MCPParam::Optional(TEXT("value_y"), EType::Number, ValueYDoc),
 		MCPParam::Optional(TEXT("value_z"), EType::Number, ValueZDoc),
+		MCPParam::Optional(TEXT("control_rotation"), EType::Rotator, TEXT("New control rotation the hold re-applies every frame; sent alone it keeps the hold's value")),
 	}, MCPSpec::ContractExempt(TEXT("Changes the value of a running input hold")));
 	Registry.RegisterHandler(TEXT("pie_inject_input_stop"), &InjectInputStop, {
 		MCPParam::Required(TEXT("injection_id"), EType::String, TEXT("Hold or tape id to stop")),
@@ -194,19 +212,54 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("client"), EType::Integer, RemoteClientDoc).Min(0),
 	}, MCPSpec::ContractExempt(TEXT("Plays a value tape into the running PIE session")));
 
+	// Pawn driving (#1565)
+	const TCHAR* const DriveIdDoc = TEXT("Drive id from drive_pawn (default: the most recent drive)");
+	Registry.RegisterHandler(TEXT("pie_drive_pawn"), &PieDrivePawn, {
+		MCPParam::Optional(TEXT("direction"), EType::Vec3, TEXT("World direction to push movement input in every frame")),
+		MCPParam::Optional(TEXT("targetLocation"), EType::Vec3, TEXT("World point to steer toward; the drive ends as arrived within acceptanceRadius")),
+		MCPParam::Optional(TEXT("mode"), EType::String, TEXT("input (default): movement input on the pawn; navigate: a navmesh move from the player controller, needs targetLocation")).Enum({ TEXT("input"), TEXT("navigate") }),
+		MCPParam::Optional(TEXT("durationSeconds"), EType::Number, TEXT("Real seconds to drive before ending as completed or timeout (default 5, at most 600)")).Range(0, 600),
+		MCPParam::Optional(TEXT("scale"), EType::Number, TEXT("Movement input scale (default 1)")).Range(-1, 1),
+		MCPParam::Optional(TEXT("sampleEvery"), EType::Number, TEXT("Seconds between track samples; 0 samples every frame (default 0.1)")).Min(0),
+		MCPParam::Optional(TEXT("acceptanceRadius"), EType::Number, TEXT("Distance in cm from targetLocation that counts as arrived (default 50)")).Min(0),
+		MCPParam::Optional(TEXT("planar"), EType::Boolean, TEXT("Steer and measure arrival on the XY plane (default true); false for flying or swimming pawns")),
+		MCPParam::Optional(TEXT("stopOnMapChange"), EType::Boolean, TEXT("End the drive as map_changed when the player arrives in another level (default false: keep driving there)")),
+		MCPParam::Optional(TEXT("playerIndex"), EType::Integer, TEXT("Local player index in the PIE world (default 0)")),
+		MCPSharedParam::PieInstance().Describe(PieInstanceDoc),
+		MCPParam::Optional(TEXT("driveId"), EType::String, TEXT("Caller-chosen drive id (minted when absent)")),
+		MCPParam::Optional(TEXT("wait"), EType::Boolean, TEXT("Return only when the drive ends, with its whole track (default true)")),
+		MCPParam::Optional(TEXT("timeoutSeconds"), EType::Number, TEXT("Longest wait=true waits (default durationSeconds + 30)")).Min(0),
+	}, MCPSpec::ExactlyOne({ { TEXT("direction") }, { TEXT("targetLocation") } })
+		.ContractExempt(TEXT("Drives the PIE player's pawn over later frames; pie(drive_stop) ends it")));
+	Registry.RegisterHandler(TEXT("pie_drive_status"), &PieDriveStatus, {
+		MCPParam::Optional(TEXT("driveId"), EType::String, DriveIdDoc),
+		MCPParam::Optional(TEXT("includeSamples"), EType::Boolean, TEXT("Include the sampled track (default true)")),
+	});
+	Registry.RegisterHandler(TEXT("pie_drive_stop"), &PieDriveStop, {
+		MCPParam::Optional(TEXT("driveId"), EType::String, DriveIdDoc),
+	}, MCPSpec::ContractExempt(TEXT("Ends a running pawn drive")));
+
 	// Multiplayer players
 	Registry.RegisterHandler(TEXT("pie_clients"), &PieClients, {});
 	Registry.RegisterHandler(TEXT("pie_console"), &PieConsole, {
 		MCPParam::Required(TEXT("command"), EType::String, TEXT("Console command")),
 		MCPParam::Required(TEXT("client"), EType::Integer, TEXT("Remote player 1..N (join order)")).Min(1),
 	}, MCPSpec::ContractExempt(TEXT("Runs a console command in a remote player's process")));
+	// Slate key events for one PIE player's UI (#2018, #1928).
+	Registry.RegisterHandler(TEXT("pie_send_key"), &PieSendKey, {
+		MCPParam::Optional(TEXT("key"), EType::String, TEXT("FKey name: Right, Left, Up, Down, Tab, Enter, SpaceBar, Escape, Gamepad_DPad_Down, Gamepad_FaceButton_Bottom...")),
+		MCPParam::Optional(TEXT("text"), EType::String, TEXT("Characters to type into the focused widget, one character event each, instead of a key")),
+		MCPParam::Optional(TEXT("event"), EType::String, TEXT("press (default: down then up) | down | up")).Enum({ TEXT("press"), TEXT("down"), TEXT("up") }),
+		MCPParam::Optional(TEXT("pie_instance"), EType::Integer, TEXT("FWorldContext::PIEInstance of the client whose UI gets the key. Omitted picks the editor's own player: the listen-server host, else the lowest client PIE instance")).Min(0),
+		MCPParam::Optional(TEXT("client_id"), EType::Integer, ClientIdDoc).Min(0),
+	}, MCPSpec::ExactlyOne({ { TEXT("key") }, { TEXT("text") } }).ContractExempt(TEXT("Sends key events into the running PIE session")));
 	Registry.RegisterHandler(TEXT("pie_remote_result"), &PieRemoteResult, {
 		MCPParam::Required(TEXT("request_id"), EType::String, TEXT("injection_id or request_id a relayed call returned")).Alias(TEXT("injection_id")),
 	});
 
 	// Multiplayer acceptance runs
 	Registry.RegisterHandler(TEXT("pie_uat_run"), &PieUatRun, {
-		MCPParam::Optional(TEXT("scenario"), EType::Object, TEXT("Scenario object: {name, map, pie:{players, net_mode, one_process, windowless, client_fps}, join_timeout_s, settle_ms, steps:[{name, do[], expect[], forbid[], window_ms}]}; see docs/pie.md")),
+		MCPParam::Optional(TEXT("scenario"), EType::Object, TEXT("Scenario object: {name, map, pie:{players, net_mode, one_process, windowless, client_fps}, join_timeout_s, settle_ms, steps:[{name, do[], expect[{log host|client:N, pattern (regex), min, max, since step|run}], forbid[], window_ms}]}. A rule reads only lines logged after its step began unless since is run; see docs/pie.md")),
 		MCPParam::Optional(TEXT("path"), EType::String, TEXT("Scenario JSON file, relative to the project directory")),
 	}, MCPSpec::ExactlyOne({ { TEXT("scenario") }, { TEXT("path") } })
 		.ContractExempt(TEXT("Opens the scenario map and starts a multiplayer PIE session")));
@@ -230,6 +283,7 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("pie_instance"), EType::Integer, PieInstanceDoc).Min(0),
 		MCPParam::Optional(TEXT("rng_seed"), EType::Number, TEXT("Seed the stream RNG for reproducible runs")),
 		MCPParam::Optional(TEXT("run_gap_frames"), EType::Integer, TEXT("Idle frames that split input runs (default 6)")),
+		MCPParam::Optional(TEXT("capture_ui_pointer"), EType::Boolean, TEXT("Also record the mouse through Slate (cursor, UMG hover, click, drag, wheel) while the cursor is shown, as ui_input steps (default false)")),
 		MCPParam::Optional(TEXT("recording_dir"), EType::String, TEXT("Recordings root (default Saved/MCPRecordings)")),
 		MCPParam::Optional(TEXT("id"), EType::String, TEXT("Recording id (default: a timestamp)")),
 	}, MCPSpec::ContractExempt(TEXT("Arms the recorder, which starts on the next PIE session")));
@@ -260,6 +314,7 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	}, MCPSpec::ContractExempt(TEXT("Writes a marker into the recording in flight")));
 
 	// Replay. replay_arm and replay_run share one parser, so their params stay identical.
+	const TCHAR* const StartWhenDoc = TEXT("Hold the steps until the player can act, then resume at the matching point of the recording: {pawn_at_rest (default true: speed <= max_speed_cms, default 5, and on the ground), hold_ms (default 500), log_contains, timeout_ms (default 60000)}. Replaces settle_ms");
 	const TArray<FMCPParamSpec> ReplayParams = {
 		MCPParam::Optional(TEXT("recording_id"), EType::String, RecordingIdDoc),
 		MCPParam::Optional(TEXT("sequence_path"), EType::String, TEXT("Explicit sequence.json path")),
@@ -273,6 +328,7 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("record_drift"), EType::Boolean, TEXT("Record drift against the source (default true)")),
 		MCPParam::Optional(TEXT("auto_stop_pie"), EType::Boolean, TEXT("End PIE when the replay completes (replay_arm default false, replay_run default true)")),
 		MCPParam::Optional(TEXT("eject"), EType::Boolean, TEXT("Eject to a spectator camera during replay")),
+		MCPParam::Optional(TEXT("lock_input"), EType::Boolean, TEXT("Block the user's keyboard, mouse and gamepad from the PIE game while the replay runs, so only the recording drives the player; Esc, Shift+F1 and F8 still work, and monitor mode ignores it (default false)")),
 		MCPParam::Optional(TEXT("time_scale"), EType::Number, TEXT("Playback speed multiplier (default 1)")),
 		MCPParam::Optional(TEXT("mode"), EType::String, TEXT("replay drives input; monitor only samples (default replay)")).Enum({ TEXT("replay"), TEXT("monitor") }),
 		MCPParam::Optional(TEXT("capture_frame_every"), EType::Integer, TEXT("Capture a viewport JPEG every N steps and build a contact sheet")).Min(0),
@@ -281,6 +337,7 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("client_id"), EType::Integer, ClientIdDoc).Min(0),
 		MCPParam::Optional(TEXT("pie_instance"), EType::Integer, PieInstanceDoc).Min(0),
 		MCPParam::Optional(TEXT("drift_thresholds"), EType::Object, TEXT("{position_cm, rotation_deg, velocity_cms, tracked_default, tracked:{path: threshold}}")),
+		MCPParam::Optional(TEXT("start_when"), EType::Object, StartWhenDoc),
 	};
 	Registry.RegisterHandler(TEXT("pie_replay_arm"), &PieReplayArm, ReplayParams,
 		MCPSpec::ContractExempt(TEXT("Arms the replayer, which drives the next PIE session")));
@@ -294,13 +351,17 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("pie_replay_analyze"), &PieReplayAnalyze, {
 		MCPParam::Optional(TEXT("recording_id"), EType::String, RecordingIdDoc),
 		MCPParam::Optional(TEXT("recording_dir"), EType::String, RecordingDirDoc),
+		MCPParam::Optional(TEXT("limit"), EType::Integer, TEXT("Most frames_over_threshold entries returned (default 50)")).Min(0),
+		MCPParam::Optional(TEXT("offset"), EType::Integer, TEXT("First frames_over_threshold entry returned")).Min(0),
 	});
 	Registry.RegisterHandler(TEXT("pie_replay_state"), &PieReplayState, {
 		MCPParam::Optional(TEXT("recording_id"), EType::String, RecordingIdDoc),
 		MCPParam::Optional(TEXT("recording_dir"), EType::String, RecordingDirDoc),
 		MCPParam::Optional(TEXT("at_time"), EType::Number, TEXT("Seconds to sample, interpolated (default: the last frame)")),
 		MCPParam::Optional(TEXT("at_frame"), EType::Integer, TEXT("Frame index to sample, instead of at_time")).Min(0),
-		MCPParam::Optional(TEXT("apply"), EType::Boolean, TEXT("Teleport the live PIE pawn to the recorded pose (default false)")),
+		MCPParam::Optional(TEXT("apply"), EType::Boolean, TEXT("Teleport the live PIE pawn to the recorded pose (default false). On a net client the server's pawn for that player moves too, so the server does not correct it back")),
+		MCPParam::Optional(TEXT("pie_instance"), EType::Integer, TEXT("With apply: FWorldContext PIEInstance whose player to move (default the active PIE world)")).Min(0),
+		MCPParam::Optional(TEXT("client_id"), EType::Integer, TEXT("With apply: local-player index inside that PIE world (default 0)")).Min(0),
 	}, MCPSpec::ContractExempt(TEXT("With apply it moves the live PIE pawn")));
 
 	// Reproduction tests and assertions
@@ -312,6 +373,7 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("max_velocity_drift_cms"), EType::Number, TEXT("Most velocity drift allowed (default 50)")),
 		MCPParam::Optional(TEXT("max_rotation_drift_deg"), EType::Number, TEXT("Most rotation drift allowed (default 5)")),
 		MCPParam::Optional(TEXT("max_errors"), EType::Integer, TEXT("Most errors logged during the run (default 0)")).Min(0),
+		MCPParam::Optional(TEXT("start_when"), EType::Object, TEXT("Replay gate test_run uses, as replay_run's start_when")),
 	}, MCPSpec::ContractExempt(TEXT("Writes test.json beside the recording")));
 	Registry.RegisterHandler(TEXT("pie_test_run"), &PieTestRun, {
 		MCPParam::Optional(TEXT("test_path"), EType::String, TEXT("Explicit test.json path")),
@@ -342,6 +404,9 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("velocity_cms"), EType::Number, TEXT("Velocity drift threshold (default 25)")),
 		MCPParam::Optional(TEXT("tracked_default"), EType::Number, TEXT("Default tracked-value threshold")),
 		MCPParam::Optional(TEXT("tracked_thresholds"), EType::Object, TEXT("Per-path tracked-value thresholds {path: threshold}")),
+		MCPParam::Optional(TEXT("align"), EType::String, TEXT("auto (default) pairs a's rows with b's shifted by the row offset that best matches the two trajectories, so input landing a few frames later is not read as drift; index pairs rows by index. The result's alignment reports the offset")).Enum({
+			TEXT("auto"), TEXT("index") }),
+		MCPParam::Optional(TEXT("max_offset_rows"), EType::Integer, TEXT("align=auto: largest shift tried, in rows either way (default 30)")).Min(0),
 	});
 
 	// Declarative scenarios
@@ -361,7 +426,7 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("pie_profile_create"), &PieProfileCreate, {
 		MCPParam::Required(TEXT("name"), EType::String, TEXT("Asset name")),
 		MCPParam::Optional(TEXT("package_path"), EType::String, TEXT("Content folder (default /Game/Observation)")),
-		MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("What to do when the asset exists (default skip)")).Enum({ TEXT("skip"), TEXT("replace") }),
+		MCPSharedParam::OnConflict().Describe(TEXT("What to do when the asset exists (default skip)")).Enum({ TEXT("skip"), TEXT("replace") }),
 		MCPParam::Optional(TEXT("tracked_values"), EType::Array, TrackedValuesDoc),
 		MCPParam::Optional(TEXT("tracked_actors"), EType::Array, TEXT("Actor ids to track")).Items(EType::String),
 		MCPParam::Optional(TEXT("tracked_widgets"), EType::Array, TEXT("Widget class names or paths, or widget names, sampled as visible true or false")).Items(EType::String),
@@ -450,11 +515,12 @@ void FPIEHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("contains"), EType::String, TEXT("Substring the message must contain")),
 		MCPParam::Optional(TEXT("limit"), EType::Integer, TEXT("Most rows (default 200)")).Min(1),
 		MCPParam::Optional(TEXT("offset"), EType::Integer, TEXT("First row")).Min(0),
+		MCPParam::Optional(TEXT("max_message_chars"), EType::Integer, TEXT("Longest message returned; longer ones are cut and marked truncated (default 500, 0 for no limit)")).Min(0),
 	});
 
 	// Profiling
 	Registry.RegisterHandler(TEXT("pie_perf_summary"), &PiePerfSummary, {
-		MCPParam::Optional(TEXT("recording_id"), EType::String, RecordingIdDoc),
+		MCPParam::Optional(TEXT("recording_id"), EType::String, TEXT("Recording id under the recordings root (default: the newest recording)")),
 		MCPParam::Optional(TEXT("recording_dir"), EType::String, RecordingDirDoc),
 	});
 

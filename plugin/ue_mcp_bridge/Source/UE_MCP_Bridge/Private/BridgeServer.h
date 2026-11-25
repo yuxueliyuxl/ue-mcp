@@ -18,6 +18,7 @@
 #include "MCPSocketPlatform.h"
 #include "BridgeWebSocket.h"
 #include "BridgePortConfig.h"
+#include "BridgeStateFiles.h"
 
 /**
  * Sole owner of one accepted client socket.
@@ -99,13 +100,35 @@ private:
 	FMCPBridgeServer& Server;
 };
 
+/**
+ * The one way to write to a client socket. A deferred answer is sent from a
+ * thread of its own while the connection thread goes on answering, so every
+ * frame is written whole under this lock, and nothing is written once the
+ * connection has retired it.
+ */
+class FMCPConnectionWriter
+{
+public:
+	explicit FMCPConnectionWriter(FMCPSocketHandle InSocket) : Socket(InSocket) {}
+
+	bool Send(const TArray<uint8>& Frame);
+	void Close(uint16 StatusCode, const FString& Reason);
+	void Retire();
+
+private:
+	FCriticalSection Lock;
+	FMCPSocketHandle Socket;
+	bool bOpen = true;
+};
+
 class FMCPBridgeServer : public FRunnable
 {
 	friend class FMCPConnectionUnlist;
 	friend class FMCPConnectionRelease;
+	friend class FMCPConnectionWriter;
 
 public:
-	FMCPBridgeServer(int32 Port = 9877, const FString& InPortSource = TEXT("default"), bool bInPortPinned = false);
+	explicit FMCPBridgeServer(const FMCPBridgePortChoice& InPortChoice);
 	~FMCPBridgeServer();
 
 	// Start the server
@@ -120,54 +143,8 @@ public:
 	// Public stop method (calls FRunnable::Stop)
 	void Shutdown();
 
-	// #492: per-project port lockfile so multiple editors can coexist.
-	// #821: the record names the instance that wrote it, is published by
-	// rename so a reader never sees a half-written file, and is only ever
-	// removed by the instance whose id it carries.
-	static FString GetPortLockfilePath();
-	static FString GetBridgeErrorFilePath();
-	void WritePortLockfile(int32 PortValue);
-	void DeletePortLockfileIfOwned();
-
-	/** Leave an on-disk trace for "editor alive, bridge dead". Written to its
-	 *  own path so a failed start can never overwrite a live editor's record. */
-	void WriteBindFailureRecord(int32 FirstPort, int32 LastPort, int32 ErrorCode);
-
-	// #817: this process's own record under Saved/UE_MCP_Bridge/instances/.
-	//
-	// port.json names one bridge for a whole project directory, which is the
-	// right answer for one editor and no answer at all for two. A per-pid file
-	// has exactly one writer by construction, so a second editor of the same
-	// project describes itself instead of overwriting the first, and a record
-	// left by a crash is provably stale instead of merely suspicious.
-	void WriteInstanceRecord(const FString& State, int32 PortValue);
-	void DeleteOwnInstanceRecord();
-
-	/** Remove records whose process is gone. Runs once, at startup, on the
-	 *  server thread; the sweep never touches this instance's own record. */
-	void ReapStaleInstanceRecords();
-
-	// Deterministic per-worktree base port. Derived from a hash of the project
-	// root path so every checkout gets a stable, launch-order-independent port
-	// that the Node client computes identically (see src/port.ts). Keep the two
-	// implementations in lockstep.
-	static int32 DeriveProjectPort(const FString& ProjectRootDir);
-
-	// Resolve the base port to bind: -MCPPort= command line > UE_MCP_PORT env >
-	// the port the client published in Saved/UE_MCP_Bridge/requested.json >
-	// `ue-mcp.bridge.port` from the project's config files > deterministic
-	// derived port. That order is the client's (see src/bridge.ts); both sides
-	// have to walk it identically or a pinned project ends up with a client
-	// aimed at one port and an editor listening on another (#819). The probe
-	// loop in Run() walks upward from here on collision, and the actual bound
-	// port is published to the lockfile.
-	//
-	// requested.json (#817) sits above the config read because it is the same
-	// answer computed from more inputs: the client merges four config layers
-	// and the environment, none of which an editor launched from Explorer can
-	// see. It exists only while a pin exists, so an unpinned install resolves
-	// exactly as it did before that channel was added.
-	static FMCPBridgePortChoice ResolveConfiguredPort();
+	/** Who this server is, as every record it publishes names it. */
+	FMCPBridgeIdentity Identity() const;
 
 	// Get handler registry
 	FMCPHandlerRegistry& GetHandlerRegistry() { return HandlerRegistry; }
@@ -178,11 +155,25 @@ public:
 	// Lightweight status accessors used by the editor toolbar.
 	bool IsRunning() const { return bIsRunning; }
 	int32 GetPort() const { return ServerPort; }
-	const FString& GetPortSource() const { return PortSource; }
+	const FString& GetPortSource() const { return PortChoice.Source; }
 	int32 GetHandshakenClientCount() const { return ActiveConnectionCount.GetValue(); }
 
 	// Process a JSON-RPC message
 	FString ProcessMessage(const FString& Message);
+
+	// SendInterim writes a notification frame to the requesting client while a
+	// deferred answer is awaited (progress).
+	// OutDeferred, when given, receives the wait for a deferred answer instead of
+	// it running here; the empty string is returned and the caller runs it.
+	FString ProcessMessage(const FString& Message, const TFunction<void(const FString&)>& SendInterim, TFunction<FString()>* OutDeferred);
+
+	/** The JSON-RPC response for a handler's result, with the engine state attached to a timeout. */
+	FString FinishJsonRpcResponse(const TSharedPtr<FJsonObject>& Request, const FString& Method, const TSharedPtr<FJsonValue>& Result);
+
+	/** Wait for a handler's deferred answer until the deadline, a cancel or shutdown, sending progress frames when asked. */
+	TSharedPtr<FJsonValue> AwaitDeferredAnswer(
+		const FJsonObject& Request, const FString& Method, class FMCPDeferredCall& Deferred, class FMCPRequestContext& Context,
+		double DeadlineSeconds, bool bWantsProgress, const TFunction<void(const FString&)>& SendInterim);
 
 	/**
 	 * #821: what this bridge is and what it can do, answered without the game
@@ -196,49 +187,18 @@ public:
 
 	TSharedPtr<FJsonObject> BuildCapabilitiesPayload();
 
-	// ── Framing ──────────────────────────────────────────────────────────────
-	//
-	// Public because they are pure functions over a byte buffer with no server
-	// state behind them, and because the automation spec in
-	// Private/Tests/BridgeProtocolTests.cpp is the only thing that can prove
-	// them. The alternative was befriending the test class, which encodes a
-	// test's name into the header and breaks whenever the test is renamed.
-
-	/**
-	 * Decode at most one frame from the front of Buffer.
-	 *
-	 * On Decoded the frame's bytes (header, mask and payload) are consumed from
-	 * Buffer and whatever follows is left in place, so a read that delivered two
-	 * pipelined requests yields both instead of dropping the second. On
-	 * NeedMoreData nothing is consumed and the caller reads again.
-	 *
-	 * On ProtocolError OutCloseCode carries the status the peer should be closed
-	 * with: 1002 for framing the bridge cannot follow, 1009 when the frame is
-	 * merely too large. The caller sends that code, so the client can tell a
-	 * size refusal from a broken stream.
-	 */
-	static EMCPFrameDecode DecodeWebSocketFrame(TArray<uint8>& Buffer, FMCPWebSocketFrame& OutFrame, FString& OutError, uint16& OutCloseCode);
-
-	/** Frame a text message for the wire. Server to client, so never masked. */
-	static TArray<uint8> CreateWebSocketFrame(const FString& Message);
-
-	/** Frame a control opcode (close, ping, pong) with its payload. */
-	static TArray<uint8> CreateControlFrame(EMCPWebSocketOpcode Opcode, const TArray<uint8>& Payload);
-
-	/** The largest message the bridge will accept on one connection, whether it
-	 *  arrives as one frame or as fragments. A message of exactly this size is
-	 *  receivable: the unparsed receive buffer is bounded a frame header higher
-	 *  so the decoder can hold a full-size frame whole. */
-	static int64 MaxMessageBytes();
+	/** The socket-thread methods (get_engine_state, get_bridge_capabilities, the
+	 *  parameter echo pair, cancel_request), registered like any handler. */
+	void RegisterBuiltInMethods();
 
 private:
-	// Server port
+	// The bound port once Run() has bound one; until then the port to try first.
 	int32 ServerPort;
 
-	// Where ServerPort came from before the collision walk touched it, and
-	// whether it was pinned by a human. Only the log lines read these.
-	FString PortSource;
-	bool bPortPinned;
+	// The port policy's answer, resolved on the game thread before the server
+	// thread starts: where the first port came from, whether a human pinned it,
+	// and the ports the collision walk steps over.
+	FMCPBridgePortChoice PortChoice;
 
 	// Thread management
 	FRunnableThread* ServerThread;
@@ -276,8 +236,19 @@ private:
 	/** Case-insensitive, line-scoped header lookup. */
 	static bool FindHeaderValue(const FString& Request, const FString& HeaderName, FString& OutValue);
 
-	/** Refuse an upgrade with an HTTP status the caller can read. */
-	static void SendHttpError(FMCPSocketHandle SocketFD, int32 StatusCode, const FString& StatusText, const FString& Detail);
+	/** Refuse an upgrade with an HTTP status the caller can read. ExtraHeaders
+	 *  is zero or more complete header lines, each ending in CRLF. */
+	static void SendHttpError(FMCPSocketHandle SocketFD, int32 StatusCode, const FString& StatusText, const FString& Detail, const FString& ExtraHeaders = FString());
+
+	/**
+	 * Generate this session's token and publish it to the per-user token file
+	 * for ServerPort. Runs once on the server thread before the first accept.
+	 * On failure SessionToken stays empty and every upgrade is refused.
+	 */
+	void PublishSessionToken();
+
+	/** Remove the token file if it still holds this session's token. */
+	void RetractSessionToken();
 
 	FString CreateWebSocketAcceptKey(const FString& ClientKey);
 
@@ -316,4 +287,11 @@ private:
 	// form any record or payload uses.
 	const FString InstanceId;
 	FDateTime StartedAtUtc;
+
+	// Required as "Authorization: Bearer <token>" on every upgrade. Written on
+	// the server thread before the accept loop starts and read-only after, so
+	// connection threads read it without a lock. Never logged, and never
+	// written into the project's port lockfile or any other record.
+	FString SessionToken;
+	FString SessionTokenDir;
 };

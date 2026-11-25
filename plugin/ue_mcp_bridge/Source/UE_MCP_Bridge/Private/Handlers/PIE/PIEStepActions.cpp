@@ -1,5 +1,9 @@
 #include "Handlers/PIE/PIEStepActions.h"
 
+#include "HandlerParams.h"
+#include "HandlerPathGuard.h"
+#include "HandlerWorld.h"
+#include "Handlers/PIE/PIEClientUI.h"
 #include "Handlers/PIE/PIELog.h"
 #include "Handlers/PIE/PIERemotePlayers.h"
 #include "MCPPIEInputInjector.h"
@@ -10,6 +14,7 @@
 #include "Editor.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/LocalPlayer.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
@@ -17,6 +22,8 @@
 #include "HAL/FileManager.h"
 #include "InputAction.h"
 #include "Misc/Paths.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
+#include "Serialization/JsonSerializer.h"
 
 namespace MCPPIE
 {
@@ -44,7 +51,48 @@ namespace MCPPIE
 				if (A.Num() > 1) Out.Y = A[1]->AsNumber();
 				if (A.Num() > 2) Out.Z = A[2]->AsNumber();
 			}
+			else if (V->Type == EJson::Object)
+			{
+				ReadVec3Fields(V->AsObject(), Out);
+			}
 			return Out;
+		}
+
+		/** A place location or offset: [x, y, z] or {x, y, z}, three numbers either way. Anything else is
+		 *  refused rather than read as the origin, which teleported the pawn to (0, 0, 0) with ok:true (#1813). */
+		bool StepActionPoint(const TSharedPtr<FJsonValue>& V, const TCHAR* Field, FVector& Out, FString& Err)
+		{
+			bool bOk = false;
+			if (V.IsValid() && V->Type == EJson::Array)
+			{
+				const TArray<TSharedPtr<FJsonValue>>& A = V->AsArray();
+				bOk = A.Num() == 3;
+				for (int32 I = 0; bOk && I < 3; ++I)
+				{
+					bOk = A[I].IsValid() && A[I]->Type == EJson::Number;
+					if (bOk) Out[I] = A[I]->AsNumber();
+				}
+			}
+			else if (V.IsValid() && V->Type == EJson::Object)
+			{
+				const TSharedPtr<FJsonObject> O = V->AsObject();
+				double X = 0, Y = 0, Z = 0;
+				bOk = O.IsValid() && O->Values.Num() == 3
+					&& O->TryGetNumberField(TEXT("x"), X) && O->TryGetNumberField(TEXT("y"), Y) && O->TryGetNumberField(TEXT("z"), Z);
+				if (bOk) Out = FVector(X, Y, Z);
+			}
+			if (!bOk)
+			{
+				FString Given;
+				if (V.IsValid())
+				{
+					const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> W = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Given);
+					FJsonSerializer::Serialize(V, FString(), W);
+				}
+				Err = FString::Printf(TEXT("place %s must be [x, y, z] or {x, y, z} with three numbers, such as [-2500, 0, 200] or {\"x\": -2500, \"y\": 0, \"z\": 200}; got %s"),
+					Field, Given.IsEmpty() ? TEXT("nothing") : *Given);
+			}
+			return bOk;
 		}
 
 		FInputActionValue StepActionValue(const UInputAction* Input, const FVector& Value)
@@ -110,6 +158,13 @@ namespace MCPPIE
 				return false;
 			}
 			for (const TSharedPtr<FJsonValue>& V : *Values) { Out.Values.Add(StepActionVector(V)); }
+			double Hz = 60;
+			if ((*Body)->TryGetNumberField(TEXT("hz"), Hz) && (Hz < 1 || Hz > 1000))
+			{
+				Err = FString::Printf(TEXT("a tape's hz must be 1 to 1000, not %g"), Hz);
+				return false;
+			}
+			Out.Hz = FMath::RoundToInt(Hz);
 			return true;
 		}
 		if (O->TryGetObjectField(TEXT("press"), Body))
@@ -156,13 +211,11 @@ namespace MCPPIE
 			P->TryGetBoolField(TEXT("face"), Out.bFace);
 			if (P->TryGetStringField(TEXT("at"), Out.At) && !Out.At.IsEmpty())
 			{
-				if (P->HasField(TEXT("offset"))) Out.Offset = StepActionVector(P->TryGetField(TEXT("offset")));
-				return true;
+				return !P->HasField(TEXT("offset")) || StepActionPoint(P->TryGetField(TEXT("offset")), TEXT("offset"), Out.Offset, Err);
 			}
 			if (P->HasField(TEXT("location")))
 			{
-				Out.Value = StepActionVector(P->TryGetField(TEXT("location")));
-				return true;
+				return StepActionPoint(P->TryGetField(TEXT("location")), TEXT("location"), Out.Value, Err);
 			}
 			Err = TEXT("place needs at (an actor name or label) or location");
 			return false;
@@ -182,7 +235,27 @@ namespace MCPPIE
 			}
 			return true;
 		}
-		Err = TEXT("an action must be one of tape, press, hold, inject, console, place, capture, wait_ms");
+		if (O->TryGetObjectField(TEXT("key"), Body))
+		{
+			Out.Kind = FStepAction::EKind::Key;
+			Out.Verb = TEXT("key");
+			(*Body)->TryGetStringField(TEXT("key"), Out.KeyName);
+			(*Body)->TryGetStringField(TEXT("text"), Out.KeyText);
+			(*Body)->TryGetStringField(TEXT("event"), Out.KeyEvent);
+			if (Out.KeyName.IsEmpty() == Out.KeyText.IsEmpty())
+			{
+				Err = TEXT("a key action takes exactly one of key (an FKey name such as Right or Enter) or text");
+				return false;
+			}
+			PIEClientUI::EKeyPhase Phase;
+			if (!PIEClientUI::ParseKeyPhase(Out.KeyEvent, Phase))
+			{
+				Err = FString::Printf(TEXT("a key action's event must be press, down or up, not '%s'"), *Out.KeyEvent);
+				return false;
+			}
+			return true;
+		}
+		Err = TEXT("an action must be one of tape, press, hold, inject, console, place, capture, key, wait_ms");
 		return false;
 	}
 
@@ -199,6 +272,7 @@ namespace MCPPIE
 
 	bool FStepActionRunner::Run(const FStepAction& A, FString& Err)
 	{
+		LastTarget.Reset();
 		UInputAction* Input = nullptr;
 		if (A.UsesInputAction())
 		{
@@ -218,6 +292,26 @@ namespace MCPPIE
 		{
 			return RequestCapture(A, Err);
 		}
+		if (A.Kind == FStepAction::EKind::Key)
+		{
+			if (A.Client > 0)
+			{
+				Err = FString::Printf(TEXT("key cannot target remote client %d: a remote player runs in another process with no Slate path from here. Aim the run at that client's window with pie_instance (script_run) and leave client off."), A.Client);
+				return false;
+			}
+			PIEClientUI::FUIPlayer Player;
+			if (!PIEClientUI::Resolve(OwnPIEInstance, OwnLocalPlayer, Player, Err))
+			{
+				return false;
+			}
+			LastTarget = Player.Description;
+			PIEClientUI::EKeyPhase Phase = PIEClientUI::EKeyPhase::Press;
+			PIEClientUI::ParseKeyPhase(A.KeyEvent, Phase);
+			PIEClientUI::FKeyResult Sent;
+			return A.KeyName.IsEmpty()
+				? PIEClientUI::SendText(Player, A.KeyText, Sent, Err)
+				: PIEClientUI::SendKey(Player, A.KeyName, Phase, Sent, Err);
+		}
 
 		if (A.Client > 0)
 		{
@@ -228,6 +322,7 @@ namespace MCPPIE
 			}
 			const FString Id = PIERemotePlayers::NewId(TEXT("uat"));
 			PIERemotePlayers::RememberId(Id, Remote);
+			LastTarget = FString::Printf(TEXT("remote client %d"), A.Client);
 			FString What;
 			switch (A.Kind)
 			{
@@ -254,12 +349,22 @@ namespace MCPPIE
 			return true;
 		}
 
-		// The editor's own player.
+		// The editor's own player, resolved to one exact local player: left to the injector, the input went to
+		// whichever PIE world was active, which in a one-process session with a second client was the client (#1814).
+		ULocalPlayer* Own = PIERemotePlayers::FindOwnLocalPlayer(OwnPIEInstance, OwnLocalPlayer, Err);
+		if (!Own)
+		{
+			Err = OwnPIEInstance >= 0
+				? FString::Printf(TEXT("%s: the run's pie_instance %d client_id %d has no local player (%s)"), *A.Verb, OwnPIEInstance, OwnLocalPlayer, *Err)
+				: FString::Printf(TEXT("%s: client 0 has no local player (%s)"), *A.Verb, *Err);
+			return false;
+		}
+		LastTarget = PIERemotePlayers::DescribeLocalPlayer(Own);
 		switch (A.Kind)
 		{
 		case FStepAction::EKind::Tape:
 		{
-			const FString Id = FPIEInputInjector::StartTape(Input, A.Values, 60, FString(), Err);
+			const FString Id = FPIEInputInjector::StartTape(Input, A.Values, A.Hz, FString(), Err, 0, INDEX_NONE, Own);
 			if (Id.IsEmpty())
 			{
 				return false;
@@ -268,11 +373,11 @@ namespace MCPPIE
 			return true;
 		}
 		case FStepAction::EKind::Inject:
-			return FPIEInputInjector::InjectOnce(Input, StepActionValue(Input, A.Value), Err);
+			return FPIEInputInjector::InjectOnce(Input, StepActionValue(Input, A.Value), Err, 0, INDEX_NONE, Own);
 		case FStepAction::EKind::Hold:
 		{
 			// Timed by the wall clock, like a remote hold; a tape would stretch with the frame rate.
-			const FString Id = FPIEInputInjector::StartHold(Input, StepActionValue(Input, A.Value), FString(), Err);
+			const FString Id = FPIEInputInjector::StartHold(Input, StepActionValue(Input, A.Value), FString(), Err, 0, INDEX_NONE, Own);
 			if (Id.IsEmpty())
 			{
 				return false;
@@ -282,8 +387,7 @@ namespace MCPPIE
 		}
 		case FStepAction::EKind::Console:
 		{
-			UWorld* World = PIERemotePlayers::FindLocalPlayerWorld();
-			if (PIERemotePlayers::RunLocalConsole(World, A.Command).IsEmpty())
+			if (PIERemotePlayers::RunLocalConsole(Own->GetWorld(), A.Command).IsEmpty())
 			{
 				Err = FString::Printf(TEXT("console '%s' found no local player to run on"), *A.Command);
 				return false;
@@ -376,7 +480,8 @@ namespace MCPPIE
 	{
 		const FString Label = A.Command.IsEmpty() ? FString::FromInt(Captures.Num() + 1) : A.Command;
 		const FString File = FString::Printf(TEXT("captures/step%02d_client%d_%s.jpg"), StepNumber, A.Client, *Label);
-		const FString Path = CaptureRoot / File;
+		FString Path;
+		if (!MCPResolvePathInside(CaptureRoot / File, { CaptureRoot }, Path, Err)) return false;
 		if (A.Client > 0)
 		{
 			UMCPPIERemoteControl* Remote = PIERemotePlayers::Find(A.Client, Err);
@@ -423,16 +528,30 @@ namespace MCPPIE
 			return false;
 		}
 		APlayerController* PC = nullptr;
+		APlayerController* OwnClientPC = nullptr;
 		UMCPPIERemoteControl* Remote = nullptr;
 		if (A.Client > 0)
 		{
 			Remote = PIERemotePlayers::Find(A.Client, Err);
 			PC = Remote ? Cast<APlayerController>(Remote->GetOwner()) : nullptr;
 		}
-		else
+		else if (ULocalPlayer* Own = PIERemotePlayers::FindOwnLocalPlayer(OwnPIEInstance, OwnLocalPlayer, Err))
 		{
-			PC = World->GetFirstPlayerController();
-			PC = PC && PC->IsLocalController() ? PC : nullptr;
+			// Client 0 is a client window when the server is dedicated: move the server's pawn for that player, as
+			// for a remote client, and turn the client's own controller, which keeps its facing (#2010).
+			PC = PIERemotePlayers::FindAuthorityController(Own->PlayerController);
+			if (PC && PC != Own->PlayerController)
+			{
+				OwnClientPC = Own->PlayerController;
+			}
+			else if (!PC)
+			{
+				Err = TEXT("the server's copy of this player is not in the editor process");
+			}
+		}
+		if (PC)
+		{
+			World = PC->GetWorld();
 		}
 		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
 		if (!Pawn)
@@ -485,7 +604,16 @@ namespace MCPPIE
 			return false;
 		}
 		PC->SetControlRotation(Rotation);
-		if (Remote)
+		if (OwnClientPC)
+		{
+			OwnClientPC->SetControlRotation(Rotation);
+			if (APawn* ClientPawn = OwnClientPC->GetPawn())
+			{
+				// The client's copy follows now instead of on the next correction.
+				ClientPawn->SetActorLocationAndRotation(Location, Rotation, false, nullptr, ETeleportType::ResetPhysics);
+			}
+		}
+		else if (Remote)
 		{
 			// The owning client keeps its own facing and moves from it; it has to turn itself.
 			const FString Id = PIERemotePlayers::NewId(TEXT("uat"));
@@ -494,6 +622,7 @@ namespace MCPPIE
 			Relayed.Add({ Id, A.Client, FString::Printf(TEXT("turning to yaw %.0f"), Rotation.Yaw) });
 		}
 		UE_LOG(LogMCPPIE, Log, TEXT("[PIE-ACT] placed %s at %s yaw %.0f"), *Pawn->GetName(), *Location.ToCompactString(), Rotation.Yaw);
+		LastTarget = FString::Printf(TEXT("%s in %s (%s)"), *Pawn->GetName(), *World->GetName(), *DescribePIENetMode(World));
 		return true;
 	}
 
@@ -530,7 +659,9 @@ namespace MCPPIE
 				WaitUntil = Now + A.Ms / 1000.0;
 				return EOutcome::Running;
 			}
-			if (!Runner.Run(A, OutError))
+			const bool bRan = Runner.Run(A, OutError);
+			R.Target = Runner.LastTarget;
+			if (!bRan)
 			{
 				R.bOk = false;
 				R.Error = OutError;

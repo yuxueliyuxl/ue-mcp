@@ -12,6 +12,7 @@
 #include "Misc/DateTime.h"
 #include "Misc/FeedbackContext.h"
 #include "Misc/FileHelper.h"
+#include "Misc/Guid.h"
 #include "Misc/Paths.h"
 #include "Misc/SlowTask.h"
 #include "Misc/SlowTaskStack.h"
@@ -20,11 +21,16 @@
 #include "Serialization/JsonWriter.h"
 #include "Runtime/Launch/Resources/Version.h"
 
-// Same definition as the canonical one in UE_MCP_Bridge/Public/HandlerUtils.h.
-// It is repeated rather than shared because this module loads at
-// PostConfigInit and must not depend on the bridge module, and because the
-// bridge module lists this one as a private dependency, so its public headers
-// cannot reach in the other direction either. Keep the two in step.
+#if PLATFORM_WINDOWS
+#include "Windows/WindowsHWrapper.h"
+#endif
+
+// The same gate as UE_MCP_Bridge/Public/HandlerEngineVersion.h, repeated
+// because this module loads at PostConfigInit and must not depend on the bridge
+// module, and the bridge lists this one as a private dependency, so its public
+// headers cannot reach in the other direction either. This is the one place
+// outside that header allowed to read the engine version macros;
+// tests/unit/engine-gates.test.ts holds the two definitions identical.
 #ifndef UE_MCP_HAS_5_8_API
 #define UE_MCP_HAS_5_8_API ((ENGINE_MAJOR_VERSION > 5) || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8))
 #endif
@@ -306,6 +312,27 @@ void FMCPEngineStatus::NoteHandlerEnd(const FString& Method)
 	}
 }
 
+void FMCPEngineStatus::NoteBatchProgress(int32 CompletedCalls, int32 RequestedCalls, const FString& CurrentMethod)
+{
+	FScopeLock Lock(&Mutex);
+	if (BatchRequestedCalls == 0)
+	{
+		BatchStartSeconds = FPlatformTime::Seconds();
+	}
+	BatchCompletedCalls = CompletedCalls;
+	BatchRequestedCalls = RequestedCalls;
+	BatchCurrentMethod = CurrentMethod;
+}
+
+void FMCPEngineStatus::ClearBatchProgress()
+{
+	FScopeLock Lock(&Mutex);
+	BatchCompletedCalls = 0;
+	BatchRequestedCalls = 0;
+	BatchCurrentMethod.Empty();
+	BatchStartSeconds = 0.0;
+}
+
 void FMCPEngineStatus::CaptureNow()
 {
 	if (!IsInGameThread() || !bInstalled)
@@ -531,6 +558,20 @@ TSharedPtr<FJsonObject> FMCPEngineStatus::Snapshot() const
 		Out->SetField(TEXT("handler"), MakeShared<FJsonValueNull>());
 	}
 
+	// Present only while execute_batch is running, which is when a caller that
+	// stopped waiting needs it. completedCalls is also the index of the call
+	// under way, so currentIndex spells that out rather than leaving it implied.
+	if (BatchRequestedCalls > 0)
+	{
+		TSharedPtr<FJsonObject> Batch = MakeShared<FJsonObject>();
+		Batch->SetNumberField(TEXT("completedCalls"), BatchCompletedCalls);
+		Batch->SetNumberField(TEXT("requestedCalls"), BatchRequestedCalls);
+		Batch->SetNumberField(TEXT("currentIndex"), BatchCompletedCalls);
+		Batch->SetStringField(TEXT("currentMethod"), BatchCurrentMethod);
+		Batch->SetNumberField(TEXT("elapsedSeconds"), Now - BatchStartSeconds);
+		Out->SetObjectField(TEXT("batch"), Batch);
+	}
+
 	return Out;
 }
 
@@ -570,34 +611,52 @@ bool FMCPEngineStatus::ShouldPublishStatus()
 
 bool FMCPEngineStatus::PublishAtomically(const FString& FinalPath, const FString& Contents)
 {
-	// Write then move: a reader polling at the same rate would otherwise catch
-	// a half-written file and report "no snapshot" at the exact moment the
-	// snapshot matters.
-	//
-	// #990: the temp file carries this process's pid, the way
-	// FMCPBridgeStateFiles::PublishJson has always done it. Without that every
-	// process in the project directory wrote and renamed one shared
-	// `status.json.tmp`, so concurrent writers deleted each other's temp file
-	// out from under the rename and each failure was logged at Error severity.
-	const FString TempPath = FString::Printf(TEXT("%s.%u.tmp"), *FinalPath, FPlatformProcess::GetCurrentProcessId());
+	// Each publication owns its sibling temporary file, including concurrent calls in one process (#990).
+	// Windows contention retries are bounded to about 50 ms. A longer non-sharing read skips
+	// this snapshot, preserving the previous one until the next publication.
+	const FString TempPath = FString::Printf(TEXT("%s.%u.%s.tmp"), *FinalPath,
+		FPlatformProcess::GetCurrentProcessId(), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
 	if (!FFileHelper::SaveStringToFile(Contents, *TempPath))
 	{
+		IFileManager::Get().Delete(*TempPath, false, false, true);
 		return false;
 	}
-	// The platform layer, not IFileManager::Move: that logs every failed rename at Error,
-	// and a reader polling this file holds it open for a moment on every read.
-	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-	for (int32 Attempt = 0; Attempt < 5; ++Attempt)
+	// Avoid IFileManager::Move: it logs failed renames at Error while readers poll the file.
+#if PLATFORM_WINDOWS
+	// Generic Move deletes the destination first, then MoveFileW fails if another writer recreates it.
+	// Replace in one operation instead; a sharing violation leaves the previous snapshot intact.
+	const auto NativePath = [](const FString& Path)
 	{
-		PlatformFile.DeleteFile(*FinalPath);
-		if (PlatformFile.MoveFile(*FinalPath, *TempPath))
-		{
-			return true;
-		}
+		FString Full = FPaths::ConvertRelativePathToFull(Path);
+		const bool bUNC = Full.StartsWith(TEXT("//"));
+		FPaths::RemoveDuplicateSlashes(Full);
+		if (bUNC) Full.InsertAt(0, TEXT('/'));
+		Full.ReplaceInline(TEXT("/"), TEXT("\\"));
+		if (Full.StartsWith(TEXT("\\\\?\\"))) return Full;
+		return Full.StartsWith(TEXT("\\\\")) ? TEXT("\\\\?\\UNC\\") + Full.Mid(2) : TEXT("\\\\?\\") + Full;
+	};
+	const FString NativeTempPath = NativePath(TempPath);
+	const FString NativeFinalPath = NativePath(FinalPath);
+	bool bPublished = false;
+	for (int32 Attempt = 0; Attempt < 10; ++Attempt)
+	{
+		bPublished = !!::MoveFileExW(*NativeTempPath, *NativeFinalPath, MOVEFILE_REPLACE_EXISTING);
+		if (bPublished) break;
+		const DWORD Error = ::GetLastError();
+		// Readers and simultaneous replacements can briefly hold the destination. Retry only that contention.
+		if ((Error != ERROR_SHARING_VIOLATION && Error != ERROR_ACCESS_DENIED) || Attempt == 9) break;
 		FPlatformProcess::Sleep(0.005f);
 	}
-	PlatformFile.DeleteFile(*TempPath);
-	return false;
+#else
+	// Unix/Apple's physical move uses rename(), which already replaces an existing destination.
+	const bool bPublished = IPlatformFile::GetPlatformPhysical().MoveFile(*FinalPath, *TempPath);
+#endif
+	if (!bPublished)
+	{
+		IFileManager::Get().Delete(*TempPath, /*RequireExists*/ false, /*EvenReadOnly*/ false, /*Quiet*/ true);
+		return false;
+	}
+	return true;
 }
 
 void FMCPEngineStatus::RemoveStaleInstanceStatusFiles()

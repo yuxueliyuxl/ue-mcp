@@ -1,7 +1,8 @@
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
 import { buildProject } from "../../editor/editor-build.js";
 import { inspectInstall } from "../../editor/install-check.js";
 import { specBp } from "../specs/project.generated.js";
-import type { ToolContext, ActionSpec, HandlerActionSpec } from "../../core/types.js";
+import type { ToolContext, ActionSpec, HandlerActionSpec } from "../../surface/tool-types.js";
 
 /**
  * The out-of-process UnrealBuildTool build, registered as project(build) and
@@ -10,10 +11,17 @@ import type { ToolContext, ActionSpec, HandlerActionSpec } from "../../core/type
 export const buildProjectAction: HandlerActionSpec = {
   kind: "handler",
   effect: "mutate",
-  // #958: dispatched in process, because UnrealBuildTool cannot link while an
-  // editor holds the module DLLs, so the build that matters runs with it down.
+  // #958
+  offline: "Runs UnrealBuildTool out of process, which requires the editor to be STOPPED because it cannot link while an editor holds the module DLLs.",
+  params: {
+    optional: ["configuration", "platform", "clean"],
+    notes: {
+      configuration: "default Development",
+      platform: "default the host platform",
+    },
+  },
   description:
-    "Build the project's C++ out of process with UnrealBuildTool. Works with the editor STOPPED, which a full rebuild requires (UBT cannot link while an editor holds the module DLLs). Blocks until the build finishes and returns the compiler output. A link that fails because another process holds an output open names the file and the holder under lockedOutputs, with the remedy in the message. Params: configuration? (default Development), platform? (default the host platform), clean? (#958)",
+    "Build the project's C++ out of process with UnrealBuildTool. Works with the editor STOPPED, which a full rebuild requires (UBT cannot link while an editor holds the module DLLs). Blocks until the build finishes and returns the compiler output. A link that fails because another process holds an output open names the file and the holder under lockedOutputs, with the remedy in the message. (#958)",
   handler: async (ctx, p) => {
     ctx.project.ensureLoaded();
     const lines: string[] = [];
@@ -32,6 +40,7 @@ export const installActions: Record<string, ActionSpec> = {
   check_install: {
     kind: "handler",
     effect: "read",
+    offline: "Inspects the project, the engine tree and the deployed plugin on disk.",
     description:
       "Answer whether this project can run the bridge at all, from disk, with no editor running and "
       + "nothing compiled. Reports the project kind (a project declaring no native modules of its own "
@@ -41,8 +50,14 @@ export const installActions: Record<string, ActionSpec> = {
       + ".uproject, compiled and up to date with its source, and whether this machine has the C++ "
       + "toolchain Unreal needs. Every problem carries a stable code, what is wrong and the exact fix, "
       + "and nextSteps is those fixes in order. Read-only: it never deploys, enables or builds "
-      + "anything. Params: projectPath? (default the loaded project), skipToolchain? (skip the "
-      + "toolchain probe, which shells out to vswhere or the compiler)",
+      + "anything.",
+    params: {
+      optional: ["projectPath", "skipToolchain"],
+      notes: {
+        projectPath: "default the loaded project",
+        skipToolchain: "skip the toolchain probe, which shells out to vswhere or the compiler",
+      },
+    },
     handler: async (ctx: ToolContext, p: Record<string, unknown>) => {
       const requested = (p.projectPath as string | undefined)?.trim();
       if (!requested) ctx.project.ensureLoaded();
@@ -65,10 +80,7 @@ export const installActions: Record<string, ActionSpec> = {
     "Disable a plugin in the .uproject. removeReference deletes the entry outright instead of writing an explicit disable, which is the difference between handing a default-on plugin back to its default and overriding it, and the two are not the same file. Idempotent against whichever of the two was asked for. Refuses to disable the bridge itself, since that would leave no way to undo it. Patches only that entry of the on-disk .uproject (#1248). Takes effect on the next editor start.",
     "disable_plugin",
   ),
-  live_coding_compile: {
-    ...specBp("mutate", "Trigger a Live Coding compile (Windows only). Hot-patches method bodies of existing UCLASSes without editor restart - the fast inner loop for UFUNCTION implementations. Does NOT reliably register brand-new UCLASSes; use build_project + editor restart for those.", "live_coding_compile"),
-    timeoutMs: 300_000,
-  },
+  live_coding_compile: specBp("mutate", "Trigger a Live Coding compile (Windows only). Hot-patches method bodies of existing UCLASSes without editor restart - the fast inner loop for UFUNCTION implementations. Does NOT reliably register brand-new UCLASSes; use build_project + editor restart for those.", "live_coding_compile"),
   live_coding_status: specBp("read", 
     "Report Live Coding availability/state (available, started, enabledForSession, compiling). Helps choose between live_coding_compile and build_project.",
     "live_coding_status",

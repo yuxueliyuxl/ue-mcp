@@ -353,7 +353,7 @@ TSharedPtr<FJsonValue> FMetaHumanHandlers::CreateCharacter(const TSharedPtr<FJso
 	if (NameErr) return NameErr;
 	UClass* Cls = FindClass(CharacterClass);
 	UClass* FactoryCls = FindClass(FactoryClass);
-	if (!Cls || !FactoryCls) return MCPError(TEXT("MetaHuman plugin not available: the MetaHumanCharacter asset class or its factory is not loaded"));
+	if (!Cls || !FactoryCls) return MCPError(TEXT("MetaHuman plugin not available: the MetaHumanCharacter asset class or its factory is not loaded. ") + MCPEnablePluginStep(TEXT("MetaHumanCharacter")));
 	UFactory* Factory = NewObject<UFactory>(GetTransientPackage(), FactoryCls);
 
 	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("MetaHumanCharacter"), Cls, Factory);
@@ -838,7 +838,7 @@ void FMetaHumanHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("metahuman_create_character"), &CreateCharacter, {
 		MCPParam::Required(TEXT("name"), EType::String, TEXT("Name of the new MetaHumanCharacter asset")),
 		MCPParam::Optional(TEXT("packagePath"), EType::String, TEXT("Destination folder (default /Game/MetaHumans)")),
-		MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("skip (default) returns an existing asset untouched, error refuses")),
+		MCPSharedParam::OnConflict(),
 	}, MCPSpec::ContractExempt(TEXT("creates a MetaHumanCharacter asset")));
 	Registry.RegisterHandlerWithTimeout(TEXT("metahuman_read_character"), &ReadCharacter, 300.0f, {
 		AssetPathParam(),

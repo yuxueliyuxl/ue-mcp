@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { animationTool } from "../../src/tools/animation.js";
-import type { ToolContext } from "../../src/core/types.js";
+import type { ToolContext } from "../../src/surface/tool-types.js";
 import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
 describe("animation IK and retarget authoring", () => {
@@ -116,7 +116,7 @@ describe("animation IK and retarget authoring", () => {
     const retarget = readHandlerFile("AnimationHandlers_IKRetargeterAuthoring.cpp");
     const legacy = readHandlerFile("AnimationHandlers_StateMachine.cpp");
     const assetResolve = readFileSync(new URL(
-      "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Public/HandlerAssetResolve.h",
+      "../../plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/HandlerAssetResolve.h",
       import.meta.url,
     ), "utf8");
 

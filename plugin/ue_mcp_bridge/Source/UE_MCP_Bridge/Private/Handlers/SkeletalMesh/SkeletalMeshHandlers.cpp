@@ -2,19 +2,18 @@
 
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+#include "SkeletalMeshVertexRead.h"
 
 #include "Engine/SkeletalMesh.h"
 // FSkeletalMeshLODInfo. 5.5+ reaches it transitively; 5.4 does not.
 #include "Engine/SkinnedAssetCommon.h"
 #include "SkeletalMeshEditorSubsystem.h"
 
-#if WITH_EDITORONLY_DATA && UE_MCP_HAS_5_4_API
 #include "BoneWeights.h"
 #include "GPUSkinVertexFactory.h"
 #include "MeshDescription.h"
 #include "ScopedTransaction.h"
 #include "SkeletalMeshAttributes.h"
-#endif
 
 namespace
 {
@@ -127,7 +126,6 @@ namespace
 		return Lod;
 	}
 
-#if WITH_EDITORONLY_DATA && UE_MCP_HAS_5_4_API
 	struct FMCPSkinWeightTarget
 	{
 		USkeletalMesh* Mesh = nullptr;
@@ -146,25 +144,6 @@ namespace
 		UE::AnimationCore::FBoneWeights Desired;
 		UE::AnimationCore::FBoneWeights After;
 	};
-
-	TSharedPtr<FJsonValue> MCPParseFiniteInteger(
-		const TSharedPtr<FJsonObject>& Object,
-		const TCHAR* Field,
-		int32& OutValue,
-		const FString& Context)
-	{
-		double Number = 0.0;
-		if (!Object.IsValid() || !Object->TryGetNumberField(Field, Number)
-			|| !FMath::IsFinite(Number)
-			|| !FMath::IsNearlyEqual(Number, FMath::RoundToDouble(Number))
-			|| Number < static_cast<double>(MIN_int32)
-			|| Number > static_cast<double>(MAX_int32))
-		{
-			return MCPError(FString::Printf(TEXT("%s.%s must be a finite integer"), *Context, Field));
-		}
-		OutValue = static_cast<int32>(Number);
-		return nullptr;
-	}
 
 	TSharedPtr<FJsonValue> MCPResolveSkinWeightTarget(
 		const TSharedPtr<FJsonObject>& Params,
@@ -301,10 +280,10 @@ namespace
 		}
 		if (Values->Num() > MCPSkinWeightMaxVerticesPerCall)
 		{
-			return MCPError(FString::Printf(
+			return MCPBatchTooLargeError(FString::Printf(
 				TEXT("vertexIndices contains %d entries; the maximum per read is %d"),
 				Values->Num(),
-				MCPSkinWeightMaxVerticesPerCall));
+				MCPSkinWeightMaxVerticesPerCall), MCPSkinWeightMaxVerticesPerCall);
 		}
 
 		TSet<int32> Seen;
@@ -432,10 +411,10 @@ namespace
 		}
 		if (Values->Num() > MCPSkinWeightMaxVerticesPerCall)
 		{
-			return MCPError(FString::Printf(
+			return MCPBatchTooLargeError(FString::Printf(
 				TEXT("edits contains %d vertices; the maximum per call is %d"),
 				Values->Num(),
-				MCPSkinWeightMaxVerticesPerCall));
+				MCPSkinWeightMaxVerticesPerCall), MCPSkinWeightMaxVerticesPerCall);
 		}
 
 		const FReferenceSkeleton& RefSkeleton = Target.Mesh->GetRefSkeleton();
@@ -691,7 +670,6 @@ namespace
 		Payload->SetBoolField(TEXT("restoreRawWeights"), true);
 		return Payload;
 	}
-#endif // WITH_EDITORONLY_DATA && UE_MCP_HAS_5_4_API
 }
 void FSkeletalMeshHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 {
@@ -722,6 +700,49 @@ void FSkeletalMeshHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("minWeight"), EType::Number, TEXT("Count a vertex for every bone weighing at least this much (0 < minWeight <= 1); omit to count each vertex once, for its dominant bone")),
 		SpecSkinLodIndex, SpecProfileName,
 	});
+	Registry.RegisterHandlerWithTimeout(TEXT("read_skeletal_mesh_vertices"), &ReadSkeletalMeshVertices, 300.0f, {
+		SpecAssetPath,
+		MCPParam::Optional(TEXT("boneNames"), EType::Array, TEXT("Keep vertices weighted to any of these bones; omit to keep every vertex")).Items(EType::String),
+		MCPParam::Optional(TEXT("includeChildBones"), EType::Boolean, TEXT("With boneNames, also select every bone below each named bone (default false)")),
+		MCPParam::Optional(TEXT("minWeight"), EType::Number, TEXT("With boneNames, keep a vertex only when its summed weight on the selected bones is at least this (0 < minWeight <= 1; default any positive weight)")),
+		MCPParam::Optional(TEXT("box"), EType::Object, TEXT("Keep vertices inside this component-space bind-pose box (inclusive)")).WithFields({
+			MCPParam::RequiredField(TEXT("min"), EType::Vec3, TEXT("Box minimum (cm)")),
+			MCPParam::RequiredField(TEXT("max"), EType::Vec3, TEXT("Box maximum (cm)")),
+		}),
+		MCPParam::Optional(TEXT("include"), EType::Array, TEXT("Data per vertex: any of positions, weights, triangles (default positions and weights)")).Items(EType::String),
+		MCPParam::Optional(TEXT("offset"), EType::Number, TEXT("First selected vertex to return (default 0); ignored with dumpToFile")),
+		MCPParam::Optional(TEXT("limit"), EType::Integer, TEXT("Selected vertices to return inline, 1 to 20000 (default 2000); ignored with dumpToFile")),
+		MCPParam::Optional(TEXT("dumpToFile"), EType::Boolean, TEXT("Write the whole selection to a JSON file and return only the summary")),
+		MCPParam::Optional(TEXT("outputPath"), EType::String, TEXT("File for dumpToFile; relative paths resolve under Saved/ (default Saved/UE_MCP/SkeletalMeshVertices/)")),
+		SpecSkinLodIndex, SpecProfileName,
+	});
+	{
+		// A placed component, so the level tool exposes it (#1452).
+		FMCPHandlerRegistry::FCategoryScope LevelScope(Registry, TEXT("level"));
+		Registry.RegisterHandlerWithTimeout(TEXT("get_skinned_vertices"), &GetSkinnedVertices, 300.0f, {
+			MCPSharedParam::ActorLabel().Describe(TEXT("Actor label, name or path; pass actorLabel or actorPath")),
+			MCPSharedParam::ActorPath(),
+			MCPParam::Optional(TEXT("componentName"), EType::String, TEXT("Skinned mesh component (default: the first on the actor); a leader-pose follower reads as drawn")),
+			MCPSharedParam::World().Describe(TEXT("World scope: editor (default) | pie")),
+			MCPSharedParam::PieInstance().Describe(TEXT("Which PIE world when world is pie: 0 = server or primary, 1..N = clients")),
+			MCPParam::Optional(TEXT("lodIndex"), EType::Integer, TEXT("Render LOD to skin (default: the LOD the component draws)")),
+			MCPParam::Optional(TEXT("space"), EType::String, TEXT("Space of positions, box and nearPoint (default component)")).Enum({ TEXT("component"), TEXT("world") }),
+			MCPParam::Optional(TEXT("boneNames"), EType::Array, TEXT("Keep vertices weighted to any of these bones; omit to keep every vertex")).Items(EType::String),
+			MCPParam::Optional(TEXT("includeChildBones"), EType::Boolean, TEXT("With boneNames, also select every bone below each named bone (default false)")),
+			MCPParam::Optional(TEXT("minWeight"), EType::Number, TEXT("With boneNames, keep a vertex only when its summed weight on the selected bones is at least this (0 < minWeight <= 1; default any positive weight)")),
+			MCPParam::Optional(TEXT("box"), EType::Object, TEXT("Keep vertices whose posed position is inside this box (inclusive), in space")).WithFields({
+				MCPParam::RequiredField(TEXT("min"), EType::Vec3, TEXT("Box minimum (cm)")),
+				MCPParam::RequiredField(TEXT("max"), EType::Vec3, TEXT("Box maximum (cm)")),
+			}),
+			MCPParam::Optional(TEXT("nearPoint"), EType::Vec3, TEXT("Keep vertices within radius of this point, in space; needs radius")),
+			MCPParam::Optional(TEXT("radius"), EType::Number, TEXT("Distance from nearPoint in cm, above 0; needs nearPoint")),
+			MCPParam::Optional(TEXT("include"), EType::Array, TEXT("Data per vertex: any of positions, weights, triangles (default positions and weights)")).Items(EType::String),
+			MCPParam::Optional(TEXT("startIndex"), EType::Integer, TEXT("First selected vertex to return (default 0); ignored with dumpToFile")),
+			MCPParam::Optional(TEXT("limit"), EType::Integer, TEXT("Selected vertices to return inline, 1 to 20000 (default 2000); ignored with dumpToFile")),
+			MCPParam::Optional(TEXT("dumpToFile"), EType::Boolean, TEXT("Write the whole selection to a JSON file and return only the summary")),
+			MCPParam::Optional(TEXT("outputPath"), EType::String, TEXT("File for dumpToFile; relative paths resolve under Saved/ (default Saved/UE_MCP/SkinnedVertices/)")),
+		}, MCPSpec::AtLeastOne({ { TEXT("actorLabel") }, { TEXT("actorPath") } }));
+	}
 	Registry.RegisterHandler(TEXT("set_skeletal_mesh_skin_weights"), &SetSkinWeights, {
 		SpecAssetPath,
 		MCPParam::Required(TEXT("edits"), EType::Array, TEXT("Selected source vertices and their complete replacement influences (1-256)")).Items(EType::Object).WithFields({
@@ -731,6 +752,17 @@ void FSkeletalMeshHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		SpecSkinLodIndex, SpecProfileName,
 		MCPParam::Optional(TEXT("restoreRawWeights"), EType::Boolean, TEXT("Rollback payloads only: restore the exact uint16 rawWeight values")),
 	});
+	Registry.RegisterHandlerWithTimeout(TEXT("transform_skinned_part"), &TransformSkinnedPart, 600.0f, {
+		SpecAssetPath,
+		MCPParam::Required(TEXT("boneName"), EType::String, TEXT("Bone to move; every vertex skinned to it or to a bone below it moves by its weight")),
+		MCPParam::Optional(TEXT("translation"), EType::Vec3, TEXT("Offset in space's axes (cm)")),
+		MCPParam::Optional(TEXT("rotation"), EType::Rotator, TEXT("Rotation about the bone's origin, in space's axes (degrees)")),
+		MCPParam::Optional(TEXT("space"), EType::String, TEXT("Axes of translation and rotation: the bone's bind-pose frame (default) or the mesh's component space")).Enum({ TEXT("bone"), TEXT("component") }),
+		MCPParam::Optional(TEXT("moveBone"), EType::Boolean, TEXT("Move the bone's reference pose with its vertices (default true); false moves only the vertices")),
+		MCPParam::Optional(TEXT("lods"), EType::Array, TEXT("LOD indices whose source vertices move (default every LOD); generated LODs follow their base LOD")).Items(EType::Integer),
+		MCPSharedParam::DryRun().Describe(TEXT("Validate every LOD and report what would move without writing anything")),
+		MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Save the mesh after the rebuild (default true)")).Default(true),
+	}, MCPSpec::AtLeastOne({ { TEXT("translation") }, { TEXT("rotation") } }));
 	Registry.RegisterHandlerWithTimeout(TEXT("generate_skeletal_mesh_lods"), &GenerateSkeletalMeshLods, 600.0f, {
 		MCPParam::Optional(TEXT("assetPath"), EType::String, TEXT("One SkeletalMesh")),
 		MCPParam::Optional(TEXT("assetPaths"), EType::Array, TEXT("SkeletalMeshes, at most 500")).Items(EType::String),
@@ -740,8 +772,8 @@ void FSkeletalMeshHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("trianglePercentages"), EType::Array, TEXT("Triangle percentage of LOD 0 for each LOD after it, lodCount - 1 values above 0 and at most 100 (default the engine's reduction settings)")).Items(EType::Number),
 		MCPParam::Optional(TEXT("regenerateImported"), EType::Boolean, TEXT("Also regenerate LODs that were imported rather than generated (default false)")),
 		MCPParam::Optional(TEXT("skipExisting"), EType::Boolean, TEXT("Skip a mesh already at lodCount (default true)")),
-		MCPParam::Optional(TEXT("dryRun"), EType::Boolean, TEXT("Report each mesh's LODs and what would happen without changing anything")),
-		MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Save each changed mesh (default true)")),
+		MCPSharedParam::DryRun().Describe(TEXT("Report each mesh's LODs and what would happen without changing anything")),
+		MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Save each changed mesh (default true)")).Default(true),
 	}, MCPSpec::ExactlyOne({ { TEXT("assetPath") }, { TEXT("assetPaths") }, { TEXT("directory") } }));
 }
 
@@ -749,9 +781,6 @@ TSharedPtr<FJsonValue> FSkeletalMeshHandlers::ReadSkinWeights(const TSharedPtr<F
 {
 	// Read before the target resolves; also on engines that refuse the call (#1057).
 	MCPReadParamsAhead(Params, { TEXT("assetPath"), TEXT("vertexIndices"), TEXT("lodIndex"), TEXT("profileName") });
-#if !(WITH_EDITORONLY_DATA && UE_MCP_HAS_5_4_API)
-	return MCPError(TEXT("read_skeletal_mesh_skin_weights requires an Unreal Editor build on Unreal Engine 5.4 or newer"));
-#else
 	FMCPSkinWeightTarget Target;
 	if (TSharedPtr<FJsonValue> Error = MCPResolveSkinWeightTarget(Params, Target)) return Error;
 
@@ -790,16 +819,12 @@ TSharedPtr<FJsonValue> FSkeletalMeshHandlers::ReadSkinWeights(const TSharedPtr<F
 		TEXT("source MeshDescription weights are normalized and quantized to uint16; rawWeight is exact source storage, while the rebuilt render buffer may use 8-bit weights unless high-precision skin weights are enabled"));
 	Result->SetArrayField(TEXT("vertices"), Vertices);
 	return MCPResult(Result);
-#endif
 }
 
 TSharedPtr<FJsonValue> FSkeletalMeshHandlers::ReadBoneVertexBounds(const TSharedPtr<FJsonObject>& Params)
 {
 	// Read before the target resolves; also on engines that refuse the call (#1057).
 	MCPReadParamsAhead(Params, { TEXT("assetPath"), TEXT("boneNames"), TEXT("minWeight"), TEXT("lodIndex"), TEXT("profileName") });
-#if !(WITH_EDITORONLY_DATA && UE_MCP_HAS_5_4_API)
-	return MCPError(TEXT("read_skeletal_mesh_bone_vertex_bounds requires an Unreal Editor build on Unreal Engine 5.4 or newer"));
-#else
 	FMCPSkinWeightTarget Target;
 	if (TSharedPtr<FJsonValue> Error = MCPResolveSkinWeightTarget(Params, Target)) return Error;
 
@@ -995,16 +1020,153 @@ TSharedPtr<FJsonValue> FSkeletalMeshHandlers::ReadBoneVertexBounds(const TShared
 		TEXT("componentSpace boxes are source MeshDescription positions in the mesh's bind (reference) pose; boneSpace boxes are the same positions in each bone's bind-pose frame, which is the frame a physics body on that bone uses; bindPose is the bone's component-space reference transform"));
 	Result->SetArrayField(TEXT("bones"), Bones);
 	return MCPResult(Result);
-#endif
+}
+
+TSharedPtr<FJsonValue> FSkeletalMeshHandlers::ReadSkeletalMeshVertices(const TSharedPtr<FJsonObject>& Params)
+{
+	// Read before the target resolves; also on engines that refuse the call (#1057).
+	MCPReadParamsAhead(Params, {
+		TEXT("assetPath"), TEXT("boneNames"), TEXT("includeChildBones"), TEXT("minWeight"), TEXT("box"),
+		TEXT("include"), TEXT("offset"), TEXT("limit"), TEXT("dumpToFile"), TEXT("outputPath"),
+		TEXT("lodIndex"), TEXT("profileName") });
+	FMCPSkinWeightTarget Target;
+	if (TSharedPtr<FJsonValue> Error = MCPResolveSkinWeightTarget(Params, Target)) return Error;
+	const FReferenceSkeleton& RefSkeleton = Target.Mesh->GetRefSkeleton();
+
+	// Every selector and the page are checked before any vertex is read.
+	MCPVertexRead::FIncludes Include;
+	MCPVertexRead::FBoneSelection Bones;
+	bool bByBox = false;
+	FBox SelectionBox(ForceInit);
+	MCPVertexRead::FPage Page;
+	if (TSharedPtr<FJsonValue> Error = MCPVertexRead::ParseIncludes(Params, Include)) return Error;
+	if (TSharedPtr<FJsonValue> Error = MCPVertexRead::ParseBoneSelection(Params, RefSkeleton, Target.Mesh->GetPathName(), Bones)) return Error;
+	if (TSharedPtr<FJsonValue> Error = MCPVertexRead::ParseBox(Params, bByBox, SelectionBox)) return Error;
+	if (TSharedPtr<FJsonValue> Error = MCPVertexRead::ParsePage(Params, TEXT("offset"), Page)) return Error;
+
+	const FMeshDescription& Description = *Target.Description;
+	const FSkeletalMeshConstAttributes Attributes(Description);
+	const FSkinWeightsVertexAttributesConstRef SkinWeights = Attributes.GetVertexSkinWeights(Target.ProfileName);
+	const TVertexAttributesConstRef<FVector3f> Positions = Description.GetVertexPositions();
+
+	// Selected in vertex ID order, so pages are stable between calls.
+	struct FSelectedVertex
+	{
+		FVertexID ID;
+		float SelectedWeight = 0.0f;
+	};
+	TArray<FSelectedVertex> Selected;
+	TArray<int32> SelectionOrdinal;
+	SelectionOrdinal.Init(INDEX_NONE, Description.Vertices().GetArraySize());
+	FBox SelectedBounds(ForceInit);
+	int32 SourceVertexCount = 0;
+	for (const FVertexID VertexID : Description.Vertices().GetElementIDs())
+	{
+		++SourceVertexCount;
+		const FVector Position(Positions[VertexID]);
+		if (bByBox && !SelectionBox.IsInsideOrOn(Position)) continue;
+		float BoneWeight = 0.0f;
+		if (Bones.bActive)
+		{
+			const FVertexBoneWeightsConst Weights = SkinWeights.Get(VertexID);
+			for (int32 InfluenceIndex = 0; InfluenceIndex < Weights.Num(); ++InfluenceIndex)
+			{
+				const UE::AnimationCore::FBoneWeight Weight = Weights[InfluenceIndex];
+				if (Bones.IsSelected(static_cast<int32>(Weight.GetBoneIndex()))) BoneWeight += Weight.GetWeight();
+			}
+			if (!Bones.Keeps(BoneWeight)) continue;
+		}
+		SelectionOrdinal[VertexID.GetValue()] = Selected.Num();
+		Selected.Add({ VertexID, BoneWeight });
+		SelectedBounds += Position;
+	}
+	Page.Resolve(Selected.Num());
+
+	TArray<TSharedPtr<FJsonValue>> Vertices;
+	Vertices.Reserve(Page.End - Page.First);
+	for (int32 Ordinal = Page.First; Ordinal < Page.End; ++Ordinal)
+	{
+		const FSelectedVertex& Entry = Selected[Ordinal];
+		auto Vertex = MakeShared<FJsonObject>();
+		Vertex->SetNumberField(TEXT("vertexIndex"), Entry.ID.GetValue());
+		if (Include.bPositions)
+		{
+			Vertex->SetObjectField(TEXT("position"), MCPVec3ToJsonObject(FVector(Positions[Entry.ID])));
+		}
+		if (Bones.bActive)
+		{
+			Vertex->SetNumberField(TEXT("selectedWeight"), Entry.SelectedWeight);
+		}
+		if (Include.bWeights)
+		{
+			const FVertexBoneWeightsConst Weights = SkinWeights.Get(Entry.ID);
+			TArray<TSharedPtr<FJsonValue>> Influences;
+			for (int32 InfluenceIndex = 0; InfluenceIndex < Weights.Num(); ++InfluenceIndex)
+			{
+				const UE::AnimationCore::FBoneWeight Weight = Weights[InfluenceIndex];
+				if (Weight.GetRawWeight() == 0) continue;
+				const int32 BoneIndex = static_cast<int32>(Weight.GetBoneIndex());
+				auto Influence = MakeShared<FJsonObject>();
+				Influence->SetStringField(
+					TEXT("boneName"),
+					RefSkeleton.IsValidIndex(BoneIndex) ? RefSkeleton.GetBoneName(BoneIndex).ToString() : FString());
+				Influence->SetNumberField(TEXT("boneIndex"), BoneIndex);
+				Influence->SetNumberField(TEXT("weight"), Weight.GetWeight());
+				Influences.Add(MakeShared<FJsonValueObject>(Influence));
+			}
+			Vertex->SetArrayField(TEXT("influences"), Influences);
+		}
+		Vertices.Add(MakeShared<FJsonValueObject>(Vertex));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Triangles;
+	int32 SelectedTriangleCount = 0;
+	if (Include.bTriangles)
+	{
+		SelectedTriangleCount = MCPVertexRead::CollectTriangles(
+			[&Description](auto&& Visit)
+			{
+				for (const FTriangleID TriangleID : Description.Triangles().GetElementIDs())
+				{
+					const TArrayView<const FVertexID> Corners = Description.GetTriangleVertices(TriangleID);
+					if (Corners.Num() != 3) continue;
+					MCPVertexRead::FTriangle Triangle;
+					Triangle.Index = TriangleID.GetValue();
+					for (int32 Corner = 0; Corner < 3; ++Corner) Triangle.Corners[Corner] = Corners[Corner].GetValue();
+					Triangle.Group = Description.GetTrianglePolygonGroup(TriangleID).GetValue();
+					Visit(Triangle);
+				}
+			},
+			SelectionOrdinal, Page, TEXT("polygonGroup"), Triangles);
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("assetPath"), Target.Mesh->GetPathName());
+	Result->SetNumberField(TEXT("lodIndex"), Target.LodIndex);
+	Result->SetStringField(TEXT("profileName"), Target.DisplayProfileName);
+	MCPVertexRead::SetSelectionSummary(Result, SourceVertexCount, Selected.Num(), Bones, SelectedBounds);
+	if (Include.bTriangles)
+	{
+		Result->SetNumberField(TEXT("selectedTriangleCount"), SelectedTriangleCount);
+	}
+	Result->SetStringField(
+		TEXT("coordinateSpace"),
+		TEXT("positions, box and selectedBounds are source MeshDescription positions in the mesh's bind (reference) pose, in cm; vertexIndex and triangleIndex are source IDs, the IDs read_skeletal_mesh_skin_weights and set_skeletal_mesh_skin_weights take"));
+
+	const FString PathHash = FString::Printf(TEXT("%08x"), GetTypeHash(Target.Mesh->GetPathName()));
+	const FString DefaultDumpPath = FPaths::Combine(
+		TEXT("UE_MCP"), TEXT("SkeletalMeshVertices"),
+		FPaths::MakeValidFileName(FString::Printf(
+			TEXT("%s_LOD%d_%s"), *Target.Mesh->GetName(), Target.LodIndex, *PathHash)) + TEXT(".json"));
+	return MCPVertexRead::Finish(
+		Result, Vertices, Triangles, Include.bTriangles, Page, TEXT("offset"), Selected.Num(),
+		DefaultDumpPath, TEXT("skeletal mesh vertex dump"));
 }
 
 TSharedPtr<FJsonValue> FSkeletalMeshHandlers::SetSkinWeights(const TSharedPtr<FJsonObject>& Params)
 {
 	// Read before the target resolves; also on engines that refuse the call (#1057).
 	MCPReadParamsAhead(Params, { TEXT("assetPath"), TEXT("edits"), TEXT("lodIndex"), TEXT("profileName"), TEXT("restoreRawWeights") });
-#if !(WITH_EDITORONLY_DATA && UE_MCP_HAS_5_4_API)
-	return MCPError(TEXT("set_skeletal_mesh_skin_weights requires an Unreal Editor build on Unreal Engine 5.4 or newer"));
-#else
 	FMCPSkinWeightTarget Target;
 	if (TSharedPtr<FJsonValue> Error = MCPResolveSkinWeightTarget(Params, Target)) return Error;
 
@@ -1168,7 +1330,6 @@ TSharedPtr<FJsonValue> FSkeletalMeshHandlers::SetSkinWeights(const TSharedPtr<FJ
 		MCPSetNoRollback(Result, TEXT("Every selected vertex already held the requested normalized weights, so nothing was written."));
 	}
 	return MCPResult(Result);
-#endif
 }
 
 TSharedPtr<FJsonValue> FSkeletalMeshHandlers::ReadBuildSettings(const TSharedPtr<FJsonObject>& Params)
@@ -1203,10 +1364,9 @@ TSharedPtr<FJsonValue> FSkeletalMeshHandlers::SetOptimizeForInstancing(const TSh
 	// bOptimizeForInstancing is a 5.8 engine feature with no earlier equivalent,
 	// so there is nothing to write and nothing to stand in for it. The action
 	// stays registered and says why, rather than answering "Unknown method".
-	return MCPError(
-		TEXT("set_skeletal_mesh_optimize_for_instancing requires Unreal Engine 5.8 or newer: ")
+	return MCPUnsupportedEngineError(TEXT("set_skeletal_mesh_optimize_for_instancing"), TEXT("5.8"),
 		TEXT("FSkeletalMeshBuildSettings::bOptimizeForInstancing does not exist in this engine, ")
-		TEXT("and no earlier skeletal mesh build setting stands in for it."));
+		TEXT("and no earlier skeletal mesh build setting stands in for it, so there is nothing to set here"));
 #else
 	FString AssetPath;
 	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;

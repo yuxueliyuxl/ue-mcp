@@ -1,3 +1,4 @@
+// @session independent: Process-wide stderr logging.
 /**
  * Structured logging for the ue-mcp server.
  *
@@ -5,16 +6,24 @@
  * line is prefixed with `[ue-mcp]` so it can be filtered in agent transcripts.
  *
  * Levels are filtered by UE_MCP_LOG_LEVEL (debug | info | warn | error).
- * Default is info.
+ * Default is info; a process can lower its own default with setDefaultLogLevel.
  */
 import { readEnv } from "./env.js";
+import { redactCredentials } from "./redact-credentials.js";
 
 type Level = "debug" | "info" | "warn" | "error";
 
 const LEVELS: Record<Level, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
+let defaultLevel: Level = "info";
+
+/** The level used when UE_MCP_LOG_LEVEL is unset. A terminal command wants warnings only. */
+export function setDefaultLogLevel(level: Level): void {
+  defaultLevel = level;
+}
+
 function threshold(): number {
-  const envLevel = (readEnv("logLevel") ?? "info").toLowerCase();
+  const envLevel = (readEnv("logLevel") ?? defaultLevel).toLowerCase();
   return LEVELS[envLevel as Level] ?? LEVELS.info;
 }
 
@@ -25,11 +34,16 @@ export function stampLogs(on = true): void {
   stamped = on;
 }
 
+/**
+ * The one place a log line is built. Every level goes through it, so the
+ * redaction here covers every call site, including an error whose message
+ * quotes a request or its headers (#1866).
+ */
 function fmt(level: Level, component: string, msg: string, err?: unknown): string {
   const detail = err === undefined
     ? ""
     : ` :: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`;
-  return `[ue-mcp] ${stamped ? `${new Date().toISOString()} ` : ""}${level} ${component}: ${msg}${detail}`;
+  return redactCredentials(`[ue-mcp] ${stamped ? `${new Date().toISOString()} ` : ""}${level} ${component}: ${msg}${detail}`);
 }
 
 export function debug(component: string, msg: string, err?: unknown): void {

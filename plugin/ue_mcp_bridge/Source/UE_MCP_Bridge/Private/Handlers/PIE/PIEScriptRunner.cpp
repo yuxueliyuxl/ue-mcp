@@ -9,9 +9,13 @@
 #include "Handlers/PIE/PIEStepActions.h"
 #include "Handlers/PIE/PIERemotePlayers.h"
 #include "Handlers/PIE/PIELog.h"
+#include "Handlers/PIE/PIEWorldResolver.h"
 #include "MCPPIERemoteControl.h"
+#include "MCPPIEActionTrigger.h"
+#include "InputAction.h"
 #include "HandlerWorld.h"
 #include "Editor.h"
+#include "HandlerPlaySession.h"
 #include "Editor/EditorEngine.h"
 #include "HAL/FileManager.h"
 #include "Misc/CoreDelegates.h"
@@ -34,7 +38,7 @@ namespace MCPPIE
 		}
 
 		const TCHAR* ScriptOpNames[] = {
-			TEXT("decreasing"), TEXT("increasing"), TEXT("eq"), TEXT("gt"), TEXT("lt"), TEXT("visible"), TEXT("exists")
+			TEXT("decreasing"), TEXT("increasing"), TEXT("eq"), TEXT("gt"), TEXT("lt"), TEXT("visible"), TEXT("exists"), TEXT("triggered")
 		};
 
 		const TCHAR* ScriptStatusNames[] = {
@@ -68,6 +72,33 @@ namespace MCPPIE
 			return !E.Note.IsEmpty() || E.Captures.Num() > 0;
 		}
 
+		// An Input Action value as its type reads: a boolean, a number, or [x, y] / [x, y, z].
+		TSharedRef<FJsonValue> ScriptActionValueToJson(const FVector& V, const FString& Type)
+		{
+			if (Type == TEXT("bool")) return MakeShared<FJsonValueBoolean>(V.X != 0.0);
+			if (Type == TEXT("axis1d")) return MakeShared<FJsonValueNumber>(V.X);
+			TArray<TSharedPtr<FJsonValue>> A = { MakeShared<FJsonValueNumber>(V.X), MakeShared<FJsonValueNumber>(V.Y) };
+			if (Type != TEXT("axis2d")) A.Add(MakeShared<FJsonValueNumber>(V.Z));
+			return MakeShared<FJsonValueArray>(A);
+		}
+
+		FVector ScriptActionValueFromJson(const TSharedPtr<FJsonValue>& J)
+		{
+			if (!J.IsValid()) return FVector::ZeroVector;
+			if (J->Type == EJson::Boolean) return FVector(J->AsBool() ? 1.0 : 0.0, 0.0, 0.0);
+			if (J->Type == EJson::Number) return FVector(J->AsNumber(), 0.0, 0.0);
+			FVector V = FVector::ZeroVector;
+			if (J->Type == EJson::Array)
+			{
+				const TArray<TSharedPtr<FJsonValue>>& A = J->AsArray();
+				for (int32 I = 0; I < FMath::Min(3, A.Num()); ++I)
+				{
+					if (A[I].IsValid() && A[I]->Type == EJson::Number) V[I] = A[I]->AsNumber();
+				}
+			}
+			return V;
+		}
+
 		TSharedRef<FJsonObject> ScriptEvidenceToJson(const FScriptEvidence& E)
 		{
 			TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
@@ -81,6 +112,12 @@ namespace MCPPIE
 			if (E.VerdictFrame >= 0) O->SetNumberField(TEXT("verdict_frame"), static_cast<double>(E.VerdictFrame));
 			if (E.VerdictAtMs >= 0.0) O->SetNumberField(TEXT("verdict_at_ms"), E.VerdictAtMs);
 			if (!E.Reason.IsEmpty()) O->SetStringField(TEXT("reason"), E.Reason);
+			if (E.bTriggered)
+			{
+				O->SetNumberField(TEXT("triggered_at_ms"), E.TriggeredAtMs);
+				O->SetField(TEXT("action_value"), ScriptActionValueToJson(E.TriggerValue, E.TriggerValueType));
+				if (!E.TriggerValueType.IsEmpty()) O->SetStringField(TEXT("value_type"), E.TriggerValueType);
+			}
 			ScriptVerdictEvidenceToJson(E, O);
 			return O;
 		}
@@ -97,6 +134,12 @@ namespace MCPPIE
 			if (O->TryGetNumberField(TEXT("verdict_frame"), Frame)) E.VerdictFrame = static_cast<int64>(Frame);
 			O->TryGetNumberField(TEXT("verdict_at_ms"), E.VerdictAtMs);
 			O->TryGetStringField(TEXT("reason"), E.Reason);
+			E.bTriggered = O->TryGetNumberField(TEXT("triggered_at_ms"), E.TriggeredAtMs);
+			if (E.bTriggered)
+			{
+				O->TryGetStringField(TEXT("value_type"), E.TriggerValueType);
+				E.TriggerValue = ScriptActionValueFromJson(O->TryGetField(TEXT("action_value")));
+			}
 			O->TryGetStringField(TEXT("note"), E.Note);
 			const TArray<TSharedPtr<FJsonValue>>* Captures = nullptr;
 			if (O->TryGetArrayField(TEXT("captures"), Captures) && Captures)
@@ -111,6 +154,8 @@ namespace MCPPIE
 
 		int32 ScriptEffectiveWithinMs(const FScriptStepDef& Def, int32 DefaultWithinMs)
 		{
+			// A person may take as long as they like: triggered without within_ms waits with no timeout (0).
+			if (Def.bHasExpect && IsScriptTriggerOp(Def.Expect.Op)) return FMath::Max(0, Def.Expect.WithinMs);
 			if (Def.bHasExpect && Def.Expect.WithinMs > 0) return Def.Expect.WithinMs;
 			return DefaultWithinMs > 0 ? DefaultWithinMs : 5000;
 		}
@@ -182,7 +227,7 @@ namespace MCPPIE
 			if (St.WindowStartMs >= 0.0)
 			{
 				D->SetNumberField(TEXT("window_start_ms"), St.WindowStartMs);
-				D->SetNumberField(TEXT("window_end_ms"), St.WindowEndMs);
+				if (St.WindowEndMs >= 0.0) D->SetNumberField(TEXT("window_end_ms"), St.WindowEndMs);
 			}
 			AddScriptEvent(Run, TEXT("step_started"), Index, D);
 
@@ -285,10 +330,60 @@ namespace MCPPIE
 			return Out.Num() > 0;
 		}
 
-		void ScriptEvaluateRunningStep(FScriptRun& Run, int32 Index, FScriptValueReader Reader)
+		// A triggered step: passes on the first fresh trigger inside its window, fails once within_ms runs out
+		// (never, with within_ms 0). Triggers before the window opened, at the end of act, do not count.
+		void ScriptEvaluateTriggeredStep(FScriptRun& Run, int32 Index, IScriptTriggerSource* Triggers)
 		{
 			FScriptStepRun& St = Run.Steps[Index];
 			const FScriptExpect& E = St.Def.Expect;
+			const double FromMs = St.ExpectFromMs();
+			FScriptTrigger Trigger;
+			FString Why;
+			const EScriptTriggerRead Read = Triggers
+				? Triggers->ReadTrigger(Index, E, FromMs, Trigger, Why)
+				: EScriptTriggerRead::Unwatched;
+			if (!Triggers) Why = TEXT("nothing watches input in this run");
+			if (Read != EScriptTriggerRead::Unwatched)
+			{
+				St.Evidence.Samples++;
+				St.Evidence.bObserved = true;
+			}
+			else if (!Why.IsEmpty())
+			{
+				St.Evidence.Reason = Why;
+			}
+			const bool bInWindow = Read == EScriptTriggerRead::Triggered && Trigger.AtMs >= FromMs
+				&& (St.WithinMs <= 0 || Trigger.AtMs - FromMs <= St.WithinMs);
+			if (bInWindow)
+			{
+				St.Evidence.bTriggered = true;
+				St.Evidence.TriggeredAtMs = Trigger.AtMs;
+				St.Evidence.TriggerValue = Trigger.Value;
+				St.Evidence.TriggerValueType = Trigger.ValueType;
+				ScriptSettleStep(Run, Index, EScriptStepStatus::Passed, FString());
+				if (Triggers) Triggers->EndWatch(Index);
+				return;
+			}
+			if (St.WithinMs > 0 && Run.NowMs - FromMs >= St.WithinMs)
+			{
+				const FString Reason = St.Evidence.bObserved
+					? FString::Printf(TEXT("%s was not triggered by client %d within %d ms"), *E.Value, E.Client, St.WithinMs)
+					: FString::Printf(TEXT("%s on client %d could not be watched within %d ms: %s"), *E.Value, E.Client, St.WithinMs,
+						Why.IsEmpty() ? TEXT("no player to watch") : *Why);
+				ScriptSettleStep(Run, Index, EScriptStepStatus::Failed, Reason);
+				if (Triggers) Triggers->EndWatch(Index);
+			}
+		}
+
+		void ScriptEvaluateRunningStep(FScriptRun& Run, int32 Index, FScriptValueReader Reader, IScriptTriggerSource* Triggers)
+		{
+			FScriptStepRun& St = Run.Steps[Index];
+			const FScriptExpect& E = St.Def.Expect;
+			if (IsScriptTriggerOp(E.Op))
+			{
+				ScriptEvaluateTriggeredStep(Run, Index, Triggers);
+				return;
+			}
 			double Current = 0.0;
 			const bool bObserved = Reader(E, Current);
 			if (bObserved)
@@ -456,6 +551,22 @@ namespace MCPPIE
 		return Op == EScriptExpectOp::Eq || Op == EScriptExpectOp::Gt || Op == EScriptExpectOp::Lt;
 	}
 
+	bool IsScriptTriggerOp(EScriptExpectOp Op)
+	{
+		return Op == EScriptExpectOp::Triggered;
+	}
+
+	FString NormalizeScriptInputActionPath(const FString& Path)
+	{
+		const FString Trimmed = Path.TrimStartAndEnd();
+		if (!Trimmed.StartsWith(TEXT("/"))) return Trimmed;
+		int32 LastSlash = INDEX_NONE;
+		Trimmed.FindLastChar(TEXT('/'), LastSlash);
+		const FString Leaf = Trimmed.Mid(LastSlash + 1);
+		if (Leaf.IsEmpty() || Leaf.Contains(TEXT("."))) return Trimmed;
+		return Trimmed + TEXT(".") + Leaf;
+	}
+
 	bool IsScriptStepSettled(EScriptStepStatus Status)
 	{
 		return Status == EScriptStepStatus::Passed
@@ -570,7 +681,7 @@ namespace MCPPIE
 		else if (bWrongType)
 		{
 			Field = TEXT("act");
-			OutError = FString::Printf(TEXT("%s.act must be an array of step actions (tape, press, hold, inject, console, place, capture, wait_ms)"), *Where);
+			OutError = FString::Printf(TEXT("%s.act must be an array of step actions (tape, press, hold, inject, console, place, capture, key, wait_ms)"), *Where);
 			return false;
 		}
 
@@ -604,33 +715,64 @@ namespace MCPPIE
 		if (!Exp->TryGetStringField(TEXT("op"), Op) || Op.IsEmpty())
 		{
 			Field = TEXT("expect.op");
-			OutError = FString::Printf(TEXT("%s.expect.op is required (decreasing, increasing, eq, gt, lt, visible, exists)"), *Where);
+			OutError = FString::Printf(TEXT("%s.expect.op is required (decreasing, increasing, eq, gt, lt, visible, exists, triggered)"), *Where);
 			return false;
 		}
 		if (!ParseScriptExpectOp(Op, Out.Expect.Op))
 		{
 			Field = TEXT("expect.op");
-			OutError = FString::Printf(TEXT("%s.expect.op '%s' is unknown (decreasing, increasing, eq, gt, lt, visible, exists)"), *Where, *Op);
+			OutError = FString::Printf(TEXT("%s.expect.op '%s' is unknown (decreasing, increasing, eq, gt, lt, visible, exists, triggered)"), *Where, *Op);
 			return false;
 		}
+		const bool bTriggerOp = IsScriptTriggerOp(Out.Expect.Op);
 		if (!Exp->TryGetStringField(TEXT("value"), Out.Expect.Value) || Out.Expect.Value.TrimStartAndEnd().IsEmpty())
 		{
 			Field = TEXT("expect.value");
 			OutError = FString::Printf(TEXT("%s.expect.value is required for op '%s' (%s)"), *Where, *Op,
 				Out.Expect.Op == EScriptExpectOp::Visible ? TEXT("a widget class or name")
 				: Out.Expect.Op == EScriptExpectOp::Exists ? TEXT("an actor id")
+				: bTriggerOp ? TEXT("an Input Action asset path, such as /Game/Input/IA_Interact")
 				: TEXT("a tracked value path"));
 			return false;
 		}
 		Out.Expect.Value.TrimStartAndEndInline();
+		if (bTriggerOp) Out.Expect.Value = NormalizeScriptInputActionPath(Out.Expect.Value);
+
+		const TSharedPtr<FJsonValue> ClientValue = Exp->TryGetField(TEXT("client"));
+		if (ClientValue.IsValid() && !ClientValue->IsNull())
+		{
+			if (!bTriggerOp)
+			{
+				Field = TEXT("expect.client");
+				OutError = FString::Printf(TEXT("%s.expect.client applies to op 'triggered', the player whose input is watched"), *Where);
+				return false;
+			}
+			if (ClientValue->Type != EJson::Number || ClientValue->AsNumber() < 0.0
+				|| ClientValue->AsNumber() != FMath::RoundToDouble(ClientValue->AsNumber()))
+			{
+				Field = TEXT("expect.client");
+				OutError = FString::Printf(TEXT("%s.expect.client must be a non-negative integer (0 the editor's own player, 1..N a remote player)"), *Where);
+				return false;
+			}
+			Out.Expect.Client = static_cast<int32>(FMath::Min(ClientValue->AsNumber(), 1024.0));
+		}
 
 		const TSharedPtr<FJsonValue> TargetValue = Exp->TryGetField(TEXT("target"));
+		if (TargetValue.IsValid() && !TargetValue->IsNull() && bTriggerOp)
+		{
+			Field = TEXT("expect.target");
+			OutError = FString::Printf(TEXT("%s.expect.target does not apply to op 'triggered'; the step passes when the action fires"), *Where);
+			return false;
+		}
 		if (TargetValue.IsValid() && !TargetValue->IsNull())
 		{
-			if (IsScriptRelativeOp(Out.Expect.Op))
+			// On decreasing and increasing, target is the least change from
+			// the value at step start ("x dropped by at least 300").
+			if (IsScriptRelativeOp(Out.Expect.Op)
+				&& (TargetValue->Type != EJson::Number || TargetValue->AsNumber() <= 0.0))
 			{
 				Field = TEXT("expect.target");
-				OutError = FString::Printf(TEXT("%s.expect.target does not apply to op '%s', which compares against the value at step start"), *Where, *Op);
+				OutError = FString::Printf(TEXT("%s.expect.target on op '%s' is the least change from the value at step start, a number above 0"), *Where, *Op);
 				return false;
 			}
 			if (TargetValue->Type == EJson::Boolean)
@@ -700,6 +842,7 @@ namespace MCPPIE
 			else E->SetNumberField(TEXT("target"), Expect.Target);
 		}
 		if (Expect.WithinMs > 0) E->SetNumberField(TEXT("within_ms"), Expect.WithinMs);
+		if (IsScriptTriggerOp(Expect.Op) && Expect.Client > 0) E->SetNumberField(TEXT("client"), Expect.Client);
 		return E;
 	}
 
@@ -738,6 +881,7 @@ namespace MCPPIE
 			D.Expect.bHasTarget = S.Expect.bHasTarget;
 			D.Expect.Target = S.Expect.Target;
 			D.Expect.WithinMs = FMath::Max(0, S.Expect.WithinMs);
+			D.Expect.Client = IsScriptTriggerOp(D.Expect.Op) ? FMath::Max(0, S.Expect.Client) : 0;
 			D.bAgentJudgeable = D.Judge != EScriptJudge::Manual || S.bAgentJudgeable;
 			D.Arrange = ScriptJsonArrayFromString(S.ArrangeJson);
 			D.Act = ScriptJsonArrayFromString(S.ActJson);
@@ -761,6 +905,7 @@ namespace MCPPIE
 			S.Expect.bHasTarget = D.Expect.bHasTarget;
 			S.Expect.Target = D.Expect.Target;
 			S.Expect.WithinMs = D.Expect.WithinMs;
+			S.Expect.Client = D.Expect.Client;
 			S.bAgentJudgeable = D.bAgentJudgeable;
 			S.bResolveInPIE = D.bResolveInPIE;
 			S.ArrangeJson = ScriptJsonArrayToString(D.Arrange);
@@ -798,9 +943,14 @@ namespace MCPPIE
 			case EScriptExpectOp::Exists:
 				OutActors.AddUnique(S.Expect.Value);
 				break;
+			case EScriptExpectOp::Triggered:
+				// The trigger source watches the player's input; the observer reads nothing for it.
+				break;
 			default:
 			{
-				const bool bCovered = ProfileValuePaths.ContainsByPredicate([&S](const FString& P)
+				// A pawn channel is read off the sampled pawn state, not tracked.
+				const bool bCovered = IsPawnChannelName(S.Expect.Value)
+					|| ProfileValuePaths.ContainsByPredicate([&S](const FString& P)
 				{
 					return TrackedValuePathMatches(P, S.Expect.Value);
 				});
@@ -822,8 +972,8 @@ namespace MCPPIE
 	{
 		switch (Expect.Op)
 		{
-		case EScriptExpectOp::Decreasing: return Current < AtStart;
-		case EScriptExpectOp::Increasing: return Current > AtStart;
+		case EScriptExpectOp::Decreasing: return Expect.bHasTarget ? AtStart - Current >= Expect.Target : Current < AtStart;
+		case EScriptExpectOp::Increasing: return Expect.bHasTarget ? Current - AtStart >= Expect.Target : Current > AtStart;
 		case EScriptExpectOp::Eq:
 		{
 			const double Tolerance = FMath::Max(1e-4, 1e-4 * FMath::Max(FMath::Abs(Current), FMath::Abs(Expect.Target)));
@@ -834,6 +984,9 @@ namespace MCPPIE
 		case EScriptExpectOp::Visible:
 		case EScriptExpectOp::Exists:
 			return (Current != 0.0) == ScriptExpectTargetBool(Expect);
+		case EScriptExpectOp::Triggered:
+			// Judged from the trigger source, not a value.
+			return false;
 		}
 		return false;
 	}
@@ -921,7 +1074,8 @@ namespace MCPPIE
 		return true;
 	}
 
-	void AdvanceScriptRun(FScriptRun& Run, double NowMs, int64 Frame, FScriptValueReader Reader, IScriptStepDriver* Driver)
+	void AdvanceScriptRun(FScriptRun& Run, double NowMs, int64 Frame, FScriptValueReader Reader, IScriptStepDriver* Driver,
+		IScriptTriggerSource* Triggers)
 	{
 		if (Run.State != EScriptRunState::Running && Run.State != EScriptRunState::AwaitingVerdict) return;
 		Run.NowMs = NowMs;
@@ -986,7 +1140,7 @@ namespace MCPPIE
 				Run.State = EScriptRunState::Running;
 				return;
 			}
-			if (Run.Steps[I].Status == EScriptStepStatus::Running) ScriptEvaluateRunningStep(Run, I, Reader);
+			if (Run.Steps[I].Status == EScriptStepStatus::Running) ScriptEvaluateRunningStep(Run, I, Reader, Triggers);
 			if (Run.Steps[I].Status == EScriptStepStatus::Running)
 			{
 				Run.State = EScriptRunState::Running;
@@ -997,7 +1151,7 @@ namespace MCPPIE
 		Run.State = ScriptAwaitingSteps(Run).Num() > 0 ? EScriptRunState::AwaitingVerdict : EScriptRunState::Running;
 	}
 
-	void AdvanceScriptReplay(FScriptRun& Run, double NowMs, int64 Frame, FScriptValueReader Reader)
+	void AdvanceScriptReplay(FScriptRun& Run, double NowMs, int64 Frame, FScriptValueReader Reader, IScriptTriggerSource* Triggers)
 	{
 		if (Run.State != EScriptRunState::Running) return;
 		Run.NowMs = NowMs;
@@ -1018,7 +1172,7 @@ namespace MCPPIE
 			}
 			if (Run.Steps[I].Status == EScriptStepStatus::Running)
 			{
-				ScriptEvaluateRunningStep(Run, I, Reader);
+				ScriptEvaluateRunningStep(Run, I, Reader, Triggers);
 			}
 			if (!IsScriptStepSettled(Run.Steps[I].Status)) FirstUnsettled = FMath::Min(FirstUnsettled, I);
 		}
@@ -1134,7 +1288,14 @@ namespace MCPPIE
 				St.Act.EndedAtMs = Run.NowMs;
 				St.Act.Reason = Reason;
 			}
-			if (St.Status == EScriptStepStatus::Running)
+			if (St.Status == EScriptStepStatus::Running && St.Def.bHasExpect && IsScriptTriggerOp(St.Def.Expect.Op))
+			{
+				ScriptSettleStep(Run, I, EScriptStepStatus::Failed, St.Evidence.bObserved
+					? FString::Printf(TEXT("%s; %s was not triggered"), *Reason, *St.Def.Expect.Value)
+					: FString::Printf(TEXT("%s; %s was never watched%s%s"), *Reason, *St.Def.Expect.Value,
+						St.Evidence.Reason.IsEmpty() ? TEXT("") : TEXT(": "), *St.Evidence.Reason));
+			}
+			else if (St.Status == EScriptStepStatus::Running)
 			{
 				ScriptSettleStep(Run, I, EScriptStepStatus::Failed, St.Evidence.bObserved || !St.Def.bHasExpect
 					? Reason
@@ -1234,7 +1395,7 @@ namespace MCPPIE
 		if (St.WindowStartMs >= 0.0)
 		{
 			O->SetNumberField(TEXT("window_start_ms"), St.WindowStartMs);
-			O->SetNumberField(TEXT("window_end_ms"), St.WindowEndMs);
+			if (St.WindowEndMs >= 0.0) O->SetNumberField(TEXT("window_end_ms"), St.WindowEndMs);
 		}
 		if (St.Act.State != EScriptActState::None) O->SetObjectField(TEXT("act_result"), ScriptActReportToJson(St.Act));
 		return O;
@@ -1460,7 +1621,8 @@ namespace MCPPIE
 			}
 			// The window opened when the source step's act ended.
 			St.WindowStartMs = Src.ExpectFromMs() + OffsetMs;
-			St.WindowEndMs = St.WindowStartMs + St.WithinMs;
+			// A triggered step with no timeout has an open window.
+			St.WindowEndMs = St.WithinMs > 0 ? St.WindowStartMs + St.WithinMs : -1.0;
 		}
 	}
 
@@ -1497,7 +1659,11 @@ namespace MCPPIE
 		class FEditorScriptStepDriver : public IScriptStepDriver
 		{
 		public:
-			explicit FEditorScriptStepDriver(const FString& InCaptureRoot) : CaptureRoot(InCaptureRoot) {}
+			FEditorScriptStepDriver(const FString& InCaptureRoot, int32 PIEInstance, int32 LocalPlayer) : CaptureRoot(InCaptureRoot)
+			{
+				Runner.OwnPIEInstance = PIEInstance;
+				Runner.OwnLocalPlayer = LocalPlayer;
+			}
 
 			virtual bool BeginAct(int32 Index, const FScriptStepDef& Def, double NowMs, FScriptActReport& Report) override
 			{
@@ -1604,6 +1770,7 @@ namespace MCPPIE
 					A->SetStringField(TEXT("action"), R.Verb);
 					A->SetBoolField(TEXT("ok"), R.bOk);
 					if (!R.Error.IsEmpty()) A->SetStringField(TEXT("error"), R.Error);
+					if (!R.Target.IsEmpty()) A->SetStringField(TEXT("target"), R.Target);
 					A->SetNumberField(TEXT("at_ms"), NowMs);
 					Report.Actions.Add(MakeShared<FJsonValueObject>(A));
 				}
@@ -1623,6 +1790,172 @@ namespace MCPPIE
 			double SettleDeadline = 0.0;
 		};
 	}
+
+	// ── Input Action triggers in the editor ─────────────────────────────
+
+	/**
+	 * Watches the Input Actions triggered steps name. Client 0, the editor's own player, is read here once per
+	 * frame; a remote player (client 1..N) reads its own player through its UMCPPIERemoteControl and reports the
+	 * trigger, which is timed when the editor hears of it. Either way a trigger counts only after a frame without
+	 * one (FActionTriggerGate), so input still down when the window opens does not pass the step.
+	 */
+	class FEditorScriptTriggerSource : public IScriptTriggerSource
+	{
+	public:
+		FEditorScriptTriggerSource(int32 InOwnPIEInstance, int32 InOwnLocalPlayer)
+			: OwnPIEInstance(InOwnPIEInstance), OwnLocalPlayer(InOwnLocalPlayer) {}
+
+		virtual EScriptTriggerRead ReadTrigger(int32 Index, const FScriptExpect& Expect, double FromMs,
+			FScriptTrigger& OutTrigger, FString& OutWhy) override
+		{
+			FWatch* W = Watches.Find(Index);
+			if (!W)
+			{
+				W = &Watches.Add(Index);
+				W->Expect = Expect;
+				W->Path = FSoftObjectPath(Expect.Value);
+				W->FromMs = FromMs;
+			}
+			if (W->bTriggered)
+			{
+				OutTrigger = W->Trigger;
+				return EScriptTriggerRead::Triggered;
+			}
+			OutWhy = W->Why;
+			return W->bWatching ? EScriptTriggerRead::Watching : EScriptTriggerRead::Unwatched;
+		}
+
+		virtual void EndWatch(int32 Index) override
+		{
+			if (FWatch* W = Watches.Find(Index))
+			{
+				StopRemote(*W);
+				Watches.Remove(Index);
+			}
+		}
+
+		virtual void Cancel() override
+		{
+			for (TPair<int32, FWatch>& P : Watches) StopRemote(P.Value);
+			Watches.Reset();
+		}
+
+		// Once per engine frame while the run observes. NowMs is the run clock on this frame.
+		void Poll(double NowMs)
+		{
+			for (TPair<int32, FWatch>& P : Watches)
+			{
+				FWatch& W = P.Value;
+				if (W.bTriggered) continue;
+				if (W.Expect.Client > 0) PollRemote(W, NowMs);
+				else PollLocal(W, NowMs);
+			}
+		}
+
+	private:
+		struct FWatch
+		{
+			FScriptExpect Expect;
+			FSoftObjectPath Path;
+			double FromMs = 0.0;
+			TWeakObjectPtr<const UInputAction> Action;
+			FActionTriggerGate Gate;
+			bool bWatching = false;
+			bool bTriggered = false;
+			FScriptTrigger Trigger;
+			FString Why;
+			FString RemoteId;
+			TWeakObjectPtr<UMCPPIERemoteControl> Remote;
+		};
+
+		static const UInputAction* LoadWatchedAction(FWatch& W)
+		{
+			const UInputAction* Action = W.Action.Get();
+			if (!Action)
+			{
+				Action = Cast<UInputAction>(W.Path.TryLoad());
+				W.Action = Action;
+			}
+			if (!Action) W.Why = FString::Printf(TEXT("no Input Action loads from %s"), *W.Path.ToString());
+			return Action;
+		}
+
+		void PollLocal(FWatch& W, double NowMs)
+		{
+			const UInputAction* Action = LoadWatchedAction(W);
+			FString Err;
+			// The same player an act with no client drives.
+			ULocalPlayer* LocalPlayer = Action ? PIERemotePlayers::FindOwnLocalPlayer(OwnPIEInstance, OwnLocalPlayer, Err) : nullptr;
+			bool bTriggered = false;
+			FVector Value = FVector::ZeroVector;
+			if (!Action) { W.bWatching = false; return; }
+			if (!LocalPlayer || !ReadActionTriggerState(LocalPlayer, Action, bTriggered, Value, Err))
+			{
+				W.bWatching = false;
+				W.Why = Err.IsEmpty() ? FString(TEXT("the editor's own player is not in PIE")) : Err;
+				return;
+			}
+			W.bWatching = true;
+			W.Why.Reset();
+			if (W.Gate.Feed(bTriggered)) Fire(W, NowMs, Value, Action);
+		}
+
+		void PollRemote(FWatch& W, double NowMs)
+		{
+			const UInputAction* Action = LoadWatchedAction(W);
+			if (!Action) { W.bWatching = false; return; }
+			UMCPPIERemoteControl* Remote = W.Remote.Get();
+			if (!Remote || W.RemoteId.IsEmpty())
+			{
+				// Not sent yet, or the player left: (re)send once the remote player is ready.
+				FString Err;
+				Remote = PIERemotePlayers::Find(W.Expect.Client, Err);
+				if (!Remote)
+				{
+					W.bWatching = false;
+					W.Why = Err;
+					return;
+				}
+				W.Remote = Remote;
+				W.RemoteId = PIERemotePlayers::NewId(TEXT("watch"));
+				Remote->SendWatchTrigger(W.RemoteId, FSoftObjectPath(Action));
+				W.Why = FString::Printf(TEXT("waiting for client %d to start watching"), W.Expect.Client);
+				return;
+			}
+			if (const FMCPPIERemoteTrigger* T = Remote->FindTrigger(W.RemoteId))
+			{
+				W.bWatching = true;
+				Fire(W, NowMs, T->Value, Action);
+				return;
+			}
+			if (const FMCPPIERemoteResult* R = Remote->FindResult(W.RemoteId))
+			{
+				W.bWatching = R->bOk;
+				W.Why = R->bOk ? FString() : FString::Printf(TEXT("client %d could not watch it: %s"), W.Expect.Client, *R->Error);
+			}
+		}
+
+		static void Fire(FWatch& W, double NowMs, const FVector& Value, const UInputAction* Action)
+		{
+			W.bTriggered = true;
+			W.Trigger.AtMs = FMath::Max(NowMs, W.FromMs);
+			W.Trigger.Value = Value;
+			W.Trigger.ValueType = ActionValueTypeName(Action);
+			UE_LOG(LogMCPPIE, Log, TEXT("[PIE-SCRIPT] %s triggered on client %d at %.0f ms"), *W.Path.ToString(), W.Expect.Client, W.Trigger.AtMs);
+		}
+
+		static void StopRemote(FWatch& W)
+		{
+			if (UMCPPIERemoteControl* Remote = W.Remote.Get())
+			{
+				if (!W.RemoteId.IsEmpty() && !W.bTriggered) Remote->SendStopWatch(W.RemoteId);
+			}
+		}
+
+		TMap<int32, FWatch> Watches;
+		int32 OwnPIEInstance = INDEX_NONE;
+		int32 OwnLocalPlayer = 0;
+	};
 
 	// ── Runner ──────────────────────────────────────────────────────────
 
@@ -1698,8 +2031,8 @@ namespace MCPPIE
 	void FPIEScriptRunner::AdvanceNow()
 	{
 		auto Reader = [this](const FScriptExpect& E, double& V) { return ReadLive(E, V); };
-		if (Run.bReplay) AdvanceScriptReplay(Run, Run.NowMs, Run.Frame, Reader);
-		else AdvanceScriptRun(Run, Run.NowMs, Run.Frame, Reader, StepDriver.Get());
+		if (Run.bReplay) AdvanceScriptReplay(Run, Run.NowMs, Run.Frame, Reader, TriggerSource.Get());
+		else AdvanceScriptRun(Run, Run.NowMs, Run.Frame, Reader, StepDriver.Get(), TriggerSource.Get());
 		if (IsScriptRunSettled(Run))
 		{
 			Finish(EScriptRunState::Finished, TEXT("all steps settled"));
@@ -1817,7 +2150,9 @@ namespace MCPPIE
 		}
 
 		NewRun.State = EScriptRunState::Armed;
-		StepDriver = MakeShared<FEditorScriptStepDriver>(NewRun.OutputDir);
+		// An act entry with no client, and a triggered step on client 0, use the player the run observes.
+		StepDriver = MakeShared<FEditorScriptStepDriver>(NewRun.OutputDir, Cfg.PIEInstance, Cfg.ClientId);
+		TriggerSource = MakeShared<FEditorScriptTriggerSource>(Cfg.PIEInstance, Cfg.ClientId);
 		Run = MoveTemp(NewRun);
 		bHasRun = true;
 
@@ -1831,8 +2166,7 @@ namespace MCPPIE
 
 		if (Cfg.bStartPIE && GEditor && !GEditor->PlayWorld)
 		{
-			FRequestPlaySessionParams PlayParams;
-			GEditor->RequestPlaySession(PlayParams);
+			MCPPlaySession::Request(/*bNeedsEditorWorld=*/true);
 			Run.bStartedPIE = true;
 		}
 		BindEndFrame();
@@ -1856,7 +2190,7 @@ namespace MCPPIE
 		}
 		if (GEditor->PlayWorld)
 		{
-			OutError = TEXT("A PIE session is running; stop it before pie_script_replay");
+			OutError = TEXT("A PIE session is running; stop it before pie_script_replay. ") + MCPStopPlayInEditorStep();
 			return false;
 		}
 
@@ -1955,6 +2289,7 @@ namespace MCPPIE
 		NewRun.bOwnsReplayer = true;
 		NewRun.bEndPIEWhenSettled = Cfg.bAutoStopPIE;
 		NewRun.State = EScriptRunState::Armed;
+		TriggerSource = MakeShared<FEditorScriptTriggerSource>(Cfg.PIEInstance, Cfg.ClientId);
 		Run = MoveTemp(NewRun);
 		bHasRun = true;
 
@@ -1967,8 +2302,7 @@ namespace MCPPIE
 		D->SetStringField(TEXT("observation_run_id"), Run.ObservationRunId);
 		AddScriptEvent(Run, TEXT("run_started"), -1, D);
 
-		FRequestPlaySessionParams PlayParams;
-		GEditor->RequestPlaySession(PlayParams);
+		MCPPlaySession::Request(/*bNeedsEditorWorld=*/true);
 		Run.bStartedPIE = true;
 		BindEndFrame();
 
@@ -2041,7 +2375,11 @@ namespace MCPPIE
 			Finish(EScriptRunState::Finished, Err.IsEmpty() ? FString(TEXT("observation ended")) : Err);
 			return;
 		}
+		Run.WaitingFor = Clock.WaitingFor;
 		if (Clock.State != EObserverState::Observing || Clock.FramesSampled == 0) return;
+
+		// Every frame, sampled or not, so a trigger that lasts one frame is not missed.
+		if (TriggerSource.IsValid()) TriggerSource->Poll(Clock.ElapsedSeconds * 1000.0);
 
 		const int64 Frame = static_cast<int64>(Clock.LastFrame);
 		if (Run.bClockStarted && Frame == Run.Frame) return;
@@ -2072,6 +2410,11 @@ namespace MCPPIE
 		{
 			StepDriver->Cancel();
 			StepDriver.Reset();
+		}
+		if (TriggerSource.IsValid())
+		{
+			TriggerSource->Cancel();
+			TriggerSource.Reset();
 		}
 		SettleUnfinishedScriptSteps(Run, FString::Printf(TEXT("run ended before the step settled (%s)"), *Reason));
 
@@ -2104,6 +2447,7 @@ namespace MCPPIE
 
 		Run.State = FinalState;
 		Run.StopReason = Reason;
+		Run.WaitingFor.Reset();
 		Run.EndedAt = ScriptNowIso();
 		if (Run.StartedAt.IsEmpty()) Run.StartedAt = Run.EndedAt;
 

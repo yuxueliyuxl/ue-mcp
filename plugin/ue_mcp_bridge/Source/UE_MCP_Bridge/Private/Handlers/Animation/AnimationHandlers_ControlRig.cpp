@@ -21,20 +21,14 @@
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UObjectHash.h"
 
-// UControlRigBlueprint lives in ControlRigBlueprintLegacy.h from 5.7 and in
-// ControlRigBlueprint.h before it; the factory needs the complete type.
-#if __has_include("ControlRigBlueprintLegacy.h")
+// The factory needs the complete UControlRigBlueprint type.
+#if UE_MCP_HAS_CONTROL_RIG_BLUEPRINT_LEGACY_HEADER
 #include "ControlRigBlueprintLegacy.h"
-#elif __has_include("ControlRigBlueprint.h")
+#elif UE_MCP_HAS_CONTROL_RIG_BLUEPRINT_TYPE
 #include "ControlRigBlueprint.h"
 #endif
-#ifndef MCP_HAS_CONTROL_RIG_BLUEPRINT_FACTORY
-#if __has_include("ControlRigBlueprintFactory.h")
+#if UE_MCP_HAS_CONTROL_RIG_BLUEPRINT_FACTORY
 #include "ControlRigBlueprintFactory.h"
-#define MCP_HAS_CONTROL_RIG_BLUEPRINT_FACTORY 1
-#else
-#define MCP_HAS_CONTROL_RIG_BLUEPRINT_FACTORY 0
-#endif
 #endif
 
 #include "RigVMModel/RigVMGraph.h"
@@ -115,7 +109,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadControlRigGraph(const TSharedPtr<
 	// URigVMGraph. That is version-tolerant and needs no editor-only host API.
 	// Through the shared helper, not a local #if: GetObjectsWithOuter takes
 	// EGetObjectsFlags in 5.8 and a bool before it, and the version gate for
-	// that lives in exactly one place (Public/HandlerUtils.h).
+	// that lives in exactly one place (HandlerUtils.h).
 	TArray<UObject*> Subobjects;
 	MCPGetNestedSubobjects(Blueprint, Subobjects);
 
@@ -303,7 +297,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateControlRig(const TSharedPtr<FJs
 	}
 
 	UObject* Created = nullptr;
-#if MCP_HAS_CONTROL_RIG_BLUEPRINT_FACTORY
+#if UE_MCP_HAS_CONTROL_RIG_BLUEPRINT_FACTORY
 	Created = UControlRigBlueprintFactory::CreateControlRigFromSkeletalMeshOrSkeleton(Source);
 #endif
 	if (!Created)
@@ -367,7 +361,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetControlRigPreviewMesh(const TShare
 	if (PathErr) return PathErr;
 	if (MeshErr) return MeshErr;
 
-#if __has_include("ControlRigBlueprintLegacy.h") || __has_include("ControlRigBlueprint.h")
+#if UE_MCP_HAS_CONTROL_RIG_BLUEPRINT_TYPE
 	UObject* Loaded = MCPLoadAssetObject(AssetPath);
 	UControlRigBlueprint* Rig = Cast<UControlRigBlueprint>(Loaded);
 	if (!Rig) return Loaded ? MCPAssetWrongTypeError(AssetPath, Loaded, TEXT("ControlRigBlueprint")) : MCPAssetNotFoundError(AssetPath);

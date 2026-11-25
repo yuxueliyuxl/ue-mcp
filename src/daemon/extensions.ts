@@ -1,3 +1,4 @@
+// @session independent: Loads extensions from the user's extensions directory and matches their routes. No editor is involved.
 /**
  * Daemon extensions: modules the daemon loads at startup from the extensions
  * directory, each handed a versioned API. The open daemon is complete without
@@ -16,8 +17,8 @@ import { pathToFileURL } from "node:url";
 import { info, warn } from "../core/log.js";
 import { ENV_VARS, readEnv } from "../core/env.js";
 import { userDir } from "../core/user-dir.js";
-import type { DaemonExtension, DaemonExtensionApi, ExtensionHandler, ExtensionResponse } from "./extension-api.js";
-import { extensionRefusal, type ExtensionManifest, type RefusedExtension } from "./extension-api.js";
+import { EXTENSION_PERMISSIONS, type DaemonExtension, type DaemonExtensionApi, type ExtensionHandler, type ExtensionManifest, type ExtensionPermission, type ExtensionResponse, type RefusedExtension } from "../contract/daemon.js";
+import { extensionRefusal } from "./extension-manifest.js";
 import { packageVersion } from "../core/package-root.js";
 import {
   chooseVersion,
@@ -34,6 +35,20 @@ export function extensionsDir(): string {
   return readEnv("extensionsDir") ?? path.join(userDir(), "extensions");
 }
 
+type Refusal = NonNullable<ReturnType<typeof extensionRefusal>>;
+
+/**
+ * The version gate install and load share: extensionRefusal, except that
+ * UE_MCP_EXTENSION_FLOOR=warn lets an extension needing a newer ue-mcp through
+ * (a development daemon whose package version trails its code). `waived` is
+ * the refusal let through that way, for the caller to warn about.
+ */
+export function extensionGate(name: string, ext: ExtensionManifest | undefined, installed: string = packageVersion()): { refusal: Refusal | null; waived: Refusal | null } {
+  const refusal = extensionRefusal(name, ext, installed);
+  if (refusal?.needsUeMcp && readEnv("extensionFloor") === "warn") return { refusal: null, waived: refusal };
+  return { refusal, waived: null };
+}
+
 interface Route {
   method: string;
   path: string;
@@ -45,6 +60,8 @@ export interface LoadedExtension {
   version: string;
   /** The oldest UI bundle version it works with. */
   uiMin?: string;
+  /** false when its bundles stay out of /ui/ (`ueMcpExtension.ui.root`). */
+  uiRoot?: false;
   routes: Route[];
   busy: () => boolean;
   dispose?: () => void | Promise<void>;
@@ -56,6 +73,20 @@ interface ExtensionPackage {
   version: string;
   main: string;
   uiMin?: string;
+  uiRoot?: false;
+  permissions?: ExtensionPermission[];
+}
+
+/** The declared permissions this daemon knows (undefined when the manifest declares none at all); an unknown one is named in the log and ignored. */
+function declaredPermissions(name: string, declared: unknown): ExtensionPermission[] | undefined {
+  if (declared === undefined) return undefined;
+  const list = Array.isArray(declared) ? declared : [declared];
+  const known = list.filter((p): p is ExtensionPermission => (EXTENSION_PERMISSIONS as readonly unknown[]).includes(p));
+  const unknown = list.filter((p) => !known.includes(p as ExtensionPermission));
+  if (unknown.length) {
+    warn("extension", `${name} declares permissions this ue-mcp does not know, ignored: ${unknown.map(String).join(", ")} (known: ${EXTENSION_PERMISSIONS.join(", ")})`);
+  }
+  return known;
 }
 
 interface PackageJson {
@@ -85,13 +116,12 @@ function readPackages(root: string, installed: string, refused: RefusedExtension
         continue;
       }
       if (!pkg.main) continue;
-      const refusal = extensionRefusal(name, pkg.ueMcpExtension, installed);
-      // warn mode: a development daemon whose package version trails its code.
-      if (refusal && !(refusal.needsUeMcp && readEnv("extensionFloor") === "warn")) {
+      const { refusal, waived } = extensionGate(name, pkg.ueMcpExtension, installed);
+      if (refusal) {
         refusals.set(copy.version, refusal);
         continue;
       }
-      if (refusal) warn("extension", `${refusal.reason}. Loaded anyway (${ENV_VARS.extensionFloor}=warn).`);
+      if (waived) warn("extension", `${waived.reason}. Loaded anyway (${ENV_VARS.extensionFloor}=warn).`);
       const held = usable.get(copy.version);
       if (!held || held.copy.legacy) usable.set(copy.version, { copy, pkg });
     }
@@ -117,7 +147,9 @@ function readPackages(root: string, installed: string, refused: RefusedExtension
     if (choice.record && projectDir) recordVersion(projectDir, name, choice.version);
     const { copy, pkg } = usable.get(choice.version)!;
     const uiMin = typeof pkg.ueMcpExtension?.ui?.min === "string" ? pkg.ueMcpExtension.ui.min : undefined;
-    out.push({ dir: copy.dir, name, version: choice.version, main: path.join(copy.dir, pkg.main!), ...(uiMin ? { uiMin } : {}) });
+    const uiRoot = pkg.ueMcpExtension?.ui?.root === false ? { uiRoot: false as const } : {};
+    const permissions = declaredPermissions(name, pkg.ueMcpExtension?.permissions);
+    out.push({ dir: copy.dir, name, version: choice.version, main: path.join(copy.dir, pkg.main!), ...(uiMin ? { uiMin } : {}), ...uiRoot, ...(permissions ? { permissions } : {}) });
   }
   return out;
 }
@@ -139,7 +171,7 @@ function warnForeignFolders(root: string): void {
 
 /** Load every extension, handing each an API built by `apiFor`. A failing one is named and skipped. */
 export async function loadExtensions(
-  apiFor: (name: string, routes: Route[], setBusy: (fn: () => boolean) => void, pkg: { version: string; uiMin?: string }) => DaemonExtensionApi,
+  apiFor: (name: string, routes: Route[], setBusy: (fn: () => boolean) => void, pkg: { version: string; uiMin?: string; uiRoot?: false; permissions?: readonly ExtensionPermission[] }) => DaemonExtensionApi,
   root: string = extensionsDir(),
   refused: RefusedExtension[] = [],
   installed: string = packageVersion(),
@@ -154,8 +186,9 @@ export async function loadExtensions(
       const mod = (await import(pathToFileURL(pkg.main).href)) as Partial<DaemonExtension> & { default?: Partial<DaemonExtension> };
       const activate = mod.activate ?? mod.default?.activate;
       if (typeof activate !== "function") throw new Error("exports no activate(api)");
-      const handle = await activate(apiFor(pkg.name, routes, (fn) => (busy = fn), { version: pkg.version, ...(pkg.uiMin ? { uiMin: pkg.uiMin } : {}) }));
-      loaded.push({ name: pkg.name, version: pkg.version, ...(pkg.uiMin ? { uiMin: pkg.uiMin } : {}), routes, busy: () => busy(), dispose: handle?.dispose });
+      const ui = { ...(pkg.uiMin ? { uiMin: pkg.uiMin } : {}), ...(pkg.uiRoot === false ? { uiRoot: false as const } : {}) };
+      const handle = await activate(apiFor(pkg.name, routes, (fn) => (busy = fn), { version: pkg.version, ...ui, ...(pkg.permissions ? { permissions: pkg.permissions } : {}) }));
+      loaded.push({ name: pkg.name, version: pkg.version, ...ui, routes, busy: () => busy(), dispose: handle?.dispose });
       info("extension", `loaded ${pkg.name} ${pkg.version}`);
     } catch (e) {
       warn("extension", `${pkg.name} failed to load`, e);

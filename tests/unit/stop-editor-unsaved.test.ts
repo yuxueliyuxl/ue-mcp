@@ -21,7 +21,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 import type { EditorProcess } from "../../src/editor/engine-observer.js";
-import type { ElicitFn, ElicitParams, ElicitResult } from "../../src/core/types.js";
+import type { ElicitFn, ElicitParams, ElicitResult } from "../../src/core/elicit.js";
 import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
 vi.mock("../../src/editor/engine-observer.js", async (importOriginal) => {
@@ -50,7 +50,8 @@ const observer = await import("../../src/editor/engine-observer.js");
 const { stopEditor } = await import("../../src/editor/editor-control.js");
 const { resolveDialogMode, clientAdvertisesElicitation } = await import("../../src/editor/dialog-mode.js");
 const { bridgeLockfilePath } = await import("../../src/bridge/editor-target.js");
-const { setDialogMode } = await import("../../src/config/user-state.js");
+const { DIALOG_MODE } = await import("../../src/config/modes.js");
+const setDialogMode = DIALOG_MODE.set;
 
 const findInteractiveEditors = vi.mocked(observer.findInteractiveEditors);
 // Stop and ownership also see headless editors; one list stands in for both here.
@@ -656,5 +657,84 @@ describe("stop_editor waits for the editor's process to exit", () => {
     expect(result.success).toBe(false);
     expect(result.message).toContain(`pid ${EDITOR_PID}`);
     expect(result.message).toContain("still running");
+  });
+});
+
+describe("stop_editor disposable-package cleanup", () => {
+  const engineMap = "/Engine/Maps/Entry";
+  const content = "/Game/Materials/M_Rock";
+  const unsavedMap = "/Temp/Untitled_1";
+
+  it("clears only disposable packages and keeps content on the save list", async () => {
+    const bridge = await startFakeBridge((method, params) => {
+      if (method === "list_dirty_packages") return {
+        success: true, content: [{ package: content }], maps: [{ package: engineMap }, { package: unsavedMap }],
+      };
+      if (method === "discard_dirty" && params.dryRun) return {
+        success: false, packages: [
+          { package: engineMap, status: "wouldClear" },
+          { package: content, status: "refused" },
+          { package: unsavedMap, status: "refused" },
+        ],
+      };
+      if (method === "discard_dirty") return { success: true, packages: [{ package: engineMap, status: "cleared" }] };
+      if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
+      return NO_DIALOGS;
+    });
+    openBridges.push(bridge);
+
+    const result = await stopEditor(makeProject(bridge.port), { discardTransient: true, confirmPollMs: 1 });
+
+    expect(result.success).toBe(false);
+    expect(result.discarded?.cleared).toEqual([engineMap]);
+    expect(result.discarded?.kept).toEqual(expect.arrayContaining([content, unsavedMap]));
+    const writes = bridge.calls.filter((call) => call.method === "discard_dirty" && !call.params.dryRun);
+    expect(writes).toEqual([{ method: "discard_dirty", params: { packages: [engineMap] } }]);
+    for (const forbidden of BUTTON_PRESSING_METHODS) expect(bridge.methods()).not.toContain(forbidden);
+  });
+
+  it("reports an older plugin without discarding any package", async () => {
+    const bridge = await startFakeBridge((method) => {
+      if (method === "list_dirty_packages") return { success: true, content: [{ package: content }], maps: [{ package: engineMap }] };
+      if (method === "discard_dirty") return null;
+      if (method === "request_editor_shutdown") return DIRTY_REFUSAL;
+      return NO_DIALOGS;
+    });
+    openBridges.push(bridge);
+
+    const result = await stopEditor(makeProject(bridge.port), { discardTransient: true, confirmPollMs: 1 });
+
+    expect(result.discarded?.cleared).toEqual([]);
+    expect(result.discarded?.kept).toEqual(expect.arrayContaining([content, engineMap]));
+    expect(result.discarded?.note).toContain("no discard_dirty");
+    expect(bridge.calls.filter((call) => call.method === "discard_dirty")).toHaveLength(1);
+    expect(bridge.calls.find((call) => call.method === "discard_dirty")?.params.dryRun).toBe(true);
+  });
+
+  it("stops after clearing disposable state and reports what was cleared", async () => {
+    let bridge: FakeBridge;
+    bridge = await startFakeBridge((method, params) => {
+      if (method === "list_dirty_packages") return { success: true, content: [], maps: [{ package: engineMap }] };
+      if (method === "discard_dirty") return {
+        success: true, packages: [{ package: engineMap, status: params.dryRun ? "wouldClear" : "cleared" }],
+      };
+      if (method === "request_editor_shutdown") {
+        setTimeout(() => {
+          bridge.goQuiet();
+          findInteractiveEditors.mockResolvedValue([]);
+        }, 30);
+        return { success: true, scheduled: true, dirtyContentPackages: [], dirtyMapPackages: [] };
+      }
+      return NO_DIALOGS;
+    });
+    openBridges.push(bridge);
+
+    const result = await stopEditor(makeProject(bridge.port), { discardTransient: true, confirmPollMs: 10 });
+
+    expect(result.success).toBe(true);
+    expect(result.discarded).toEqual({ cleared: [engineMap], kept: [] });
+    expect(result.message).toContain(engineMap);
+    const methods = bridge.methods();
+    expect(methods.lastIndexOf("discard_dirty")).toBeLessThan(methods.indexOf("request_editor_shutdown"));
   });
 });

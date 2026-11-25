@@ -1,3 +1,4 @@
+// @session independent: About the connected MCP client, not about any editor.
 /**
  * Client-specific rendering limits worth explaining in a tool result.
  *
@@ -10,33 +11,16 @@
  * problem.
  */
 import { readEnv } from "../core/env.js";
+import { parseVersion, satisfiesMinimum } from "../core/semver.js";
 
 export interface ClientInfo {
   name: string;
   version?: string;
 }
 
-/** "2.1.116" -> [2, 1, 116]; missing or odd parts sort low. */
-function parseVersion(version: string | undefined): number[] {
-  if (!version) return [0, 0, 0];
-  return version
-    .split(".")
-    .slice(0, 3)
-    .map((part) => {
-      const n = Number.parseInt(part, 10);
-      return Number.isFinite(n) ? n : 0;
-    });
-}
-
-function atLeast(version: string | undefined, target: number[]): boolean {
-  const actual = parseVersion(version);
-  for (let i = 0; i < target.length; i++) {
-    const a = actual[i] ?? 0;
-    const t = target[i] ?? 0;
-    if (a > t) return true;
-    if (a < t) return false;
-  }
-  return true;
+/** A missing or unparseable version is never at least anything. */
+function atLeast(version: string | undefined, target: string): boolean {
+  return !!version && parseVersion(version) !== null && satisfiesMinimum(version, target);
 }
 
 /**
@@ -53,8 +37,8 @@ function atLeast(version: string | undefined, target: number[]): boolean {
  * Returns a one-line explanation, or null when the client renders progress
  * normally. Delete this once no one is plausibly running an affected build.
  */
-const CLAUDE_CODE_COLLAPSE_FIRST = [2, 1, 116];
-const CLAUDE_CODE_COLLAPSE_FIXED_IN = [2, 1, 153];
+const CLAUDE_CODE_COLLAPSE_FIRST = "2.1.116";
+const CLAUDE_CODE_COLLAPSE_FIXED_IN = "2.1.153";
 
 export function progressRenderingNote(client: ClientInfo | undefined): string | null {
   if (!client) return null;
@@ -117,4 +101,30 @@ export function elicitationNeedsRelay(client: ClientInfo | undefined): boolean {
   if (!client) return true;
   const name = client.name.toLowerCase();
   return !RENDERS_WHOLE_ELICITATION.some((known) => name.includes(known));
+}
+
+/**
+ * opencode advertised the elicitation capability from 2.0.18 but dropped every
+ * form it was sent until 2.1.4 (anomalyco/opencode#58184), so the call waited
+ * on a question nobody could see. Treating those builds as able to elicit put a
+ * blocking dialog into interactive mode with no way to answer it.
+ *
+ * Matched on the exact name opencode sends at initialize: "opencode" from
+ * 2.0.26 (anomalyco/opencode#53471). Earlier 2.0 builds sent "cli", "desktop"
+ * or "acp", too generic to match. An unparseable version counts as affected,
+ * because defer is the safe miss.
+ *
+ * Returns why this client cannot be shown a form despite advertising it, or
+ * null when its forms render.
+ */
+const OPENCODE_FORMS_FIXED_IN = "2.1.4";
+
+export function elicitationUnrenderedNote(client: ClientInfo | undefined): string | null {
+  if (!client || client.name.toLowerCase() !== "opencode") return null;
+  if (atLeast(client.version, OPENCODE_FORMS_FIXED_IN)) return null;
+  return (
+    `opencode ${client.version ?? "(unknown version)"} advertises MCP elicitation but does not show the form ` +
+    "(anomalyco/opencode#58184, fixed in 2.1.4), so dialogs are handled as defer. " +
+    "Upgrade opencode to 2.1.4 or later to answer them in a form."
+  );
 }

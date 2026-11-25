@@ -9,10 +9,15 @@ class UWorld;
  * The step actions pie(uat_run) drives and a test script step's act runs: input on any player, console,
  * place, capture and wait. One executor for both, so a verb means the same thing wherever it is written.
  *
- *   { client?, tape: {action, values} } | { client?, press: {action, frames?} } | { client?, hold: {action, value, ms} }
+ *   { client?, tape: {action, values, hz?} } | { client?, press: {action, frames?} } | { client?, hold: {action, value, ms} }
  *   | { client?, inject: {action, value} } | { client?, console: "cmd" }
  *   | { client?, place: {at, offset?, face?} | {location, yaw?} } | { client?, capture: "label" | true } | { wait_ms }
+ *   | { key: {key | text, event?: press|down|up} }
  *
+ * A key goes through Slate to the UI of the run's own player (client 0, as pie_instance and client_id name it). A remote
+ * player in another process has no Slate path from here, so a key with client above 0 is refused.
+ *
+ * A place location or offset is [x, y, z] or {x, y, z}; any other shape is a parse error, never the origin.
  * Client 0 is the editor's own player; a client above 0 is a remote player, reached through PIERemotePlayers.
  */
 namespace MCPPIE
@@ -21,12 +26,18 @@ namespace MCPPIE
 
 	struct FStepAction
 	{
-		enum class EKind { Tape, Hold, Inject, Console, Wait, Place, Capture } Kind = EKind::Wait;
-		// The verb as written: tape, press, hold, inject, console, place, capture or wait_ms.
+		enum class EKind { Tape, Hold, Inject, Console, Wait, Place, Capture, Key } Kind = EKind::Wait;
+		// The verb as written: tape, press, hold, inject, console, place, capture, key or wait_ms.
 		FString Verb;
+		// Key: an FKey name or typed text, and press (default) | down | up. Slate input for the player's UI (#2018).
+		FString KeyName;
+		FString KeyText;
+		FString KeyEvent;
 		int32 Client = 0;
 		FString ActionPath;
 		TArray<FVector> Values;
+		// Tape playback rate: entries are spaced 1/Hz apart on the world clock.
+		int32 Hz = 60;
 		FVector Value = FVector(1, 0, 0);
 		float Ms = 0.0f;
 		FString Command;
@@ -59,6 +70,12 @@ namespace MCPPIE
 		/** Captures go to <CaptureRoot>/captures/step<NN>_client<C>_<label>.jpg; File is relative to CaptureRoot. */
 		FString CaptureRoot;
 		int32 StepNumber = 1;
+		/**
+		 * The player an entry with no client (client 0) drives: local player OwnLocalPlayer of PIE instance
+		 * OwnPIEInstance, as pie(inject_input) takes pie_instance and client_id. INDEX_NONE means the editor's own player.
+		 */
+		int32 OwnPIEInstance = INDEX_NONE;
+		int32 OwnLocalPlayer = 0;
 
 		/** Runs one action now. A wait does nothing here; FStepActionSequence times it. */
 		bool Run(const FStepAction& A, FString& OutError);
@@ -81,6 +98,8 @@ namespace MCPPIE
 
 		TArray<FRelayed> Relayed;
 		TArray<FCapture> Captures;
+		/** Who the last Run drove: the exact local player, the remote client, or the placed pawn. Empty for a wait. */
+		FString LastTarget;
 
 	private:
 		bool Place(const FStepAction& A, FString& OutError);
@@ -104,6 +123,7 @@ namespace MCPPIE
 			FString Verb;
 			bool bOk = true;
 			FString Error;
+			FString Target;
 		};
 
 		void Begin(const TArray<FStepAction>& InActions);

@@ -1,3 +1,4 @@
+// @session independent: Parses and writes whichever config file it is handed, and the user-global layer that applies to every project by definition.
 /**
  * Reading and writing ue-mcp.yml and its layers. Every file in the cascade
  * shares one shape (a `ue-mcp:` block plus `tasks:`, `flows:`, `plugins:`),
@@ -135,15 +136,23 @@ export interface ConfigLayerFile {
 }
 
 /**
- * The files of a project's cascade in precedence order, low -> high. The
- * caller names the overlay, because the server and the editor plugin choose
- * it by different rules.
+ * The files of a project's cascade in precedence order, low -> high: the
+ * user-global ~/.ue-mcp/config.yml, the tracked ue-mcp.yml, the
+ * ue-mcp.<env>.yml overlay when one is selected, and the untracked
+ * ue-mcp.local.yml. The one statement of that order. The caller names the
+ * overlay, because the server and the editor plugin choose it by different rules.
  */
 export function configLayerFiles(projectDir: string, overlay?: string): ConfigLayerFile[] {
-  const layers: ConfigLayerFile[] = [
-    { target: "global", file: globalConfigPath() },
-    { target: "project", file: projectConfigPath(projectDir) },
-  ];
+  return [{ target: "global", file: globalConfigPath() }, ...projectLayerFiles(projectDir, overlay)];
+}
+
+/**
+ * The cascade without the user-global file: the layers that live in the
+ * project. The flow loader reads the global file on its own, because a bad one
+ * is warned about and ignored while a bad project file is fatal.
+ */
+export function projectLayerFiles(projectDir: string, overlay?: string): ConfigLayerFile[] {
+  const layers: ConfigLayerFile[] = [{ target: "project", file: projectConfigPath(projectDir) }];
   if (overlay) layers.push({ target: "env", file: overlayConfigPath(projectDir, overlay) });
   layers.push({ target: "local", file: localConfigPath(projectDir) });
   return layers;

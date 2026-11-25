@@ -1,8 +1,11 @@
+// @session independent: Reads an MCP tools/call into a category and action. Pure logic.
 /**
  * What an MCP tools/call is, for the activity feed: the category and action
  * it runs, read through the micro gateway (`tools` with action `call`) and the
  * flow tool so every client's calls are attributed alike.
  */
+import { MICRO_GATEWAY_CALL, MICRO_GATEWAY_TOOL } from "../surface/context/micro-context.js";
+
 export interface CallLabel {
   category: string;
   action: string;
@@ -15,7 +18,7 @@ export function describeToolCall(params: unknown): CallLabel {
   const name = typeof p.name === "string" ? p.name : "unknown";
   const args = (p.arguments ?? {}) as Record<string, unknown>;
   const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
-  if (name === "tools" && args.action === "call") {
+  if (name === MICRO_GATEWAY_TOOL && args.action === MICRO_GATEWAY_CALL) {
     return { category: str(args.category) ?? "unknown", action: str(args.method) ?? "unknown" };
   }
   const label: CallLabel = { category: name, action: str(args.action) ?? "unknown" };

@@ -1,3 +1,4 @@
+// @session independent: Validates and compares the recorded handler specs it is handed; holds nothing per editor.
 /**
  * Parameter contracts authored in C++ (#1057).
  *
@@ -5,8 +6,8 @@
  * `RegisterHandler` call. The bridge publishes every spec in
  * `get_bridge_capabilities.handlerSpecs`; `npm run specs:record` writes that to
  * `tests/golden/handler-specs.json`, and `npm run specs:generate` turns the
- * recording into `src/tools/specs/<category>.generated.ts`: the zod entries and
- * the `Params:` clause of every spec'd action.
+ * recording into `src/tools/specs/<category>.generated.ts`: the recorded specs
+ * and the zod entries of every spec'd action.
  *
  * The advertised surface always comes from the recording, whether or not an
  * editor is connected, so the startup contract never depends on which editor
@@ -14,7 +15,7 @@
  * reported as drift by `project(get_status)`.
  */
 import { z } from "zod";
-import type { ActionEffect, BridgeActionSpec } from "../core/types.js";
+import type { ActionEffect, BridgeActionSpec } from "./tool-types.js";
 import { ROUTING_PARAM_NAMES } from "./routing-params.js";
 
 /** Wire types a spec can declare. Mirrors EMCPParamType in HandlerRegistry.h. */
@@ -91,7 +92,11 @@ export interface ParamSpec {
   minimum?: number;
   /** Inclusive upper bound, as minimum. */
   maximum?: number;
+  /** What the handler uses when the parameter is omitted. */
+  default?: boolean | string | number;
 }
+
+export type { ActionFacts } from "../bridge/action-facts.generated.js";
 
 /** How many branches of a choice a call supplies. Mirrors EMCPChoiceMode. */
 export const CHOICE_MODES = ["exactlyOne", "atLeastOne"] as const;
@@ -333,22 +338,10 @@ function choiceProblems(method: string, spec: HandlerSpec): string[] {
       }
     }
   });
-  if (problems.length > 0) return problems;
-  const items = clauseItems(spec);
-  items.forEach((item, index) => {
-    const next = items[index + 1];
-    if (item.kind === "choice" && item.choice.mode === "atLeastOne" && next?.kind === "param"
-      && next.param.required && !next.param.aliases?.length) {
-      problems.push(
-        `${method}: required '${next.param.name}' follows an at-least-one choice, and the clause would read it as one `
-        + "more branch; declare it before the choice's first member",
-      );
-    }
-  });
   return problems;
 }
 
-/** The items of a Params clause, in spec order: a choice sits where its first member is declared. */
+/** The items of a signature, in spec order: a choice sits where its first member is declared. */
 type ClauseItem = { kind: "param"; param: ParamSpec } | { kind: "choice"; choice: ParamChoice };
 
 export function clauseItems(spec: HandlerSpec): ClauseItem[] {
@@ -420,35 +413,18 @@ export function renderChoice(choice: ParamChoice, params: readonly ParamSpec[]):
 }
 
 /**
- * The `Params:` clause for one handler, in the grammar parseParams reads:
- * required names bare, optional ones with `?`, aliases as `(or alias)`, and a
- * choice where its first member is declared, written as renderChoice writes it
- * (`actorLabel OR actorPath`, `at least one of labelPrefix/tag`).
- */
-export function paramsClause(spec: HandlerSpec): string {
-  if (spec.params.length === 0) return "Params: none";
-  const items = clauseItems(spec).map((item) => {
-    if (item.kind === "choice") return renderChoice(item.choice, spec.params);
-    const p = item.param;
-    const aliases = p.aliases?.length ? ` (${p.aliases.map((a) => `or ${a}`).join(", ")})` : "";
-    return `${p.name}${p.required ? "" : "?"}${aliases}`;
-  });
-  return `Params: ${items.join(", ")}`;
-}
-
-/**
  * Build the action declaration for a spec'd bridge method: the summary a person
- * wrote, then the generated `Params:` clause. There is no mapParams, because the
- * spec names are the bridge names and renames are the registry's aliases. The
- * action carries the spec itself, so describe_action reports it verbatim.
+ * wrote and the recorded spec, which is the action's whole parameter contract.
+ * There is no mapParams, because the spec names are the bridge names and
+ * renames are the registry's aliases.
  */
-export function makeSpecBp(clauses: Readonly<Record<string, string>>, specs: HandlerSpecs = {}) {
+export function makeSpecBp(specs: HandlerSpecs) {
   return (effect: ActionEffect, summary: string, bridge: string): BridgeActionSpec => {
-    const clause = clauses[bridge];
-    if (clause === undefined) {
+    const spec = specs[bridge];
+    if (!spec) {
       throw new Error(
         `No recorded parameter spec for bridge method '${bridge}'. Register it with a spec in C++, `
-        + "then run npm run specs:record and npm run specs:generate.",
+        + "rebuild the plugin, then run npm run generate -- --editor with the editor open on tests/ue_mcp.",
       );
     }
     // The literal `bp` builds. Importing `bp` would load category-tool.ts,
@@ -456,16 +432,31 @@ export function makeSpecBp(clauses: Readonly<Record<string, string>>, specs: Han
     const action: BridgeActionSpec = {
       kind: "bridge",
       effect,
-      description: `${summary} ${clause}`,
+      description: summary,
       bridge,
       mapParams: undefined,
     };
-    const spec = specs[bridge];
-    if (!spec) return action;
     return spec.choices?.length
       ? { ...action, paramSpec: spec.params, paramChoices: spec.choices }
       : { ...action, paramSpec: spec.params };
   };
+}
+
+/**
+ * The default a handler declares for one of its parameters, so the server
+ * never restates it. Throws when the spec declares none, which a re-record that
+ * dropped the default would otherwise turn into a silent `undefined`.
+ */
+export function declaredDefault<T extends boolean | string | number>(
+  specs: Readonly<HandlerSpecs>,
+  method: string,
+  param: string,
+): T {
+  const value = specs[method]?.params.find((p) => p.name === param)?.default;
+  if (value === undefined) {
+    throw new Error(`${method} declares no default for '${param}'; declare it with .Default() at its C++ registration`);
+  }
+  return value as T;
 }
 
 /**

@@ -1,3 +1,4 @@
+// @session per-session: Wraps one session's bridge in that session's guards.
 /**
  * GuardedBridge - runs a `GuardRegistry` pipeline around the editor bridge.
  *
@@ -11,39 +12,17 @@
  * straight through.
  */
 import { runGuarded } from "@db-lyon/flowkit/guard";
-import type { BridgeTarget, IBridge } from "../bridge/bridge.js";
+import type { BridgeCallOptions, BridgeTarget, IBridge } from "../bridge/bridge.js";
 import type { EditorSession } from "../sessions/session.js";
-import { explainEditorDownWithEvidence } from "../dispatch/offline.js";
+import { explainEditorDownWithEvidence } from "./offline.js";
 import { GuardRegistry, makeCallContext, type ResolveExistingFile } from "./guard.js";
-import { DialogGuard, ensureGuard, existingGuard } from "../editor/dialog-guard.js";
+import { callIsReadOnly, readOnlyGuard } from "./session-access.js";
+import { ensureGuard, existingGuard, refuseIfBlocked } from "../editor/dialog-guard.js";
+import { listsDialogs, nativeDialogReply, repliesToNativeDialog } from "../editor/native-dialog-reply.js";
+import { currentCallAsker } from "./call-elicit.js";
+import { McpError, ErrorCode } from "../core/errors.js";
 
 export type { ResolveExistingFile } from "./guard.js";
-
-/**
- * The dialog gate, at the boundary every route to the editor shares.
- *
- * A tool action, a flow step, a nested flow, a guard task making its own
- * calls: they all arrive here, so refusing here is what makes the guarantee
- * hold without a second copy of the rule anywhere else. The plugin refuses too,
- * and agrees, but it cannot see a call that never reaches it and it does not
- * know this machine's dialog mode.
- *
- * Returns the refusal to send back, or null to let the call through.
- */
-export async function refuseIfBlocked(
-  session: EditorSession | undefined,
-  method: string,
-): Promise<Record<string, unknown> | null> {
-  if (!session) return null;
-  if (DialogGuard.bridgeAllowed(method)) return null;
-  // Built from the session when it has none, rather than refused for not
-  // having one. Failing closed is right, but only because no session can reach
-  // this without a guard: they were created in one startup pass, so a session
-  // registered any other way was refused every call it ever made.
-  const guard = await ensureGuard(session);
-  const decision = await guard.check(method, "bridge");
-  return decision.allow ? null : decision.refusal;
-}
 
 /**
  * Arm or clear the dialog latch from what the editor just said.
@@ -57,6 +36,85 @@ export async function refuseIfBlocked(
 export function observeReply<T>(session: EditorSession | undefined, method: string, result: T): T {
   if (session) existingGuard(session)?.observe(method, result);
   return result;
+}
+
+/**
+ * A reply this process gives while the editor shows a native Win32 dialog
+ * (editor/native-dialog-reply.ts), or undefined, and the call goes to the
+ * editor as usual.
+ */
+export async function serveNativeDialog(
+  session: EditorSession | undefined,
+  method: string,
+  params: Record<string, unknown> | undefined,
+): Promise<Record<string, unknown> | undefined> {
+  if (!session || !repliesToNativeDialog(method)) return undefined;
+  return nativeDialogReply(existingGuard(session) ?? (await ensureGuard(session)), method, params);
+}
+
+/**
+ * A call already sent to the editor, raced against a native dialog appearing.
+ *
+ * A native dialog parks the editor where the bridge cannot answer, so a call
+ * in flight would otherwise wait out its whole timeout. When one appears, the
+ * caller is told now, with the dialog, marked `inFlight` because the call had
+ * already been sent and may still run once the dialog is answered.
+ *
+ * Modal-safe methods are raced too: the plugin answers them from Slate's modal
+ * loop, which does not run inside a Win32 box. A list_dialogs in flight (a UI
+ * polls it every few seconds) is answered with the native dialog instead.
+ */
+export function raceNativeDialog<T>(
+  session: EditorSession | undefined,
+  method: string,
+  call: Promise<T>,
+  params?: Record<string, unknown>,
+): Promise<T | Record<string, unknown>> {
+  if (!session) return call;
+  const guard = existingGuard(session);
+  if (!guard) return call;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const off = guard.onNativeDialog((dialog) => {
+      if (settled) return;
+      settled = true;
+      off();
+      // The bridge may still answer, or fail when the editor exits; neither is anyone's to handle now.
+      call.catch(() => undefined);
+      if (listsDialogs(method)) {
+        void serveNativeDialog(session, method, params).then((listed) => resolve(listed ?? { success: true, dialogs: [], windows: [] }), reject);
+        return;
+      }
+      const refusal = guard.refusal(method, dialog, { canElicit: false });
+      resolve({
+        ...refusal,
+        inFlight: true,
+        error:
+          `'${method}' had already been sent to the editor when a native dialog appeared, so whether it ran is not known. `
+          + String(refusal.error ?? ""),
+      });
+    });
+    call.then(
+      (v) => {
+        if (settled) return;
+        settled = true;
+        off();
+        resolve(v);
+      },
+      (e) => {
+        if (settled) return;
+        settled = true;
+        off();
+        reject(e);
+      },
+    );
+  });
+}
+
+/** A reply that came from the editor, as opposed to one this file made while a native dialog was up. */
+function fromEditor(result: unknown): boolean {
+  return !(typeof result === "object" && result !== null && (result as { inFlight?: unknown }).inFlight === true
+    && (result as { nativeDialog?: unknown }).nativeDialog === true);
 }
 
 /**
@@ -86,6 +144,14 @@ abstract class ForwardingBridge implements IBridge {
     return this.inner.refreshEpicToolsets?.() ?? Promise.resolve(this.inner.epicToolsets ?? null);
   }
 
+  get epicMcpTools(): IBridge["epicMcpTools"] {
+    return this.inner.epicMcpTools;
+  }
+
+  refreshEpicMcpTools(): Promise<readonly string[] | null> {
+    return this.inner.refreshEpicMcpTools?.() ?? Promise.resolve(this.inner.epicMcpTools ?? null);
+  }
+
   connect(timeoutMs?: number): Promise<void> {
     return this.inner.connect(timeoutMs);
   }
@@ -98,7 +164,7 @@ abstract class ForwardingBridge implements IBridge {
     return this.inner.getTarget();
   }
 
-  abstract call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+  abstract call(method: string, params?: Record<string, unknown>, timeoutMs?: number, options?: BridgeCallOptions): Promise<unknown>;
 }
 
 /**
@@ -122,11 +188,25 @@ export class DialogGatedBridge extends ForwardingBridge {
     method: string,
     params?: Record<string, unknown>,
     timeoutMs?: number,
+    options?: BridgeCallOptions,
   ): Promise<unknown> {
     const blocked = await refuseIfBlocked(this.session, method);
     if (blocked) return blocked;
-    return observeReply(this.session, method, await this.inner.call(method, params, timeoutMs));
+    const native = await serveNativeDialog(this.session, method, params);
+    if (native) return native;
+    const reply = await raceNativeDialog(this.session, method, this.inner.call(method, params, timeoutMs, options), params);
+    return fromEditor(reply) ? observeReply(this.session, method, reply) : reply;
   }
+}
+
+/**
+ * The pipeline a read-only session's call runs through: the session's own
+ * guards with the built-in read-only guard ahead of them. Built per call, and
+ * only for a read-only session, because the mode belongs to the caller while
+ * the registry is shared by every client of the editor.
+ */
+function withReadOnlyGuard(registry: GuardRegistry): GuardRegistry {
+  return new GuardRegistry().registerAll([readOnlyGuard, ...registry.list()]) as GuardRegistry;
 }
 
 export class GuardedBridge extends ForwardingBridge {
@@ -154,15 +234,32 @@ export class GuardedBridge extends ForwardingBridge {
     method: string,
     params?: Record<string, unknown>,
     timeoutMs?: number,
+    options?: BridgeCallOptions,
   ): Promise<unknown> {
+    // The call this belongs to was cancelled: an action that makes several
+    // bridge calls stops at the next one instead of carrying on unseen (#1902).
+    if (currentCallAsker()?.signal?.aborted) {
+      throw new McpError(
+        ErrorCode.CANCELLED,
+        `Bridge call '${method}' was not sent: the call it belongs to was cancelled by its caller.`,
+        { outcome: "failed", method },
+      );
+    }
     try {
       // `runGuarded` is already a pass-through on an empty registry, but building
       // the context is not free and every bridge call lands here. Most servers run
       // with no guards at all, so skip the allocation outright.
-      if (this.registry.size === 0) {
+      const readOnly = callIsReadOnly();
+      const send = async (): Promise<unknown> => {
+        const native = await serveNativeDialog(this.session, method, params);
+        if (native) return native;
+        return raceNativeDialog(this.session, method, this.inner.call(method, params, timeoutMs, options), params);
+      };
+      if (this.registry.size === 0 && !readOnly) {
         const blocked = await this.guardCall(method);
         if (blocked) return blocked;
-        return this.observe(method, await this.inner.call(method, params, timeoutMs));
+        const reply = await send();
+        return fromEditor(reply) ? this.observe(method, reply) : reply;
       }
 
       const ctx = makeCallContext(
@@ -175,16 +272,14 @@ export class GuardedBridge extends ForwardingBridge {
       );
       const blocked = await this.guardCall(method);
       if (blocked) return blocked;
-      return this.observe(
-        method,
-        await runGuarded(ctx, this.registry, () => this.inner.call(method, params, timeoutMs)),
-      );
+      const reply = await runGuarded(ctx, readOnly ? withReadOnlyGuard(this.registry) : this.registry, send);
+      return fromEditor(reply) ? this.observe(method, reply) : reply;
     } catch (e) {
       // Every route into the editor comes through here (an MCP tool call, a
       // flow step, the micro gateway), so this is the one place a missing
       // editor can be explained once rather than three times. Only a
       // connection failure is rewritten; everything else is rethrown as it
-      // was. See src/dispatch/offline.ts (T16).
+      // was. See src/flow/offline.ts (T16).
       throw await explainEditorDownWithEvidence(e, {
         method,
         projectPath: this.inner.getTarget().projectPath,

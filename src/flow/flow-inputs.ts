@@ -1,3 +1,4 @@
+// @session independent: Pure derivation of a flow's inputs from the tool graph and config it is handed.
 /**
  * The parameters a run of a flow may pass, derived from its steps (#1508).
  *
@@ -5,13 +6,12 @@
  * are the parameters its step tasks read that the steps leave unset. Each
  * task's parameters come from its action's schema, overlaid by the task's
  * flowkit option specs (a class's static `optionsSchema` refined by the
- * definition's `options_schema`). A task with neither falls back to the
- * `Params:` clause of its configured description.
+ * definition's `options_schema`).
  */
 import { mergeOptionSpecs, taskClassMetadata } from "@db-lyon/flowkit";
 import type { FlowDefinition, OptionSpec, OptionSpecs, TaskDefinition, TaskRegistry } from "@db-lyon/flowkit";
-import type { ToolDef } from "../core/types.js";
-import { actionSchema, parseParams, ROUTING_PARAMS } from "../surface/action-schema.js";
+import type { ToolDef } from "../surface/tool-types.js";
+import { actionSchema, ROUTING_PARAMS } from "../surface/action-schema.js";
 
 /** One step that reads an input, addressed as an expanded plan addresses it. */
 export interface FlowInputStep {
@@ -169,12 +169,6 @@ async function taskParams(
     // A class that cannot load has no static metadata; it fails where it would anyway, at run time.
   }
   const specs = mergeOptionSpecs(meta, def?.options_schema);
-
-  if (!schema) {
-    for (const p of parseParams(def?.description ?? "").params) {
-      out.set(p.name, { type: "any", required: p.group === undefined && !p.optional });
-    }
-  }
 
   for (const [name, spec] of Object.entries(specs ?? {})) {
     const base = out.get(name);

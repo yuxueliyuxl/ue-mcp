@@ -89,15 +89,15 @@ void FGasHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	using EType = EMCPParamType;
 	auto ActorLabel = []()
 	{
-		return MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Live actor label, internal name or object path. Pass this or actorPath"));
+		return MCPSharedParam::ActorLabel().Describe(TEXT("Live actor label, internal name or object path. Pass this or actorPath"));
 	};
 	auto ActorPath = []()
 	{
-		return MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Full actor object path. The unambiguous selector, and it wins over actorLabel when both are given"));
+		return MCPSharedParam::ActorPath();
 	};
 	auto World = []()
 	{
-		return MCPParam::Optional(TEXT("world"), EType::String, TEXT("Runtime world scope: auto (default) | pie | editor"));
+		return MCPSharedParam::World().Describe(TEXT("Runtime world scope: auto (default) | pie | editor"));
 	};
 	auto AbilityClass = [](const TCHAR* Description)
 	{
@@ -113,7 +113,7 @@ void FGasHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	};
 	auto BlueprintOnConflict = []()
 	{
-		return MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("skip (default, returns the existing asset) or error when the asset already exists"));
+		return MCPSharedParam::OnConflict();
 	};
 	const FMCPSpecRules CreatesBlueprint = MCPSpec::ContractExempt(
 		TEXT("Creates, compiles and saves a Blueprint under the contract values; nothing it reads fails first"));
@@ -342,7 +342,7 @@ void FGasHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("afterSnapshot"), EType::Object, TEXT("The later snapshot object itself")),
 	});
 	Registry.RegisterHandler(TEXT("list_gas_snapshots"), &ListGasSnapshots, {
-		MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Only snapshots of this actor object path")),
+		MCPSharedParam::ActorPath().Describe(TEXT("Only snapshots of this actor object path")),
 		MCPParam::Optional(TEXT("includeSnapshots"), EType::Boolean, TEXT("Return the full snapshot bodies rather than a summary row each")),
 	});
 	Registry.RegisterHandler(TEXT("delete_gas_snapshot"), &DeleteGasSnapshot, {
@@ -366,7 +366,7 @@ TSharedPtr<FJsonValue> FGasHandlers::CreateGasBlueprint(
 
 	if (!ParentClass)
 	{
-		return MCPError(FString::Printf(TEXT("%s parent class not found. Enable GameplayAbilities plugin."), *FriendlyType));
+		return MCPError(FString::Printf(TEXT("%s parent class not found: the GameplayAbilities plugin is not loaded. %s"), *FriendlyType, *MCPEnablePluginStep(TEXT("GameplayAbilities"))));
 	}
 
 	UBlueprintFactory* BlueprintFactory = NewObject<UBlueprintFactory>();
@@ -558,7 +558,7 @@ TSharedPtr<FJsonValue> FGasHandlers::AddAbilitySystemComponent(const TSharedPtr<
 	UClass* ASCClass = FindObject<UClass>(nullptr, TEXT("/Script/GameplayAbilities.AbilitySystemComponent"));
 	if (!ASCClass)
 	{
-		return MCPError(TEXT("AbilitySystemComponent not found. Enable GameplayAbilities plugin."));
+		return MCPPluginUnavailableError(TEXT("AbilitySystemComponent"), TEXT("GameplayAbilities"));
 	}
 
 	// Idempotency: existing ASC on the blueprint?
@@ -953,7 +953,7 @@ TSharedPtr<FJsonValue> FGasHandlers::SetAscDefaults(const TSharedPtr<FJsonObject
 	REQUIRE_ASSET(UBlueprint, BP, BPPath);
 
 	UClass* ASCClass = FindObject<UClass>(nullptr, TEXT("/Script/GameplayAbilities.AbilitySystemComponent"));
-	if (!ASCClass) return MCPError(TEXT("AbilitySystemComponent not found. Enable GameplayAbilities plugin."));
+	if (!ASCClass) return MCPPluginUnavailableError(TEXT("AbilitySystemComponent"), TEXT("GameplayAbilities"));
 
 	UClass* AttrSetClass = MCPGas::ResolveClassDerivingFrom(AttrSetSpec, UAttributeSet::StaticClass());
 	if (!AttrSetClass) return MCPError(FString::Printf(TEXT("AttributeSet class not found: %s"), *AttrSetSpec));

@@ -1,5 +1,6 @@
+// @session independent: Builds a provided category from a manifest.
 import { z } from "zod";
-import type { ToolDef, ActionSpec } from "../core/types.js";
+import type { ToolDef, ActionSpec } from "../surface/tool-types.js";
 import { categoryTool } from "../surface/category-tool.js";
 import {
   compileSchemaFields,
@@ -37,7 +38,6 @@ export interface ProvisionPlan {
 export function buildProvidedTool(plan: ProvisionPlan): ToolDef {
   const actions: Record<string, ActionSpec> = {};
   const extraSchema: Record<string, z.ZodType> = {};
-  const docLines: string[] = [];
 
   for (const [actionName, actionSpec] of Object.entries(plan.spec.actions)) {
     actions[actionName] = {
@@ -51,11 +51,6 @@ export function buildProvidedTool(plan: ProvisionPlan): ToolDef {
         : manifestActionFields(actionSpec.description ?? `Plugin action from ${plan.pluginName}`, actionSpec.schema)),
       ...contractActionFields(actionSpec.contract),
     } as ActionSpec;
-    docLines.push(
-      actionSpec.description
-        ? `- ${actionName}: ${actionSpec.description}`
-        : `- ${actionName}`,
-    );
     const compiled = actionSpec.zodSchema ?? compileSchemaFields(actionSpec.schema);
     for (const [k, v] of Object.entries(compiled)) {
       if (!(k in extraSchema)) extraSchema[k] = liftOptional(v);
@@ -65,8 +60,6 @@ export function buildProvidedTool(plan: ProvisionPlan): ToolDef {
   const summary =
     plan.description ?? `Plugin-provided category from ${plan.pluginName}`;
   // Built like any category, so it takes the routing parameters (timeoutMs,
-  // select, omit) and a rebuilder. Its doc lines keep the manifest's wording.
-  const tool = categoryTool(plan.category, summary, actions, extraSchema);
-  tool.description = `${summary}\n\nActions:\n${docLines.join("\n")}`;
-  return tool;
+  // select, omit) and a rebuilder.
+  return categoryTool(plan.category, summary, actions, extraSchema);
 }

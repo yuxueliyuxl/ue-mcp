@@ -1,85 +1,104 @@
+// @session per-session: One daemon per project root: it owns that project's runtime and follows each of its editors.
 /**
  * The per-project daemon: one detached process per project root that owns the
  * editor bridge, survives editor restarts, and serves every MCP client (through
  * the stdio shim) and the UI over loopback HTTP.
  *
- * Endpoints, all on 127.0.0.1 and all requiring the bearer token from the
- * discovery file:
- *   GET  /v1/health     what the daemon is and what it is attached to
- *   GET  /v1/events     server-sent events, resumable by Last-Event-ID
- *   GET  /v1/install    the project's install state, as `ue-mcp status --json` reports it
- *   GET  /v1/update     the newest release for the install's channel, and whether it has binaries for this engine
- *   POST /v1/update/apply  install it, now or when the editor exits
- *   POST /v1/shutdown   exit now
- *   POST /v1/handoff    exit once no call is in flight (a newer daemon is taking over)
- *   /v1/checkpoints     checkpoints per editor session, see checkpoint-routes.ts
- *   GET  /v1/skills     every skill a client of this project can load, see skills-list.ts
- *   GET  /v1/context/projection  what a strategy and category scope advertise, see context-projection.ts
- *   GET  /v1/actions    each action's effect and destructive flag, see action-effects.ts
- *   WS   /v1/mcp        one MCP session per socket
+ * Every route it serves is declared in DAEMON_ROUTES (contract/daemon.ts) and
+ * answered through router.ts; the handlers are the RouteHandlers built below
+ * and in the *-routes.ts modules.
  */
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as path from "node:path";
 import { WebSocketServer } from "ws";
 import { info, warn, error, stampLogs } from "../core/log.js";
 import { editorStepFailure } from "./editor-step.js";
 import { readEnv } from "../core/env.js";
 import { packageVersion } from "../core/package-root.js";
-import { normalizeProjectRoot } from "../bridge/port.js";
+import { compareVersions } from "../core/semver.js";
+import { hostIsAllowed, tokensMatch } from "../core/loopback-host.js";
+import { StatusError } from "../core/status-error.js";
+import { normalizeProjectRoot } from "../bridge/wire-contract.js";
 import { bridgeInstancesDir, findLiveInstanceRecord, type BridgeInstanceRecord } from "../bridge/editor-target.js";
 import type { EditorSession } from "../sessions/session.js";
 import { createRuntime, type Runtime } from "../server/runtime.js";
+import { toToolResult } from "../server/server-dispatch.js";
+import type { InProcessCallOptions } from "../server/call-options.js";
 import { startVersionCheck } from "../core/version-check.js";
 import { createMcpServer } from "../server/mcp-server.js";
 import { startFlowHttpServer } from "../flow/http-server.js";
 import {
   DAEMON_API_VERSION,
+  DAEMON_FEATURES,
+  DAEMON_GAP_EVENT,
+  DAEMON_HEADERS,
+  EXTENSION_API_VERSION,
+  EXTENSION_FEATURES,
+  routePath,
+  REGISTRY_ACCOUNT_PERMISSION_REQUIRED_FROM,
+  type CallActionOptions,
+  type DaemonDiscovery,
+  type DaemonEvent,
+  type DaemonEventType,
+  type DaemonExtensionApi,
+  type DaemonHealth,
+  type EditorStatus,
+  type McpSessionInfo,
+  type NativeDialogPressResult,
+  type NativeDialogView,
+  type RefusedExtension,
+} from "../contract/daemon.js";
+import {
+  discoveryIsStale,
   newToken,
   projectKey,
   readLiveDiscovery,
   removeDiscovery,
   writeDiscovery,
-  type DaemonDiscovery,
 } from "./discovery.js";
+import { daemonRequest } from "./client.js";
 import { EventLog } from "./events.js";
 import { ExpectedDisconnect, settleAndClassify } from "./disconnect.js";
 import { WebSocketServerTransport } from "./ws-transport.js";
 import { watchDir, type DirWatch, type WatchFn } from "./dir-watch.js";
+import { drainInflight, watchSupersede } from "./supersede-watch.js";
 import { describeToolCall, resultError, type CallLabel } from "./activity.js";
 import { openUrl } from "../core/open-url.js";
-import { handleFlowRoute, hostIsAllowed } from "../flow/http-server.js";
+import { handleFlowRoute } from "../flow/http-server.js";
 import { userDir } from "../core/user-dir.js";
 import { readRegistryAuth } from "../extensions/registry-auth.js";
-import { getDialogModeScopes, getFeedbackModeScopes, setDialogMode, setFeedbackMode, setPlaytestMode } from "../config/user-state.js";
+import { DIALOG_MODE, FEEDBACK_MODE, PLAYTEST_MODE } from "../config/modes.js";
 import { resolvePlaytestMode } from "../editor/playtest-mode.js";
-import { EXTENSION_API_VERSION, type DaemonExtensionApi, type DaemonHealth, type EditorStatus, type RefusedExtension } from "./extension-api.js";
-import { existingGuard, onDialogEvent } from "../editor/dialog-guard.js";
-
-/** What this daemon's extension API offers beyond its version number. */
-export const EXTENSION_FEATURES: readonly string[] = ["callAction.dialogPrompt", "callAction.elicit", "checkpoints", "checkpoints.assetDiff", "events.dialog", "events.script", "models.provider", "modes", "modes.playtest", "skills", "context.projection", "actions.effects", "extension.versions"];
-
-/** What this daemon's HTTP API offers beyond DAEMON_API_VERSION, reported by /v1/health. */
-export const DAEMON_FEATURES: readonly string[] = ["checkpoints", "checkpoints.assetDiff", "skills", "context.projection", "actions.effects", "install.pendingBuild", "editor.rebuild"];
+import { randomUUID } from "node:crypto";
+import { SessionAccess, parseSessionAccessMode, SESSION_ACCESS_MODES } from "../flow/session-access.js";
+import { ensureGuard, existingGuard, nativeAsBlocking, onDialogEvent } from "../editor/dialog-guard.js";
+import { nativeDialogInfo, nativeDialogsForProject } from "../editor/native-dialogs.js";
+import { createRouter, HANDLED, ok, resolveEditorSession, type RouteHandlers, type RouteRequest } from "./router.js";
 import { extensionsDir, loadExtensions, matchRoute, normalizeResponse, type LoadedExtension } from "./extensions.js";
 import { installedCopies, recordedVersion, versionsOf } from "./extension-versions.js";
 import { UiBundleStore, contentType, type UiBundleOwner } from "./ui-bundles.js";
-import { collectStatus } from "../cli/status.js";
+import { ExtensionServices } from "./extension-services.js";
+import { collectStatus } from "../integrations/install-status.js";
 import { resolvePluginDir } from "../editor/install-marker.js";
 import { editorOwnsProject, probeEditorProcessList } from "../editor/engine-observer.js";
 import { applyUpdate, checkForUpdate, readPendingUpdate, repinClientConfigs, settlePendingUpdate } from "../editor/bridge-update.js";
 import { subscribeFlowEvents } from "../flow/events.js";
 import { registerModelProvider } from "../flow/model-provider.js";
+import { registerFlowStepApprover } from "../flow/step-approval.js";
 import { subscribeScriptEvents } from "../pie/script-events.js";
 import { stopAllScriptWatches } from "../pie/script-watch.js";
 import { pluginRoutes } from "./plugin-routes.js";
 import { releaseStartLock, waitForStartTurn } from "./start-lock.js";
-import { checkpointRoute } from "./checkpoint-routes.js";
+import { checkpointRoutes } from "./checkpoint-routes.js";
+import { journalRoutes } from "./journal-routes.js";
+import { toolsRoutes } from "./tools-routes.js";
 import { checkpointsFor, subscribeCheckpointEvents } from "../checkpoints/service.js";
 import { listDaemonSkills } from "../extensions/skills-list.js";
 import { ContextProjectionError, ContextProjector, enabledGraph } from "../server/context-projection.js";
 import { actionEffectInfo } from "../surface/action-effects.js";
-import type { ContextStrategy } from "../surface/context/lean-context.js";
+import type { ContextStrategy } from "../config/context-strategy.js";
 
 const DEFAULT_IDLE_MS = 30 * 60_000;
 const DEFAULT_WAIT_FOR_EDITOR_SECONDS = 60;
@@ -126,14 +145,49 @@ export interface DaemonOptions {
 const STALL_BEAT_MS = 1000;
 const STALL_REPORT_MS = 3000;
 
-/** Pipe a file to a response; a file gone mid-read ends the response instead of the daemon. */
-function streamFile(file: string, res: http.ServerResponse): void {
-  fs.createReadStream(file)
-    .on("error", (e) => {
-      warn("daemon", `could not read ${file}`, e);
-      res.destroy();
-    })
-    .pipe(res);
+/** An extension's call options, as the runtime takes them. */
+function callOptions(o: CallActionOptions | undefined): InProcessCallOptions {
+  return {
+    ...(o?.dialogPrompt ? { dialogPrompt: o.dialogPrompt } : {}),
+    ...(o?.dialogWaitMs !== undefined ? { dialogWaitMs: o.dialogWaitMs } : {}),
+    ...(o?.elicit ? { elicit: o.elicit } : {}),
+    ...(o?.access ? { access: o.access } : {}),
+    ...(o?.signal ? { signal: o.signal } : {}),
+  };
+}
+
+/** A comma list from the query, or undefined when the parameter is absent. */
+function listParam(query: URLSearchParams, name: string): string[] | undefined {
+  const raw = query.get(name);
+  return raw === null ? undefined : raw.split(",").map((c) => c.trim()).filter(Boolean);
+}
+
+/** The discovery record this process publishes. */
+function discoveryRecord(port: number, token: string, projectDir: string, startedAt: string): DaemonDiscovery {
+  return {
+    pid: process.pid,
+    port,
+    token,
+    version: packageVersion(),
+    apiVersion: DAEMON_API_VERSION,
+    projectRoot: normalizeProjectRoot(projectDir),
+    startedAt,
+  };
+}
+
+/** Whether anything accepts a connection on this loopback port; a closed port refuses at once. */
+function listening(port: number, timeoutMs = 300): Promise<boolean> {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: "127.0.0.1", port });
+    const done = (up: boolean): void => {
+      socket.destroy();
+      resolve(up);
+    };
+    socket.setTimeout(timeoutMs, () => done(true));
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+  });
 }
 
 export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
@@ -155,6 +209,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         message: open.message,
         buttons: open.buttons,
         ...(open.items ? { items: open.items } : {}),
+        ...(open.blocks ? { blocks: open.blocks } : {}),
+        ...(open.native ? { native: open.native } : {}),
         mode: guard.mode,
       });
     }
@@ -257,7 +313,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (pending) events.publish("update.failed", { version: pending.version, error: e instanceof Error ? e.message : String(e) });
     }
   };
-  // A daemon restarted under a running editor (Studio updating itself) must not swap a staged tree in beneath it.
+  // A daemon restarted under a running editor (a client restarting it to update) must not swap a staged tree in beneath it.
   settleUpdate(projectDir, findLiveInstanceRecord(projectDir) !== null);
 
   // Look for a newer release now and then, never in the first minute (tests and short runs finish first).
@@ -286,7 +342,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   });
   // Checkpoints: checkpoint.created and checkpoint.restored for one checkpoint, checkpoints.* for the history.
   const unsubscribeCheckpoints = subscribeCheckpointEvents((e) => {
-    const type = e.type === "created" || e.type === "restored" ? `checkpoint.${e.type}` : `checkpoints.${e.type}`;
+    const type: DaemonEventType = e.type === "created" || e.type === "restored" ? `checkpoint.${e.type}` : `checkpoints.${e.type}`;
     events.publish(type, e.data as unknown as Record<string, unknown>);
   });
 
@@ -299,22 +355,39 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const wss = new WebSocketServer({ noServer: true });
   let clients = 0;
   const transports = new Set<WebSocketServerTransport>();
+  // Every open MCP session by id, with the access mode its calls run under (#1484).
+  const mcpSessions = new Map<string, { client: () => string; connectedAt: string; access: SessionAccess }>();
+  const sessionIds = new WeakMap<http.IncomingMessage, string>();
+  // Implicit asset leases switch on once more than one client shares the editor.
+  rt.sessions.leases.liveSessions = () => mcpSessions.size;
+  const listSessions = (): McpSessionInfo[] => [...mcpSessions].map(([id, m]) =>
+    ({ id, client: m.client(), connectedAt: m.connectedAt, access: m.access.mode }));
+  // The id goes back on the upgrade response, so a client on the socket knows which session it is.
+  wss.on("headers", (headers, req) => {
+    const id = randomUUID();
+    sessionIds.set(req, id);
+    headers.push(`${DAEMON_HEADERS.session}: ${id}`);
+  });
 
   wss.on("connection", (ws, req) => {
     clients += 1;
-    const header = String(req.headers["x-ue-mcp-client"] ?? "unknown");
+    const header = String(req.headers[DAEMON_HEADERS.client] ?? "unknown");
     const transport = new WebSocketServerTransport(ws);
     transports.add(transport);
-    const { server, dispose } = createMcpServer(rt);
+    const sessionId = sessionIds.get(req) ?? randomUUID();
+    // A client can open its session read-only, so no call slips through before it sets the mode.
+    const access = new SessionAccess(parseSessionAccessMode(req.headers[DAEMON_HEADERS.access]));
+    const { server, dispose } = createMcpServer(rt, { access, sessionId });
     // The MCP client's own name once it has introduced itself, else what the shim said.
     const client = (): string => server.server.getClientVersion()?.name ?? header;
+    mcpSessions.set(sessionId, { client, connectedAt: new Date().toISOString(), access });
 
     // Every call, attributed by client, for the activity feed.
     const started = new Map<string | number, { at: number; label: CallLabel }>();
     transport.observe = (direction, message) => {
       if (direction === "in" && "method" in message && message.method === "initialize") {
         const info = (message.params as { clientInfo?: { name?: string; version?: string } } | undefined)?.clientInfo;
-        events.publish("client.connected", { client: info?.name ?? header, version: info?.version ?? null, clients });
+        events.publish("client.connected", { client: info?.name ?? header, version: info?.version ?? null, clients, session: sessionId, access: access.mode });
       } else if (direction === "in" && "method" in message && message.method === "tools/call" && "id" in message) {
         const label = describeToolCall(message.params);
         started.set(message.id as string | number, { at: Date.now(), label });
@@ -336,9 +409,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     ws.on("close", () => {
       clients -= 1;
       transports.delete(transport);
+      mcpSessions.delete(sessionId);
+      // A session that ends gives up its asset leases, so nobody waits out a holder that is gone.
+      const released = rt.sessions.leases.releaseHolder(sessionId);
+      if (released > 0) events.publish("leases.released", { session: sessionId, count: released });
       dispose();
       void server.close().catch(() => {});
-      events.publish("client.disconnected", { client: client(), clients });
+      events.publish("client.disconnected", { client: client(), clients, session: sessionId });
       touch();
     });
   });
@@ -358,15 +435,32 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const cookieName = (): string => `ue_mcp_token_${port}`;
   const cookieTokens = (req: http.IncomingMessage): string[] =>
     [...(req.headers.cookie ?? "").matchAll(/(?:^|;\s*)ue_mcp_token(?:_\d+)?=([0-9a-f]+)/g)].map((m) => m[1]);
+  // Every daemon listens on a fresh port, so a browser that outlives daemon
+  // restarts (a client window, an editor dock) collects one login per
+  // restart. Nothing expires them, and once the jar passed Node's 16 KiB
+  // header limit every request came back 431. Logging in clears the logins of
+  // daemons no longer listening; one still running keeps its own.
+  const staleCookies = async (req: http.IncomingMessage): Promise<string[]> => {
+    const names = new Set(
+      [...(req.headers.cookie ?? "").matchAll(/(?:^|;\s*)(ue_mcp_token(?:_(\d+))?)=/g)]
+        .filter((m) => m[2] !== String(port))
+        .map((m) => m[1]),
+    );
+    const dead = await Promise.all([...names].map(async (name) => {
+      const p = Number(name.slice("ue_mcp_token_".length));
+      return name === "ue_mcp_token" || !(await listening(p)) ? name : null;
+    }));
+    return dead.filter((n): n is string => n !== null);
+  };
   const authorized = (req: http.IncomingMessage): boolean => {
     if (!hostIsAllowed(req) || !originAllowed(req)) return false;
     const header = req.headers.authorization;
-    if (header === `Bearer ${token}`) return true;
+    if (typeof header === "string" && header.startsWith("Bearer ") && tokensMatch(header.slice("Bearer ".length), token)) return true;
     // The served page authenticates by cookie, set once from ?token= on /ui.
-    if (cookieTokens(req).includes(token)) return true;
+    if (cookieTokens(req).some((t) => tokensMatch(t, token))) return true;
     // EventSource cannot set headers; the stream alone also takes the token as a query.
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    return url.pathname === "/v1/events" && url.searchParams.get("token") === token;
+    return url.pathname === routePath("events") && tokensMatch(url.searchParams.get("token"), token);
   };
 
   const health = (): DaemonHealth => ({
@@ -383,7 +477,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     extensions: extensions.map((x) => ({ name: x.name, version: x.version })),
     refusedExtensions,
     ui: ui.active()?.manifest.version ?? null,
+    uiBundles: ui.extensionBundles(),
     features: DAEMON_FEATURES,
+    sessions: listSessions(),
   });
   const editors = (): EditorState[] => rt.sessions.list().map((s) => states.get(s) ?? {
     name: s.name, connected: s.bridge.isConnected, port: s.bridge.port, pid: null, lastDisconnect: null,
@@ -393,16 +489,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // The daemon owns these, so it can say beforehand why the editor is about to
   // go away and the disconnect is classified as that rather than guessed.
   const editorOp = async (op: string): Promise<Record<string, unknown>> => {
-    const text = (r: { content?: Array<{ text?: string }> }) => r.content?.map((c) => c.text ?? "").join("\n") ?? "";
     const step = async (category: string, action: string) => {
       const name = `${category}.${action}`;
       events.publish("editor.operation", { op, step: name, phase: "started" });
-      const result = await rt.callAction(category, action);
-      const body = text(result);
-      // A handler reports failure by RETURNING success: false, which the dispatch
-      // passes on as a result, not an error. Reading isError alone took a failed
-      // build for a good one and launched the editor on it (#1384).
-      const failure = editorStepFailure(result.isError === true, body);
+      const served = await rt.callActionOutcome(category, action);
+      // `result` is the step's answer as an MCP client reads it.
+      const body = toToolResult(served.outcome, rt.sessions, served.session).content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+      // A handler reports failure by RETURNING success: false, which the
+      // pipeline passes on as a result, not an error. Reading the error alone
+      // took a failed build for a good one and launched the editor on it (#1384).
+      const failure = editorStepFailure(served.outcome);
       if (failure === null) {
         events.publish("editor.operation", { op, step: name, phase: "done" });
       } else {
@@ -435,6 +531,32 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // Flow tasks editor.restart and editor.rebuild go through the same announced operations.
   rt.sessions.editorOperation = async (op) => (await editorOp(op)) as { steps: Array<{ step: string; ok: boolean; result: string }> };
 
+  // ── Native dialogs ──────────────────────────────────────────────
+  // Win32 boxes the editor process shows, read from outside it by the window
+  // scan the dialog guard uses, so a UI can show and answer one while the
+  // bridge cannot answer anything.
+  const nativeDialogList = (): NativeDialogView[] =>
+    rt.sessions.list().flatMap((s) =>
+      nativeDialogsForProject(s.project.projectPath).map((d) => ({
+        editor: s.name,
+        ...nativeDialogInfo(d),
+        title: d.title,
+        message: d.text.join("\n"),
+        text: d.text,
+        buttons: d.buttons,
+        hung: d.hung,
+      })));
+  const pressNativeDialogFor = async (hwnd: string, button: string, pid?: number): Promise<NativeDialogPressResult> => {
+    for (const s of rt.sessions.list()) {
+      const d = nativeDialogsForProject(s.project.projectPath).find((x) => x.hwnd === String(hwnd));
+      if (!d) continue;
+      if (pid !== undefined && pid !== d.pid) return { pressed: false, closed: false, error: "That dialog belongs to another process than the one named." };
+      const guard = existingGuard(s) ?? (await ensureGuard(s));
+      return guard.pressNativeButton(nativeAsBlocking(d), button, "person");
+    }
+    return { pressed: false, closed: false, error: "No native dialog with that handle is open in an editor of this project." };
+  };
+
   // ── Context projection ──────────────────────────────────────────
   const projector = new ContextProjector(rt);
   const actionEffects = (categories?: string[]) => actionEffectInfo(enabledGraph(rt), rt.loads.dispatchUnion.tools, categories);
@@ -444,8 +566,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const refusedExtensions: RefusedExtension[] = [];
   // An extension's bundles are held to its version from activation, when it installs its own UI.
   const uiOwners: UiBundleOwner[] = [];
+  const services = new ExtensionServices();
+  /** Extensions already told to declare "registry.account", so the log says it once. */
+  const warnedAccount = new Set<string>();
+  const uiOwner = (x: { name: string; version: string; uiMin?: string; uiRoot?: false }): UiBundleOwner =>
+    ({ name: x.name, version: x.version, ...(x.uiMin ? { uiMin: x.uiMin } : {}), ...(x.uiRoot === false ? { root: false } : {}) });
   const extensions: LoadedExtension[] = await loadExtensions((name, routes, setBusy, pkg): DaemonExtensionApi => {
-    uiOwners.push({ name, ...pkg });
+    uiOwners.push(uiOwner({ name, ...pkg }));
     ui.setOwners(uiOwners);
     return {
       apiVersion: EXTENSION_API_VERSION,
@@ -457,7 +584,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         return dir;
       })(),
       events: {
-        publish: (type, data) => events.publish(`${name}.${type}`, data),
+        publish: (type, data) => events.publishFor(name, type, data),
         subscribe: (listener) => events.subscribe(listener),
         since: (lastId) => events.since(lastId),
       },
@@ -465,14 +592,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         routes.push({ method, path: routePath, handler });
       },
       callAction: async (category, action, args, callOpts) => {
-        const r = await rt.callAction(category, action, args, {
-          ...(callOpts?.dialogPrompt ? { dialogPrompt: callOpts.dialogPrompt } : {}),
-          ...(callOpts?.dialogWaitMs !== undefined ? { dialogWaitMs: callOpts.dialogWaitMs } : {}),
-          ...(callOpts?.elicit ? { elicit: callOpts.elicit } : {}),
-        });
+        const r = await rt.callAction(category, action, args, callOptions(callOpts));
         return { isError: !!r.isError, content: r.content };
       },
       features: EXTENSION_FEATURES,
+      nativeDialogs: {
+        list: () => nativeDialogList(),
+        press: (hwnd, button, o) => pressNativeDialogFor(hwnd, button, o?.pid),
+      },
+      services: services.forOwner(name),
       versions: () => ({
         loaded: pkg.version,
         recorded: recordedVersion(projectDir, name),
@@ -480,6 +608,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       }),
       models: {
         register: (provider) => registerModelProvider(provider),
+      },
+      flows: {
+        approveSteps: (approver) => registerFlowStepApprover(name, approver),
       },
       skills: {
         list: () => listDaemonSkills(projectDir),
@@ -494,11 +625,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
             { strategy: callOpts?.strategy ?? rt.contextStrategy, ...(callOpts?.categories ? { categories: callOpts.categories } : {}) },
             tool,
             input ?? {},
-            {
-              ...(callOpts?.dialogPrompt ? { dialogPrompt: callOpts.dialogPrompt } : {}),
-              ...(callOpts?.dialogWaitMs !== undefined ? { dialogWaitMs: callOpts.dialogWaitMs } : {}),
-              ...(callOpts?.elicit ? { elicit: callOpts.elicit } : {}),
-            },
+            callOptions(callOpts),
           );
           return { isError: !!r.isError, content: r.content };
         },
@@ -507,14 +634,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       editorOperation: (op) => editorOp(op),
       setBusy,
       ui: {
-        trustKey: (pem) => ui.trustKey(pem),
+        trustKey: (pem) => ui.trustKey(pem, name),
         install: (dir) => ui.install(dir),
         active: () => ui.active()?.manifest ?? null,
+        own: () => ui.own(name)?.manifest ?? null,
       },
       modes: {
         get: () => {
-          const feedback = getFeedbackModeScopes(projectDir);
-          const dialog = getDialogModeScopes(projectDir);
+          const feedback = FEEDBACK_MODE.scopes(projectDir);
+          const dialog = DIALOG_MODE.scopes(projectDir);
           return {
             // Unset everywhere, feedback asks, as the tool does; a dialog mode left unset follows the client.
             feedback: { mode: feedback.project ?? feedback.user ?? "interactive", project: feedback.project !== undefined },
@@ -522,16 +650,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
             playtest: resolvePlaytestMode(projectDir),
           };
         },
-        setFeedback: (mode) => setFeedbackMode(mode, projectDir),
-        setDialog: (mode) => setDialogMode(mode, projectDir),
-        setPlaytest: (mode) => setPlaytestMode(mode, projectDir),
+        setFeedback: (mode) => FEEDBACK_MODE.set(mode, projectDir),
+        setDialog: (mode) => DIALOG_MODE.set(mode, projectDir),
+        setPlaytest: (mode) => PLAYTEST_MODE.set(mode, projectDir),
       },
       checkpoints: (() => {
-        const of = (editor?: string) => {
-          const session = editor ? rt.sessions.find(editor) : rt.sessions.active;
-          if (!session) throw new Error(`No editor session '${editor}'`);
-          return checkpointsFor(session);
-        };
+        const of = (editor?: string) => checkpointsFor(resolveEditorSession(rt.sessions, editor));
         return {
           state: (o) => of(o?.editor).state(o?.limit),
           setEnabled: (enabled, o) => of(o?.editor).setEnabled(enabled),
@@ -545,6 +669,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         };
       })(),
       registryAccount: async () => {
+        if (!pkg.permissions) {
+          if (!warnedAccount.has(name)) {
+            warnedAccount.add(name);
+            warn("extension", `${name} uses the ue-mcp account without declaring it. Add "ueMcpExtension": { "permissions": ["registry.account"] } to its package.json; from ue-mcp ${REGISTRY_ACCOUNT_PERMISSION_REQUIRED_FROM} registryAccount() answers null without it.`);
+          }
+        } else if (!pkg.permissions.includes("registry.account")) {
+          return null;
+        }
         const auth = await readRegistryAuth();
         return auth ? { login: auth.login, token: auth.token, registry: auth.registry } : null;
       },
@@ -555,57 +687,63 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     };
   }, opts.extensionsDir, refusedExtensions, packageVersion(), projectDir);
   // One that failed to activate no longer holds its bundles back.
-  ui.setOwners(extensions.map((x) => ({ name: x.name, version: x.version, ...(x.uiMin ? { uiMin: x.uiMin } : {}) })));
+  ui.setOwners(extensions.map(uiOwner));
+  for (const o of uiOwners) if (!extensions.some((x) => x.name === o.name)) services.revokeOwner(o.name);
 
-  const readBody = (req: http.IncomingMessage): Promise<unknown> => new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => {
-      const raw = Buffer.concat(chunks).toString("utf-8").trim();
-      if (!raw) return resolve(undefined);
-      try {
-        resolve(JSON.parse(raw));
-      } catch (e) {
-        reject(e);
-      }
-    });
-    req.on("error", reject);
+  // ── Routes ──────────────────────────────────────────────────────
+  const errorBody = (e: unknown) => ({ error: e instanceof Error ? e.message : String(e) });
+  /** The JSON body, where a body that is not JSON is the caller's mistake (400). */
+  const body400 = (r: RouteRequest): Promise<unknown> => r.body().catch((e: unknown) => {
+    throw new StatusError(400, errorBody(e).error);
   });
-
-  // The project's ue-mcp plugins: list, registry catalog, install, update, uninstall.
-  const plugins = pluginRoutes({ projectDir, onChanged: () => events.publish("plugins.changed", {}) });
-
-  const json = (res: http.ServerResponse, status: number, body: unknown): void => {
-    res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+  const uiFile: RouteHandlers["ui"] = ({ url }) => {
+    const file = ui.resolve(url.pathname);
+    if (!file) {
+      const none = !url.pathname.startsWith("/ui/ext/") && ui.active() === null;
+      return {
+        status: none ? 503 : 404,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+        raw: none ? "No client UI is installed for this daemon." : "Not found.",
+      };
+    }
+    return { status: 200, headers: { "content-type": contentType(file), "cache-control": "no-cache", "x-content-type-options": "nosniff" }, file };
+  };
+  const editorRoute = (op: "start" | "stop" | "restart" | "rebuild"): RouteHandlers["editor.start"] => async () => {
+    try {
+      return ok(await editorOp(op));
+    } catch (e) {
+      return { status: 500, body: errorBody(e) };
+    }
+  };
+  const sessionAccess: RouteHandlers["sessions.access"] = async (r) => {
+    const id = r.params.id;
+    const session = mcpSessions.get(id);
+    if (!session) return { status: 404, body: { error: `no open MCP session '${id}'` } };
+    if (r.method === "GET") return ok({ id, access: session.access.mode });
+    if (r.method !== "PUT" && r.method !== "POST") return { status: 405, body: { error: "GET or PUT" } };
+    const mode = parseSessionAccessMode((await body400(r) as { mode?: unknown } | undefined)?.mode);
+    if (!mode) return { status: 400, body: { error: `mode is one of ${SESSION_ACCESS_MODES.join(", ")}` } };
+    if (session.access.set(mode)) {
+      info("daemon", `session ${id} (${session.client()}) is now ${mode}`);
+      events.publish("session.access", { session: id, client: session.client(), access: mode });
+    }
+    return ok({ id, access: session.access.mode });
   };
 
-  let closing: Promise<void> | null = null;
-  const httpServer = http.createServer((req, res) => {
-    const first = new URL(req.url ?? "/", "http://127.0.0.1");
-    if (req.method === "GET" && (first.pathname === "/ui" || first.pathname === "/ui/") && first.searchParams.get("token") === token
-      && hostIsAllowed(req)) {
-      res.writeHead(302, {
-        "set-cookie": `${cookieName()}=${token}; HttpOnly; SameSite=Strict; Path=/`,
-        location: "/ui/",
-      }).end();
-      return;
-    }
-    if (!authorized(req)) {
-      res.writeHead(401).end();
-      return;
-    }
-    const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    if (req.method === "GET" && url.pathname === "/v1/health") {
-      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(health()));
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/v1/events") {
-      const last = Number(req.headers["last-event-id"] ?? url.searchParams.get("since") ?? 0) || 0;
+  const handlers: RouteHandlers = {
+    "health": () => ok(health()),
+    "events": ({ req, res, url }) => {
+      const asked = Number(req.headers["last-event-id"] ?? url.searchParams.get("since") ?? 0) || 0;
+      // An id past the newest came from an earlier daemon, which numbered its own events: start over, and say events were missed.
+      const restarted = asked > events.lastId;
+      const last = restarted ? 0 : asked;
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-      const write = (e: { id: number; type: string; at: string; data: Record<string, unknown> }) =>
+      // Headers now, not with the first event: a quiet daemon would otherwise leave the client without a response.
+      res.flushHeaders();
+      const write = (e: DaemonEvent) =>
         res.write(`id: ${e.id}\nevent: ${e.type}\ndata: ${JSON.stringify({ at: e.at, ...e.data })}\n\n`);
       const backlog = events.since(last);
-      if (backlog.gap) res.write(`event: gap\ndata: {}\n\n`);
+      if (backlog.gap || restarted) res.write(`event: ${DAEMON_GAP_EVENT}\ndata: {}\n\n`);
       for (const e of backlog.events) write(e);
       const unsubscribe = events.subscribe(write);
       sse.add(res);
@@ -614,160 +752,162 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         sse.delete(res);
         touch();
       });
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/v1/update") {
-      // ?channel=beta follows that npm dist-tag instead of the one the installed version implies.
-      const channel = url.searchParams.get("channel");
-      if (channel !== null && !/^[A-Za-z][0-9A-Za-z._-]{0,31}$/.test(channel)) return json(res, 400, { error: "channel is an npm dist-tag such as latest or beta" });
-      checkForUpdate(rt.project.projectPath ?? opts.projects[0], undefined, channel ?? undefined).then((check) => json(res, 200, check));
-      return;
-    }
-    if (req.method === "POST" && url.pathname === "/v1/update/apply") {
-      readBody(req)
-        .then(async (body) => {
-          const b = (body ?? {}) as { version?: unknown; binaries?: unknown };
-          const uproject = rt.project.projectPath ?? opts.projects[0];
-          // A bridge that has not written its instance record yet (starting, or an older build) still
-          // maps its DLLs, so the process table is asked too. A probe that cannot run counts as running:
-          // the in-place swap is safe with the editor down, the whole-tree one is not with it up.
-          const editorRunning = editors().some((e) => e.connected) || findLiveInstanceRecord(projectDir) !== null
-            || (await editorProcessHolds(uproject));
-          return applyUpdate(uproject, {
-            version: typeof b.version === "string" ? b.version : undefined,
-            binaries: typeof b.binaries === "string" ? b.binaries : null,
-            editorRunning,
-            onEvent: (type, data) => events.publish(type, data),
-          });
-        })
-        .then((result) => json(res, result.ok ? 200 : 500, result), (e) => json(res, 400, { error: e instanceof Error ? e.message : String(e) }));
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/v1/install") {
+      return HANDLED;
+    },
+    "install": () => {
       // The same read-only report as `ue-mcp status --json`.
       try {
-        json(res, 200, collectStatus(rt.project.projectPath ?? opts.projects[0]));
+        return ok(collectStatus(rt.project.projectPath ?? opts.projects[0]));
       } catch (e) {
-        json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+        return { status: 500, body: errorBody(e) };
       }
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/v1/skills") {
+    },
+    "update.check": async ({ query }) => {
+      // ?channel=beta follows that npm dist-tag instead of the one the installed version implies.
+      const channel = query.get("channel");
+      if (channel !== null && !/^[A-Za-z][0-9A-Za-z._-]{0,31}$/.test(channel)) return { status: 400, body: { error: "channel is an npm dist-tag such as latest or beta" } };
+      return ok(await checkForUpdate(rt.project.projectPath ?? opts.projects[0], undefined, channel ?? undefined));
+    },
+    "update.apply": async (r) => {
       try {
-        json(res, 200, { skills: listDaemonSkills(projectDir) });
+        const b = ((await r.body()) ?? {}) as { version?: unknown; binaries?: unknown };
+        const uproject = rt.project.projectPath ?? opts.projects[0];
+        // A bridge that has not written its instance record yet (starting, or an older build) still
+        // maps its DLLs, so the process table is asked too. A probe that cannot run counts as running:
+        // the in-place swap is safe with the editor down, the whole-tree one is not with it up.
+        const editorRunning = editors().some((e) => e.connected) || findLiveInstanceRecord(projectDir) !== null
+          || (await editorProcessHolds(uproject));
+        const result = await applyUpdate(uproject, {
+          version: typeof b.version === "string" ? b.version : undefined,
+          binaries: typeof b.binaries === "string" ? b.binaries : null,
+          editorRunning,
+          onEvent: (type, data) => events.publish(type, data),
+        });
+        return { status: result.ok ? 200 : 500, body: result };
       } catch (e) {
-        json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+        return { status: 400, body: errorBody(e) };
       }
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/v1/actions") {
-      const raw = url.searchParams.get("categories");
+    },
+    "skills": () => {
       try {
-        json(res, 200, { actions: actionEffects(raw === null ? undefined : raw.split(",").map((c) => c.trim()).filter(Boolean)) });
+        return ok({ skills: listDaemonSkills(projectDir) });
       } catch (e) {
-        json(res, e instanceof RangeError ? 400 : 500, { error: e instanceof Error ? e.message : String(e) });
+        return { status: 500, body: errorBody(e) };
       }
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/v1/context/projection") {
-      const strategy = (url.searchParams.get("strategy") ?? rt.contextStrategy) as ContextStrategy;
-      const raw = url.searchParams.get("categories");
-      const categories = raw === null ? undefined : raw.split(",").map((c) => c.trim()).filter(Boolean);
+    },
+    "actions": ({ query }) => {
       try {
-        json(res, 200, projector.project({ strategy, ...(categories ? { categories } : {}) }));
+        return ok({ actions: actionEffects(listParam(query, "categories")) });
       } catch (e) {
-        json(res, e instanceof ContextProjectionError ? 400 : 500, { error: e instanceof Error ? e.message : String(e) });
+        return { status: e instanceof RangeError ? 400 : 500, body: errorBody(e) };
       }
-      return;
-    }
-    if (req.method === "POST" && url.pathname === "/v1/shutdown") {
+    },
+    "context.projection": ({ query }) => {
+      const strategy = (query.get("strategy") ?? rt.contextStrategy) as ContextStrategy;
+      const categories = listParam(query, "categories");
+      try {
+        return ok(projector.project({ strategy, ...(categories ? { categories } : {}) }));
+      } catch (e) {
+        return { status: e instanceof ContextProjectionError ? 400 : 500, body: errorBody(e) };
+      }
+    },
+    "sessions.list": () => ok({ sessions: listSessions() }),
+    "sessions.access": sessionAccess,
+    "sessions.unknown": () => ({ status: 404, body: { error: "not found" } }),
+    "dialogs.native": () => ok({ dialogs: nativeDialogList() }),
+    "dialogs.native.press": async (r) => {
+      const b = ((await body400(r)) ?? {}) as { hwnd?: unknown; button?: unknown; pid?: unknown };
+      if ((typeof b.hwnd !== "string" && typeof b.hwnd !== "number") || typeof b.button !== "string" || b.button === "") {
+        return { status: 400, body: { error: `hwnd (the window handle from ${routePath("dialogs.native")}) and button (one of its labels) are required` } };
+      }
+      try {
+        const result = await pressNativeDialogFor(String(b.hwnd), b.button, typeof b.pid === "number" ? b.pid : undefined);
+        return { status: result.pressed ? 200 : 409, body: result };
+      } catch (e) {
+        return { status: 400, body: errorBody(e) };
+      }
+    },
+    // Answered before the daemon starts closing its server.
+    "shutdown": ({ res }) => {
       res.writeHead(202).end();
       void shutdown("shutdown requested");
-      return;
-    }
-    if (req.method === "POST" && url.pathname === "/v1/handoff") {
+      return HANDLED;
+    },
+    "handoff": ({ res }) => {
       res.writeHead(202).end();
       void handoff();
-      return;
-    }
-    const op = /^\/v1\/editor\/(start|stop|restart|rebuild)$/.exec(url.pathname);
-    if (req.method === "POST" && op) {
-      editorOp(op[1]).then(
-        (result) => json(res, 200, result),
-        (e) => json(res, 500, { error: e instanceof Error ? e.message : String(e) }),
-      );
-      return;
-    }
-    if (req.method === "GET" && (url.pathname === "/ui" || url.pathname.startsWith("/ui/"))) {
-      const file = ui.resolve(url.pathname);
-      if (!file) {
-        const none = ui.active() === null;
-        res.writeHead(none ? 503 : 404, { "content-type": "text/plain; charset=utf-8" })
-          .end(none ? "No client UI is installed for this daemon." : "Not found.");
-        return;
+      return HANDLED;
+    },
+    "editor.start": editorRoute("start"),
+    "editor.stop": editorRoute("stop"),
+    "editor.restart": editorRoute("restart"),
+    "editor.rebuild": editorRoute("rebuild"),
+    ...checkpointRoutes(rt.sessions),
+    ...journalRoutes(rt.sessions),
+    ...toolsRoutes(rt),
+    // The project's ue-mcp plugins: list, registry catalog, install, update, uninstall.
+    ...pluginRoutes({ projectDir, onChanged: () => events.publish("plugins.changed", {}) }),
+    "flows": async ({ req, res, url, path: routed }) => {
+      try {
+        const handled = await handleFlowRoute(rt.flowRequest, req, res, routed.slice("/v1".length), url);
+        return handled ? HANDLED : { status: 404 };
+      } catch (e) {
+        return { status: 500, body: errorBody(e) };
       }
-      res.writeHead(200, {
-        "content-type": contentType(file),
-        "cache-control": "no-cache",
-        "x-content-type-options": "nosniff",
-      });
-      streamFile(file, res);
-      return;
-    }
-    if (url.pathname.startsWith("/v1/ext/")) {
-      const hit = matchRoute(extensions, req.method ?? "GET", url.pathname);
-      if (!hit) {
-        res.writeHead(404).end();
-        return;
-      }
-      readBody(req)
-        .then((body) => hit.route.handler({
-          method: req.method ?? "GET",
-          path: url.pathname.slice(`/v1/ext/${hit.ext.name}`.length) || "/",
+    },
+    "ext": async (r) => {
+      const hit = matchRoute(extensions, r.method, r.url.pathname);
+      if (!hit) return { status: 404 };
+      // An extension's own errors are its 500, whatever they carry.
+      try {
+        const body = await r.body();
+        const out = await hit.route.handler({
+          method: r.method,
+          path: r.url.pathname.slice(`/v1/ext/${hit.ext.name}`.length) || "/",
           params: hit.params,
-          query: Object.fromEntries(url.searchParams),
-          headers: req.headers,
+          query: Object.fromEntries(r.query),
+          headers: r.req.headers,
           body,
-        }))
-        .then((out) => {
-          const n = normalizeResponse(out ?? undefined);
-          res.writeHead(n.status, n.headers).end(n.body);
-        }, (e) => json(res, 500, { error: e instanceof Error ? e.message : String(e) }));
+        });
+        const n = normalizeResponse(out ?? undefined);
+        return { status: n.status, headers: n.headers, raw: n.body };
+      } catch (e) {
+        return { status: 500, body: errorBody(e) };
+      }
+    },
+    "ui.extension": uiFile,
+    "ui": uiFile,
+  };
+  const route = createRouter(handlers);
+
+  let closing: Promise<void> | null = null;
+  // The header limit is raised so a browser already holding a jar past the
+  // default 16 KiB still reaches the login below, which clears it.
+  const httpServer = http.createServer({ maxHeaderSize: 64 * 1024 }, (req, res) => {
+    const first = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (req.method === "GET" && (first.pathname === "/ui" || first.pathname === "/ui/") && tokensMatch(first.searchParams.get("token"), token)
+      && hostIsAllowed(req)) {
+      void staleCookies(req).then((stale) => {
+        res.writeHead(302, {
+          "set-cookie": [
+            `${cookieName()}=${token}; HttpOnly; SameSite=Strict; Path=/`,
+            ...stale.map((name) => `${name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`),
+          ],
+          location: "/ui/",
+        }).end();
+      });
       return;
     }
-    if (url.pathname === "/v1/plugins" || url.pathname.startsWith("/v1/plugins/")) {
-      readBody(req)
-        .then((body) => plugins(req.method ?? "GET", url.pathname.slice("/v1/plugins".length).replace(/\/+$/, ""), body))
-        .then((r) => (r ? json(res, r.status, r.body) : void res.writeHead(404).end()), (e) => json(res, 500, { error: e instanceof Error ? e.message : String(e) }));
+    if (!authorized(req)) {
+      res.writeHead(401).end();
       return;
     }
-    if (url.pathname === "/v1/checkpoints" || url.pathname.startsWith("/v1/checkpoints/")) {
-      const sub = url.pathname.slice("/v1/checkpoints".length).replace(/\/+$/, "");
-      readBody(req)
-        .then((body) => checkpointRoute(rt.sessions, req.method ?? "GET", sub, url.searchParams, body))
-        .then((r) => {
-          if (!r) return void res.writeHead(404).end();
-          if (!r.file) return json(res, r.status, r.body);
-          // A picture is named by the blob id of the version it shows, so it never changes.
-          res.writeHead(200, { "content-type": r.file.type, "cache-control": "private, max-age=31536000, immutable", "x-content-type-options": "nosniff" });
-          streamFile(r.file.path, res);
-        }, (e) => json(res, 500, { error: e instanceof Error ? e.message : String(e) }));
-      return;
-    }
-    if (url.pathname === "/v1/flows" || url.pathname.startsWith("/v1/flows/")) {
-      const sub = url.pathname.slice("/v1".length).replace(/\/+$/, "");
-      handleFlowRoute(rt.flowTool, rt.baseCtx, req, res, sub, url).then(
-        (handled) => { if (!handled) res.writeHead(404).end(); },
-        (e) => json(res, 500, { error: e instanceof Error ? e.message : String(e) }),
-      );
-      return;
-    }
-    res.writeHead(404).end();
+    route(req, res);
   });
 
   httpServer.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    if (url.pathname !== "/v1/mcp" || !authorized(req) || closing) {
+    if (url.pathname !== routePath("mcp") || !authorized(req) || closing) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;
@@ -800,7 +940,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   async function handoff(): Promise<void> {
     info("daemon", "handoff requested; exiting once no call is in flight");
-    while (inflight() > 0) await new Promise((r) => setTimeout(r, 250));
+    // Bounded: a call that never returns would leave this daemon running beside its successor.
+    if (!(await drainInflight(inflight, HANDOFF_DRAIN_MS))) warn("daemon", `${inflight()} call(s) still in flight after ${HANDOFF_DRAIN_MS / 1000}s; handing off anyway`);
     await shutdown("handed off to a newer daemon");
   }
 
@@ -820,7 +961,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       unsubscribeCheckpoints();
       stopAllScriptWatches();
       unsubscribeDialogs();
-      for (const x of extensions) await Promise.resolve(x.dispose?.()).catch((e) => warn("extension", `${x.name} dispose failed`, e));
+      for (const x of extensions) {
+        await Promise.resolve(x.dispose?.()).catch((e) => warn("extension", `${x.name} dispose failed`, e));
+        services.revokeOwner(x.name);
+      }
       for (const w of watchers) w.close();
       if (opts.publish !== false) removeDiscovery(projectDir);
       for (const res of sse) res.end();
@@ -837,15 +981,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   rt.logSummary();
 
 
-  const discovery: DaemonDiscovery = {
-    pid: process.pid,
-    port,
-    token,
-    version: packageVersion(),
-    apiVersion: DAEMON_API_VERSION,
-    projectRoot: normalizeProjectRoot(projectDir),
-    startedAt,
-  };
+  const discovery = discoveryRecord(port, token, projectDir, startedAt);
   const superseded = opts.publish !== false ? rivalDaemon(projectDir, discovery.version) : null;
   if (opts.publish !== false && !superseded) writeDiscovery(projectDir, discovery);
   events.publish("daemon.started", { pid: process.pid, port, version: discovery.version });
@@ -877,7 +1013,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       const http = rt.project.config.http;
       if (!http?.enabled || flowHttp) return;
       try {
-        flowHttp = startFlowHttpServer(rt.flowTool, rt.baseCtx, { port: http.port, host: http.host }).server;
+        flowHttp = startFlowHttpServer(rt.flowRequest, { port: http.port, host: http.host }).server;
       } catch (e) {
         error("http", "Failed to start the flow HTTP server", e);
       }
@@ -901,7 +1037,7 @@ export async function runDaemon(projects: string[]): Promise<number> {
     return 2;
   }
   const projectDir = path.dirname(path.resolve(projects[0]));
-  const turn = await waitForStartTurn(projectDir, (d) => !isOlder(d.version, packageVersion()));
+  const turn = await waitForStartTurn(projectDir, (d) => compareVersions(d.version, packageVersion()) >= 0, { isStale: discoveryIsStale });
   if (turn.action === "defer") {
     info("daemon", `daemon ${turn.live.version} already running (pid ${turn.live.pid}); not starting another`);
     return 0;
@@ -919,15 +1055,7 @@ export async function runDaemon(projects: string[]): Promise<number> {
       }
       daemon.superseded = rivalDaemon(projectDir, packageVersion(), existing.pid);
       if (!daemon.superseded) {
-        writeDiscovery(projectDir, {
-          pid: process.pid,
-          port: daemon.port,
-          token: daemon.token,
-          version: packageVersion(),
-          apiVersion: DAEMON_API_VERSION,
-          projectRoot: normalizeProjectRoot(projectDir),
-          startedAt: new Date().toISOString(),
-        });
+        writeDiscovery(projectDir, discoveryRecord(daemon.port, daemon.token, projectDir, new Date().toISOString()));
       }
     }
   } finally {
@@ -941,11 +1069,20 @@ export async function runDaemon(projects: string[]): Promise<number> {
 
   // Only now, so a daemon taking over binds the port after the old one let it go.
   daemon.startFlowHttp();
+  // The record is ours from here; once it names another live daemon, this one steps down.
+  const supersede = watchSupersede({
+    projectDir,
+    onSuperseded: (by) => {
+      info("daemon", `daemon ${by.version} (pid ${by.pid}) took over this project; stopping this one`);
+      void daemon.close();
+    },
+  });
   const stop = (): void => void daemon.close().then(() => process.exit(0));
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   daemon.events.subscribe((e) => {
     if (e.type !== "daemon.stopping") return;
+    supersede.stop();
     // A daemon that took over published its record here, not in startDaemon, so it withdraws it here too.
     if (existing) removeDiscovery(projectDir);
     setTimeout(() => process.exit(0), 500).unref();
@@ -953,33 +1090,19 @@ export async function runDaemon(projects: string[]): Promise<number> {
   return new Promise<number>(() => {});
 }
 
+/** How long a daemon asked to hand off waits for its calls; under the 120 s its successor waits for it. */
+const HANDOFF_DRAIN_MS = 90_000;
+
 /** A live same-or-newer daemon published by another process, other than `ignorePid`. */
 function rivalDaemon(projectDir: string, version: string, ignorePid?: number): DaemonDiscovery | null {
   const d = readLiveDiscovery(projectDir);
-  return d && d.pid !== process.pid && d.pid !== ignorePid && !isOlder(d.version, version) ? d : null;
+  return d && d.pid !== process.pid && d.pid !== ignorePid && compareVersions(d.version, version) >= 0 ? d : null;
 }
 
 async function requestHandoff(d: DaemonDiscovery): Promise<void> {
   try {
-    await fetch(`http://127.0.0.1:${d.port}/v1/handoff`, { method: "POST", headers: { authorization: `Bearer ${d.token}` } });
+    await daemonRequest(d, "handoff", { method: "POST" });
   } catch (e) {
     warn("daemon", `handoff request to pid ${d.pid} failed`, e);
   }
-}
-
-/** True when a is an older release than b. Prerelease ordering follows semver loosely. */
-export function isOlder(a: string, b: string): boolean {
-  const parse = (v: string) => {
-    const [core, pre] = v.split("-", 2);
-    return { nums: core.split(".").map((n) => Number(n) || 0), pre: pre ?? null };
-  };
-  const x = parse(a);
-  const y = parse(b);
-  for (let i = 0; i < 3; i++) {
-    if ((x.nums[i] ?? 0) !== (y.nums[i] ?? 0)) return (x.nums[i] ?? 0) < (y.nums[i] ?? 0);
-  }
-  if (x.pre === y.pre) return false;
-  if (x.pre === null) return false;
-  if (y.pre === null) return true;
-  return x.pre.localeCompare(y.pre, undefined, { numeric: true }) < 0;
 }

@@ -14,7 +14,7 @@ import { actionSchema } from "../../src/surface/action-schema.js";
 import { actionSignature } from "../../src/surface/action-signature.js";
 import { contractViolation, specProblems, type HandlerSpecs } from "../../src/surface/handler-spec.js";
 import { validateCategoryParams } from "../../src/surface/context/call-envelope.js";
-import { deployedPlugin, recordedPluginSpecs } from "../../src/bridge/bridge-parity.js";
+import { deployedPlugin, recordedPluginSpecs } from "../../src/tools/project/bridge-parity.js";
 import type { BridgeCapabilities } from "../../src/bridge/bridge.js";
 import type { FlowContext } from "../../src/flow/context.js";
 import type { IBridge } from "../../src/bridge/bridge.js";
@@ -65,13 +65,17 @@ function run(ctor: TaskConstructor, options: Record<string, unknown>) {
 }
 
 describe("a native handler with a recorded contract", () => {
-  it("carries its spec, strict keys and a Params clause generated from it", () => {
+  it("carries its spec and strict keys, with the summary alone as its description", () => {
     const { tool } = provided();
     const action = tool.actions.stamp_set;
     expect(action.paramSpec).toEqual(SPECS.stamp_set.params);
     expect(action.strictParams).toBe(true);
     expect(action.recordedContract).toEqual({ method: "stamp_set", spec: SPECS.stamp_set });
-    expect(action.description).toBe("Set a stamp. Params: actorPath (or path), blendMode?, priority?, quality?");
+    expect(action.description).toBe("Set a stamp.");
+    expect(action.paramSpec?.map((p) => `${p.name}${p.required ? "" : "?"}`)).toEqual(
+      ["actorPath", "blendMode?", "priority?", "quality?"],
+    );
+    expect(action.paramSpec?.[0].aliases).toEqual(["path"]);
   });
 
   it("advertises a key two handlers declare differently as either, and describes each action by its own", () => {

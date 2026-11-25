@@ -1,5 +1,6 @@
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
 import { z } from "zod";
-import type { ToolDef, PluginInfo } from "../core/types.js";
+import type { ToolDef, PluginInfo } from "../surface/tool-types.js";
 import { categoryTool } from "../surface/category-tool.js";
 import { actions as epicActions, schema as epicSchema } from "./epic/plugins.generated.js";
 
@@ -10,7 +11,9 @@ export const pluginsTool: ToolDef = categoryTool(
     list: {
       kind: "handler",
       effect: "read",
-      description: "Every plugin loaded from ue-mcp.yml: name, version, prefix, status, and injected actions. Params: none",
+      offline: "Reads the plugin set this server loaded.",
+      params: {},
+      description: "Every plugin loaded from ue-mcp.yml: name, version, prefix, status, and injected actions.",
       handler: async (ctx) => {
         const all = ctx.getPlugins?.() ?? [];
         return {
@@ -23,7 +26,9 @@ export const pluginsTool: ToolDef = categoryTool(
     describe: {
       kind: "handler",
       effect: "read",
-      description: "Full detail for one plugin including knowledge files and flows. Params: name",
+      offline: "Reads one loaded plugin's manifest.",
+      params: { required: ["name"] },
+      description: "Full detail for one plugin including knowledge files and flows.",
       handler: async (ctx, p) => {
         const target = p.name as string;
         const all = ctx.getPlugins?.() ?? [];
@@ -42,7 +47,7 @@ export const pluginsTool: ToolDef = categoryTool(
   {
     ...epicSchema,
     name: z.string().optional().describe("Plugin npm package name (describe action)"),
-  },
+  }, { label: { alwaysOn: true } },
 );
 
 function summarise(p: PluginInfo): Record<string, unknown> {

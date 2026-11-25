@@ -1,3 +1,4 @@
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
 /**
  * Waiting for a PCG generation to finish (#1365).
  *
@@ -5,7 +6,9 @@
  * the cheap get_pcg_generation_state instead, which also binds the component's completion delegates: a run started by
  * anything (execute, the editor, a project UFUNCTION that defers to the next tick) is counted once it ends.
  */
-import type { ToolContext } from "../core/types.js";
+import type { ToolContext } from "../surface/tool-types.js";
+import { declaredDefault } from "../surface/handler-spec.js";
+import { handlerSpecs } from "./specs/pcg.generated.js";
 
 export type WaitState = "generated" | "cancelled" | "cleaned" | "not_started" | "idle" | "timed_out";
 
@@ -70,7 +73,8 @@ export async function waitForGeneration(ctx: ToolContext, options: WaitOptions, 
   if (options.actorLabel !== undefined) selector.actorLabel = options.actorLabel;
   if (options.actorPath !== undefined) selector.actorPath = options.actorPath;
   if (options.componentName !== undefined) selector.componentName = options.componentName;
-  const timeoutMs = Math.max(0, (options.timeoutSeconds ?? 600) * 1000);
+  // The default execute_pcg_graph declares for its own wait, so the two waits agree.
+  const timeoutMs = Math.max(0, (options.timeoutSeconds ?? declaredDefault<number>(handlerSpecs, "execute_pcg_graph", "timeoutSeconds")) * 1000);
   const graceMs = Math.max(0, (options.graceSeconds ?? 2) * 1000);
   const started = clock.now();
   let polls = 0;

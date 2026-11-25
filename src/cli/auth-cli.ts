@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @session independent: Runs that per-user device flow.
 /**
  * `npx ue-mcp auth` - interactive GitHub device-flow auth so feedback(submit)
  * can author issues as the user's real GitHub account.
@@ -9,7 +10,7 @@
  * re-running the full setup wizard.
  */
 
-import { authFile, pollDeviceFlow, readUserAuth, startDeviceFlow } from "../feedback/github-auth.js";
+import { authFile, pollDeviceFlow, readUserAuth, startDeviceFlow } from "../github/auth.js";
 import {
   BOLD,
   CYAN,
@@ -20,9 +21,9 @@ import {
   info,
   ok,
   warn,
-} from "./ui/ansi.js";
-import { singleSelect } from "./ui/select.js";
-import { isMainModule, type CliUsage } from "./cli-main.js";
+} from "../terminal/ansi.js";
+import { singleSelect } from "../terminal/select.js";
+import { guardFetchExitAbort, isMainModule, type CliUsage } from "./cli-main.js";
 
 /**
  * Sign in, or reuse a cached sign-in. True when a token is cached afterwards.
@@ -166,6 +167,7 @@ export async function run(argv: string[] = []): Promise<number | void> {
 
 // Also runnable as `node dist/cli/auth-cli.js`, only when executed directly.
 if (isMainModule(import.meta.url)) {
+  guardFetchExitAbort();
   runFeedbackAuthStep({ ask: false }).then((authorized) => {
     if (!authorized) process.exitCode = 1;
   }, (e) => {

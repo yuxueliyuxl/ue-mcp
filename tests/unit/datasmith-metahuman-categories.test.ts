@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { actionSchema, ROUTING_PARAMS } from "../../src/surface/action-schema.js";
 import { datasmithTool } from "../../src/tools/datasmith.js";
 import { metahumanTool } from "../../src/tools/metahuman.js";
 import { ALL_TOOLS } from "../../src/tools.js";
-import { classifyAction } from "../../src/dispatch/locking.js";
+import { classifyAction } from "../../src/dispatch/written-paths.js";
 import { REGISTERED_HANDLER_TIMEOUT_SECONDS as BRIDGE_TIMEOUTS } from "../../src/bridge/bridge-timeouts.js";
 import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
@@ -18,9 +19,17 @@ describe("datasmith category (#1383)", () => {
   it("is a registered category with the five actions", () => {
     expect(ALL_TOOLS.map((t) => t.name)).toContain("datasmith");
     expect(Object.keys(datasmithTool.actions).sort()).toEqual(["import", "inspect", "query_actors", "reimport", "status"]);
-    expect(datasmithTool.actions.import.description).toContain("Params: filePath, destinationPath, options?");
-    expect(datasmithTool.actions.reimport.description).toContain("sceneAssetPath, filePath?, syncActors?, respawnDeleted?, options?");
-    expect(datasmithTool.actions.query_actors.description).toContain("tagPrefix?, tags?, metadataKey?, metadataValue?");
+    const declared = (action: string) =>
+      actionSchema(datasmithTool, action).params
+        .filter((p) => !ROUTING_PARAMS.has(p.name))
+        .map((p) => `${p.name}${p.required ? "" : "?"}`);
+    expect(declared("import")).toEqual(expect.arrayContaining(["filePath", "destinationPath", "options?"]));
+    expect(declared("reimport")).toEqual(
+      expect.arrayContaining(["sceneAssetPath", "filePath?", "syncActors?", "respawnDeleted?", "options?"]),
+    );
+    expect(declared("query_actors")).toEqual(
+      expect.arrayContaining(["tagPrefix?", "tags?", "metadataKey?", "metadataValue?"]),
+    );
   });
 
   it("classifies reads and mutations", () => {
@@ -33,7 +42,7 @@ describe("datasmith category (#1383)", () => {
   it("gives the long calls the plugin's timeouts", () => {
     expect(BRIDGE_TIMEOUTS.datasmith_import).toBe(600);
     expect(BRIDGE_TIMEOUTS.datasmith_reimport).toBe(600);
-    expect(datasmithTool.actions.import.timeoutMs).toBe(600_000);
+    expect(datasmithTool.actions.import.timeoutMs).toBeUndefined();
   });
 
   it("reaches Datasmith by reflection only, and says when the plugin is off", () => {
@@ -54,8 +63,11 @@ describe("metahuman category (#1354)", () => {
     expect(Object.keys(metahumanTool.actions).sort()).toEqual([
       "assemble", "create_character", "read_character", "request_rig", "request_textures", "set_body", "set_wardrobe", "status",
     ]);
-    expect(metahumanTool.actions.set_body.description).toContain("Params: assetPath (or characterPath), constraints");
-    expect(metahumanTool.actions.assemble.timeoutMs).toBe(900_000);
+    const setBody = actionSchema(metahumanTool, "set_body").params;
+    const assetPath = setBody.find((p) => p.name === "assetPath");
+    expect(assetPath).toMatchObject({ required: true, aliases: ["characterPath"] });
+    expect(setBody.find((p) => p.name === "constraints")?.required).toBe(true);
+    expect(metahumanTool.actions.assemble.timeoutMs).toBeUndefined();
     expect(BRIDGE_TIMEOUTS.metahuman_assemble).toBe(900);
   });
 

@@ -1,4 +1,5 @@
-import type { ActionSpec, ToolDef } from "../core/types.js";
+// @session independent: Builds the deprecated old address of a moved action from its canonical spec; the same answer in every editor.
+import type { ActionSpec, ToolDef } from "./tool-types.js";
 
 /**
  * The old address of an action that moved to another category, kept for one

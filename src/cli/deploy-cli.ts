@@ -1,10 +1,11 @@
+// @session per-session: Deploys into one project, chosen with --editor.
 import * as path from "node:path";
 import { ProjectContext } from "../config/project.js";
 import { deploy } from "../editor/deployer.js";
 import { coreSkillsInstalled, conflictMessages, installCoreSkills, syncPluginSkills } from "../extensions/skills.js";
-import { takeEditorTarget, EditorFlagError } from "./editor-flag.js";
+import { selectProjectOrExit } from "./editor-flag.js";
 import { findUProject } from "../config/uproject-path.js";
-import { RESET, BOLD, RED, DIM, CYAN, ok, fail } from "./ui/ansi.js";
+import { RESET, BOLD, RED, DIM, CYAN, ok, fail } from "../terminal/ansi.js";
 import type { CliUsage } from "./cli-main.js";
 
 async function deployCmd(argv: string[]) {
@@ -13,14 +14,7 @@ async function deployCmd(argv: string[]) {
   console.log("");
 
   // Find project: --editor, then CLI arg, then cwd.
-  let target: { projectPath?: string; rest: string[] };
-  try {
-    target = takeEditorTarget(argv);
-  } catch (e) {
-    fail(e instanceof EditorFlagError ? e.message : String(e));
-    process.exit(1);
-  }
-  const uprojectPath = target.projectPath || target.rest[0] || findUProject(process.cwd());
+  const uprojectPath = selectProjectOrExit(argv, { positional: true }).projectPath || findUProject(process.cwd());
 
   if (!uprojectPath) {
     fail("No .uproject found. Run from your project directory or pass the path.");

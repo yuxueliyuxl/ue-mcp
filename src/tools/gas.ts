@@ -1,4 +1,5 @@
-import type { ToolDef } from "../core/types.js";
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
+import type { ToolDef } from "../surface/tool-types.js";
 import { categoryTool } from "../surface/category-tool.js";
 import { actions as epicActions, schema as epicSchema } from "./epic/gas.generated.js";
 import { specBp, schema as specSchema } from "./specs/gas.generated.js";
@@ -76,5 +77,5 @@ export const gasTool: ToolDef = categoryTool(
     // #1057: every key a spec'd handler declares, generated from its C++
     // registration.
     ...specSchema,
-  },
+  }, { label: { description: "Gameplay Ability System abilities, effects, attributes", requiredPlugins: ["GameplayAbilities"], keywords: ["gameplay ability", "gameplay effect"] } },
 );

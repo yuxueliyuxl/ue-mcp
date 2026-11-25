@@ -1,3 +1,4 @@
+// @session per-session: One project's shadow history, constructed with that project's directory and never another's.
 /**
  * The shadow history behind checkpoints (#1482): a git repository at
  * <project>/Saved/UE_MCP_Bridge/shadow.git, driven by isomorphic-git, that
@@ -26,6 +27,9 @@ import * as path from "node:path";
 import * as crypto from "node:crypto";
 import git from "isomorphic-git";
 import { unifiedDiff } from "./text-diff.js";
+import { CHECKPOINT_MANIFEST } from "../bridge/wire-contract.js";
+import { StatusError } from "../core/status-error.js";
+import type { ChangeEntry, ChangeKind, ChangeStatus, CheckpointInfo, CheckpointTrigger, RestoreRefusal } from "../contract/daemon.js";
 
 export const DEFAULT_LARGE_FILE_BYTES = 1024 * 1024 * 1024;
 const BRANCH = "refs/heads/checkpoints";
@@ -52,36 +56,6 @@ const TEXT_EXTENSIONS = new Set([
   ".ini", ".h", ".hpp", ".cpp", ".c", ".inl", ".cs", ".uproject", ".uplugin", ".json", ".yml", ".yaml",
   ".txt", ".md", ".py", ".usf", ".ush", ".xml", ".csv", ".js", ".ts", ".toml",
 ]);
-
-export type CheckpointTrigger = "client" | "restore-before" | "restore-after";
-export type ChangeStatus = "added" | "modified" | "deleted";
-export type ChangeKind = "package" | "config" | "source" | "other";
-
-export interface CheckpointInfo {
-  id: string;
-  label: string;
-  createdAt: string;
-  trigger: CheckpointTrigger;
-  files: number;
-}
-
-export interface ChangeEntry {
-  path: string;
-  status: ChangeStatus;
-  kind: ChangeKind;
-  untracked?: true;
-  large?: true;
-  diff?: string;
-  blueprintDiff?: unknown;
-  /** A package's diff from the editor, built on Unreal's own diff code: see asset-diff.ts. */
-  assetDiff?: import("./asset-diff.js").AssetDiff;
-}
-
-export interface RestoreRefusal {
-  path: string;
-  reason: "edited-outside" | "not-recorded" | "write-failed";
-  detail?: string;
-}
 
 /** One file restore will put back, before it is written. */
 export interface RestorePlanEntry {
@@ -265,21 +239,28 @@ export class ShadowRepo {
     for (const dir of this.pendingGenerations()) {
       if (skip.has(path.resolve(dir))) continue;
       dirs.push(dir);
-      const manifest = path.join(dir, "manifest.jsonl");
+      const manifest = path.join(dir, CHECKPOINT_MANIFEST.file);
       if (!fs.existsSync(manifest)) continue;
+      const F = CHECKPOINT_MANIFEST.fields;
       for (const line of fs.readFileSync(manifest, "utf-8").split(/\r?\n/)) {
         if (!line.trim()) continue;
-        let r: { path?: unknown; existed?: unknown; copy?: unknown };
+        let r: Record<string, unknown>;
         try {
           r = JSON.parse(line);
         } catch {
           continue; // A line cut short by a crash.
         }
-        if (typeof r.path !== "string") continue;
-        const key = relativeKey(this.projectDir, r.path);
+        // A line from a newer writer may mean something this reader cannot restore.
+        const version = typeof r[F.version] === "number" ? (r[F.version] as number) : 1;
+        if (version > CHECKPOINT_MANIFEST.version) continue;
+        const file = r[F.path];
+        if (typeof file !== "string") continue;
+        const key = relativeKey(this.projectDir, file);
         if (!key || isExcludedPath(key)) continue;
-        const copy = r.existed === true && typeof r.copy === "string" ? path.resolve(dir, r.copy) : null;
-        records.push({ path: key, existed: r.existed === true && copy !== null && fs.existsSync(copy), copy });
+        const existed = r[F.existed] === true;
+        const copyName = r[F.copy];
+        const copy = existed && typeof copyName === "string" ? path.resolve(dir, copyName) : null;
+        records.push({ path: key, existed: existed && copy !== null && fs.existsSync(copy), copy });
       }
     }
     return { records, dirs };
@@ -708,6 +689,24 @@ export class ShadowRepo {
     return true;
   }
 
+  /**
+   * The bytes of a path as of checkpoint `id`, written to `dest`, for diffing the
+   * project now against it (#1487). Unlike exportAt it counts the copy a save
+   * recorded before overwriting the file that no checkpoint has folded in yet.
+   * `absent`: the path did not exist then. `unrecorded`: nothing recorded it.
+   */
+  async exportAsOf(id: string, key: string, dest: string): Promise<{ checkpoint: CheckpointInfo; state: "written" | "absent" | "unrecorded" }> {
+    if (!this.exists()) throw new CheckpointError(400, "This project has no checkpoint history yet");
+    const chain = await this.chain();
+    const i = await this.resolve(chain, id);
+    const checkpoint = this.info(chain[i]);
+    const at = await this.stateAt(chain, i, fold(key), this.firstPending());
+    if (!at) return { checkpoint, state: "unrecorded" };
+    if (at.state === null) return { checkpoint, state: "absent" };
+    await this.writeState(at.state, dest);
+    return { checkpoint, state: "written" };
+  }
+
   private async writeState(oid: string, dest: string): Promise<void> {
     const s = await this.readState(oid);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -776,16 +775,12 @@ export class ShadowRepo {
   }
 }
 
-export class CheckpointError extends Error {
-  constructor(readonly status: number, message: string) {
-    super(message);
-  }
-}
+export class CheckpointError extends StatusError {}
 
 /** Append one record to a pending generation: copy the file's bytes first, or note that it does not exist. */
 export function appendPendingRecord(dir: string, key: string, file: string): void {
   fs.mkdirSync(dir, { recursive: true });
-  const manifest = path.join(dir, "manifest.jsonl");
+  const manifest = path.join(dir, CHECKPOINT_MANIFEST.file);
   let existed = false;
   let copy: string | null = null;
   try {
@@ -798,7 +793,9 @@ export function appendPendingRecord(dir: string, key: string, file: string): voi
     copy = `${n}.bin`;
     fs.copyFileSync(file, path.join(dir, copy));
   }
-  fs.appendFileSync(manifest, `${JSON.stringify({ path: key, existed, ...(copy ? { copy } : {}) })}\n`);
+  const F = CHECKPOINT_MANIFEST.fields;
+  const line = { [F.version]: CHECKPOINT_MANIFEST.version, [F.path]: key, [F.existed]: existed, ...(copy ? { [F.copy]: copy } : {}) };
+  fs.appendFileSync(manifest, `${JSON.stringify(line)}\n`);
 }
 
 function isBinary(buf: Buffer): boolean {

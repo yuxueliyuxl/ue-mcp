@@ -1,3 +1,4 @@
+// @session independent: The verb lexicon's reading of an action NAME, for the actions this package does not declare; the same answer in every editor.
 /**
  * The effect of an action nobody declared, guessed from its name.
  *
@@ -13,7 +14,7 @@
  *   unknown the name settles nothing. Gated exactly like `mutate`.
  */
 import { MUTATE_PREFIXES, READ_PREFIXES } from "./action-verbs.js";
-import type { ActionEffect } from "../core/types.js";
+import type { ActionEffect } from "./tool-types.js";
 
 /**
  * The same three values as `ActionEffect`, kept as a separate name because

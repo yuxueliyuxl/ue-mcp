@@ -6,8 +6,8 @@
  *
  * Reads tests/golden/handler-specs.json, the recording of the parameter specs
  * the C++ handlers register with (npm run specs:record), and writes
- * src/tools/specs/<category>.generated.ts plus its index: the zod entries every
- * spec'd handler declares and the `Params:` clause of each one. A category
+ * src/tools/specs/<category>.generated.ts plus its index: the recorded spec and
+ * the zod entries of every spec'd handler. A category
  * module declares an action for a spec'd method with `specBp(effect, summary,
  * method)`, and never writes that method's parameters by hand.
  *
@@ -57,4 +57,5 @@ for (const rel of stale) {
 
 const handlers = Object.keys(snapshot.handlers).length;
 if (check && differs > 0) process.exit(1);
-console.log(`[specs] ${handlers} spec'd handlers, ${files.size - 1} categories${differs === 0 ? ", up to date" : ""}`);
+const categories = [...files.keys()].filter((rel) => rel.endsWith(".generated.ts") && rel.startsWith("src/tools/specs/")).length;
+console.log(`[specs] ${handlers} spec'd handlers, ${categories} categories${differs === 0 ? ", up to date" : ""}`);

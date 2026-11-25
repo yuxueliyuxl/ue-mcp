@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { applyNativeToolsConfig } from "../../src/surface/epic-surface.js";
 import { applyLeanContext } from "../../src/surface/context/lean-context.js";
-import type { ToolDef } from "../../src/core/types.js";
+import type { ToolDef } from "../../src/surface/tool-types.js";
 import { actionEnumValues, bp, categoryTool, cloneToolGraph } from "../../src/surface/category-tool.js";
 import { ALL_TOOLS } from "../../src/tools.js";
 import { unionSurface, type SessionSurface } from "../../src/sessions/session-surface.js";
@@ -13,18 +13,14 @@ function mixedTool(): ToolDef {
     "mixed",
     "A category with local and wrapped actions.",
     {
-      keep: bp(
-        "read",
-        "Keep the local action. Params: retained, shared",
-        "keep",
-        (p) => ({ retained: p.retained, shared: p.shared }),
-      ),
-      epic_drop: bp(
-        "read",
-        "Remove the wrapped action. Params: nativeOnly, shared",
-        "epic_call_tool",
-        (p) => ({ nativeOnly: p.nativeOnly, shared: p.shared }),
-      ),
+      keep: {
+        ...bp("read", "Keep the local action.", "keep", (p) => ({ retained: p.retained, shared: p.shared })),
+        params: { required: ["retained", "shared"] },
+      },
+      epic_drop: {
+        ...bp("read", "Remove the wrapped action.", "epic_call_tool", (p) => ({ nativeOnly: p.nativeOnly, shared: p.shared })),
+        params: { required: ["nativeOnly", "shared"] },
+      },
     },
     {
       retained: z.string().optional(),
@@ -95,10 +91,14 @@ describe("native tool surface filtering", () => {
 
     applyNativeToolsConfig(tools, { enabled: false });
 
+    // An `epic_` name that is still an action is one of ue-mcp's own (an
+    // epic category action that wraps no toolset), which stays by design.
+    const kept = new Set(tools.flatMap((tool) => Object.keys(tool.actions)));
+    const wrapped = (m: RegExpMatchArray) => !kept.has(m[0]);
     const mentions = tools.flatMap((tool) => [
-      ...[...tool.description.matchAll(/\bepic_[a-z]\w*/g)].map((m) => `${tool.name}: ${m[0]}`),
+      ...[...tool.description.matchAll(/\bepic_[a-z]\w*/g)].filter(wrapped).map((m) => `${tool.name}: ${m[0]}`),
       ...Object.entries(tool.actions).flatMap(([name, spec]) =>
-        [...(spec.description ?? "").matchAll(/\bepic_[a-z]\w*/g)].map((m) => `${tool.name}.${name}: ${m[0]}`)),
+        [...(spec.description ?? "").matchAll(/\bepic_[a-z]\w*/g)].filter(wrapped).map((m) => `${tool.name}.${name}: ${m[0]}`)),
     ]);
     expect(mentions).toEqual([]);
   });

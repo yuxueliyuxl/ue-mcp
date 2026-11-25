@@ -1,3 +1,4 @@
+// @session independent: One process-wide bus for script run events. The run id rides on the event.
 /**
  * Live progress of a PIE test script run, one module-level bus for every run in this process.
  *
@@ -23,9 +24,12 @@ export type ScriptVerdictSource = "auto" | "action" | "elicitation" | "agent" | 
 
 export interface ScriptExpect {
   value: string;
-  op: "decreasing" | "increasing" | "eq" | "gt" | "lt" | "visible" | "exists";
+  op: "decreasing" | "increasing" | "eq" | "gt" | "lt" | "visible" | "exists" | "triggered";
   target?: number | boolean;
+  /** triggered: 0 or absent waits with no timeout. */
   within_ms?: number;
+  /** triggered only: the player whose input is watched, 0 the editor's own player, 1..N a remote player. */
+  client?: number;
 }
 
 export interface ScriptStep {
@@ -53,7 +57,7 @@ export interface ScriptStep {
   arrange?: Array<Record<string, unknown>>;
   act?: Array<Record<string, unknown>>;
   /**
-   * What arrange and act did: {status: running|done|failed|skipped, reason?, arranged, actions: [{index, action, ok, error?, at_ms}],
+   * What arrange and act did: {status: running|done|failed|skipped, reason?, arranged, actions: [{index, action, ok, error?, target?, at_ms}],
    * started_at_ms, ended_at_ms, duration_ms, wall_ms, captures?}. A skipped one carries only status and reason.
    */
   actResult?: Record<string, unknown>;

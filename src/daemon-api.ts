@@ -1,3 +1,4 @@
+// @session independent: The public ue-mcp/daemon entry point: the contract, and helpers that read its records.
 /**
  * Public surface for building on the ue-mcp daemon: the HTTP and event types a
  * UI reads, the extension contract an in-daemon extension implements, and the
@@ -16,53 +17,10 @@
  *
  * Versioned by DAEMON_API_VERSION (HTTP, events, shim) and
  * EXTENSION_API_VERSION (the extension contract). Within one version, changes
- * are additive.
+ * are additive. Everything contract/daemon.ts declares is public; the helpers
+ * below take and return only its types.
  */
-export { DAEMON_API_VERSION, readDiscovery, readLiveDiscovery, discoveryPath, type DaemonDiscovery } from "./daemon/discovery.js";
-export {
-  EXTENSION_API_VERSION,
-  EXTENSION_API_MIN_VERSION,
-  type ModelProvider,
-  type ModelRequest,
-  type ModelResponse,
-  type ActionResult,
-  type CallActionOptions,
-  type DialogEventData,
-  type DaemonExtension,
-  type DaemonExtensionApi,
-  type DaemonHealth,
-  type EditorStatus,
-  type ExtensionHandler,
-  type ExtensionRequest,
-  type ExtensionResponse,
-  type ChangeEntry,
-  type CheckpointInfo,
-  type ChangesResult,
-  type CheckpointResult,
-  type CheckpointState,
-  type RestoreRefusal,
-  type RestoreResult,
-  type DaemonSkill,
-  type DaemonSkillOwner,
-  type ShadowedSkill,
-  type ProjectSkillFolder,
-  type ContextCallOptions,
-  type ContextProjection,
-  type ContextProjectionOptions,
-  type ProjectedTool,
-  type ActionEffectInfo,
-} from "./daemon/extension-api.js";
-export {
-  parseContextMeasurement,
-  scopeBucket,
-  type ContextMeasurement,
-  type ContextMeasurementParse,
-  type ContextMeasurementRun,
-  type ContextMeasurementTask,
-  type ContextScopeBucket,
-} from "./daemon/context-measurement.js";
-export type { DaemonEvent } from "./daemon/events.js";
-export type { DialogPromptFn, DialogPromptRequest, DialogPromptResult } from "./core/types.js";
-export type { DisconnectCause } from "./daemon/disconnect.js";
-export { signBundle, verifyBundle, type UiManifest } from "./daemon/ui-bundles.js";
-export type { StatusReport, ClientStatus } from "./cli/status.js";
+export * from "./contract/daemon.js";
+export { readDiscovery, readLiveDiscovery, discoveryPath } from "./daemon/discovery.js";
+export { parseContextMeasurement, scopeBucket } from "./surface/context/context-measurement.js";
+export { signBundle, verifyBundle } from "./daemon/ui-bundles.js";

@@ -1,16 +1,14 @@
-import { TaskRegistry, ShellTask } from "@db-lyon/flowkit";
-import type { TaskConstructor, TaskContextInput } from "@db-lyon/flowkit";
-import type { ToolDef } from "../core/types.js";
+// @session per-session: One task registry per session, built from that project's graph.
+import { TaskRegistry } from "@db-lyon/flowkit";
+import type { TaskContextInput } from "@db-lyon/flowkit";
+import type { ToolDef } from "../surface/tool-types.js";
 import type { FlowContext } from "./context.js";
-import { BridgeTask } from "./bridge-task.js";
-import { editorOperationTask } from "./editor-op-task.js";
+import { registerBuiltinTasks } from "./builtins.js";
 import { bridgeTaskClass, handlerTaskClass } from "./task-factory.js";
 import { actionPreparation } from "./run-action.js";
 import { MICRO_GATEWAY_TOOL, MICRO_GATEWAY_CALL, microGatewayTargets, resolveMicroCall } from "../surface/context/micro-context.js";
 import { McpError, ErrorCode } from "../core/errors.js";
 import { paramMapperOf } from "../surface/epic-input.js";
-import { AGENT_TASK_CLASSES } from "./agent-step.js";
-import { PLAYTEST_TASK_CLASSES } from "./playtest.js";
 
 /** A gateway call is an alias for the target task, not a handler that executes
  *  another action and repackages its result. Both MCP and FlowRunner create
@@ -53,14 +51,7 @@ export function buildFlowRegistry(tools: ToolDef[], baseDir?: string): TaskRegis
     ? new MicroTaskRegistry(microGatewayTargets(gateway) ?? tools, baseDir)
     : new TaskRegistry({ baseDir });
 
-  // Register built-in task class paths
-  registry.registerClassPath("ue-mcp.bridge", BridgeTask as unknown as TaskConstructor);
-  registry.register("shell", ShellTask as unknown as TaskConstructor);
-  registry.register("editor.restart", editorOperationTask("restart"));
-  registry.register("editor.rebuild", editorOperationTask("rebuild"));
-  // Model steps (agent, agent_prompt) and the playtest flow's own tasks.
-  for (const [classPath, ctor] of Object.entries(AGENT_TASK_CLASSES)) registry.registerClassPath(classPath, ctor);
-  for (const [name, ctor] of Object.entries(PLAYTEST_TASK_CLASSES)) registry.register(name, ctor);
+  registerBuiltinTasks(registry);
 
   for (const tool of tools) {
     for (const [actionName, spec] of Object.entries(tool.actions)) {
@@ -90,7 +81,7 @@ export function buildFlowRegistry(tools: ToolDef[], baseDir?: string): TaskRegis
           // widget.remove_widget) declare 120s because their method has no
           // entry in the editor's own timeout table, and dropping it here gave
           // them the 30s default on every live call.
-          bridgeTaskClass(taskName, spec.bridge, paramMapperOf(spec), spec.timeoutMs, prep, spec.followUp),
+          bridgeTaskClass(taskName, spec.bridge, paramMapperOf(spec), spec.timeoutMs, prep, { followUp: spec.followUp, intercept: spec.intercept }),
         );
       }
     }

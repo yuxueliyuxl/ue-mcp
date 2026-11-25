@@ -1,3 +1,4 @@
+// @session per-session: Projects the runtime's sessions under another strategy and scope, and dispatches a call to each session through a load built from that session's own surface.
 /**
  * What a client would be handed under one context strategy and a chosen set
  * of categories, and a way to run a call against exactly that surface.
@@ -13,47 +14,21 @@
  */
 import { normalizeObjectSchema } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
-import type { InProcessCallOptions, ToolDef } from "../core/types.js";
+import type { InProcessCallOptions } from "./call-options.js";
+import type { ToolDef } from "../surface/tool-types.js";
 import { composeServerInstructions } from "../surface/context/instructions.js";
-import type { ContextStrategy } from "../surface/context/lean-context.js";
+import type { ContextStrategy } from "../config/context-strategy.js";
+import type { ContextProjection, ContextProjectionOptions, ProjectedTool } from "../contract/daemon.js";
 import { MICRO_GATEWAY_CALL, MICRO_GATEWAY_TOOL } from "../surface/context/micro-context.js";
 import { usesArgsEnvelope } from "../surface/context/call-envelope.js";
 import { injectEditorTarget, injectMigrateTarget } from "../surface/target-params.js";
 import { unionSurface } from "../sessions/session-surface.js";
 import { buildLoadRegistry, strategySurface, type SessionLoad } from "../sessions/session-load.js";
-import { errorResult, type ToolResult } from "../dispatch/server-dispatch.js";
-import { advertisedPresentation } from "./mcp-server.js";
+import { errorResult, type ToolResult } from "./server-dispatch.js";
+import { advertisedPresentation, advertisesFlowTool } from "./mcp-server.js";
 import type { Runtime } from "./runtime.js";
 
 export const CONTEXT_STRATEGIES: readonly ContextStrategy[] = ["micro", "lean", "full"];
-
-export interface ContextProjectionOptions {
-  strategy: ContextStrategy;
-  /** Category names. Omitted means every registered, enabled category. */
-  categories?: string[];
-}
-
-export interface ProjectedTool {
-  name: string;
-  description: string;
-  /** JSON Schema, as tools/list sends it. */
-  inputSchema: Record<string, unknown>;
-  /** The category this tool is, or null for one that is not a category (micro's gateway, lean's catalog, flow). */
-  category: string | null;
-}
-
-export interface ContextProjection {
-  strategy: ContextStrategy;
-  /** The categories in scope after resolving. */
-  categories: string[];
-  /** The initialize instructions this strategy sends, narrowed to the scope when one was given. */
-  instructions: string;
-  /** What tools/list sends, in order. */
-  tools: ProjectedTool[];
-  /** Characters of JSON.stringify({ instructions, tools }) as the server sends them, / 4, rounded. */
-  seedTokens: number;
-  estimator: "chars/4";
-}
 
 /** A request this projection cannot serve: an unknown strategy or category. */
 export class ContextProjectionError extends Error {}
@@ -70,7 +45,8 @@ interface Built {
 
 /** The enabled graph the server would advertise under `full`: one session's, or the union. */
 export function enabledGraph(rt: Runtime): ToolDef[] {
-  const enabled = (load: SessionLoad): ToolDef[] => load.surface.tools.filter((t) => !load.surface.disabled.has(t.name));
+  // A category whose every action a scope took out is not advertised either.
+  const enabled = (load: SessionLoad): ToolDef[] => load.surface.tools.filter((t) => !load.surface.disabled.has(t.name) && Object.keys(t.actions).length > 0);
   const loads = rt.loads.all();
   if (loads.length <= 1) return enabled(rt.primaryLoad);
   return unionSurface(loads.map((l) => ({ ...l.surface, tools: enabled(l) }))).tools;
@@ -136,7 +112,8 @@ export class ContextProjector {
     const categoryNames = new Set(built.categories);
     const wire: Array<{ name: string; description: string; inputSchema: Record<string, unknown>; execution: { taskSupport: "forbidden" } }> = [];
     const tools: ProjectedTool[] = [];
-    for (const tool of [...built.tools, rt.flowTool]) {
+    const flow = advertisesFlowTool(built.strategy) ? [rt.flowTool] : [];
+    for (const tool of [...built.tools, ...flow]) {
       const envelope = tool !== rt.flowTool && usesArgsEnvelope(tool);
       const shown = advertisedPresentation(tool, envelope, built.strategy, have);
       if (!shown) continue;

@@ -1,3 +1,4 @@
+// @session independent: The pristine tool declaration; per-session graphs are clones of it, built in session-surface.
 /**
  * The registry of all category tools the MCP server exposes.
  *
@@ -5,7 +6,7 @@
  * import the list without triggering the MCP server's top-level `main()`
  * side effect.
  */
-import type { ToolDef } from "./core/types.js";
+import type { ToolDef } from "./surface/tool-types.js";
 
 import { projectTool } from "./tools/project.js";
 import { assetTool } from "./tools/asset.js";
@@ -37,6 +38,7 @@ import { dataflowTool } from "./tools/dataflow.js";
 import { conversationTool } from "./tools/conversation.js";
 import { sourceControlTool } from "./tools/source_control.js";
 import { pieTool } from "./tools/pie.js";
+import { canvasTool } from "./tools/canvas.js";
 
 export const ALL_TOOLS: ToolDef[] = [
   projectTool,
@@ -69,6 +71,7 @@ export const ALL_TOOLS: ToolDef[] = [
   dataflowTool,
   conversationTool,
   sourceControlTool,
+  canvasTool,
 ];
 
 /** Flatten to (toolName, actionName, bridgeMethod) triples for every action

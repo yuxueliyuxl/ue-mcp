@@ -1,3 +1,4 @@
+// @session per-session: One tool graph, task registry and guard pipeline per editor, built from that editor's own project.
 /**
  * Everything one editor session needs to serve a call, and the set of them a
  * server holds: each session's own tool graph, plugin load, advertised list,
@@ -6,14 +7,21 @@
 import * as path from "node:path";
 import type { EditorSession, SessionRegistry } from "./session.js";
 import type { ProjectContext } from "../config/project.js";
-import type { PluginInfo, ToolContext, ToolDef } from "../core/types.js";
+import type { PluginInfo, ToolContext, ToolDef } from "../surface/tool-types.js";
 import { McpError, ErrorCode } from "../core/errors.js";
 import { info, warn } from "../core/log.js";
 import { ALL_TOOLS } from "../tools.js";
-import { applyNativeToolsConfig } from "../surface/epic-surface.js";
+import {
+  applyCategoryState,
+  readCategoryState,
+  snapshotGraph,
+  type CategoryState,
+  type PristineGraph,
+} from "../surface/category-state.js";
 import { epicToolsetsOf } from "../surface/registered-surface.js";
-import { baseGraphFor, unionSurface, type SessionSurface, type UnionSurface } from "./session-surface.js";
-import { applyLeanContext, type ContextStrategy } from "../surface/context/lean-context.js";
+import { baseGraphFor, unionSurface, type ProjectSurface, type SessionSurface, type UnionSurface } from "./session-surface.js";
+import { applyLeanContext } from "../surface/context/lean-context.js";
+import type { ContextStrategy } from "../config/context-strategy.js";
 import { buildMicroGateway } from "../surface/context/micro-context.js";
 import { buildFlowRegistry } from "../flow/registry.js";
 import { assertNoLegacyGuardTasks, buildGuards } from "../flow/guards.js";
@@ -35,6 +43,15 @@ export interface SessionLoad {
   advertisedTools: ToolDef[];
   registryTools: ToolDef[];
   registry?: ReturnType<typeof buildFlowRegistry>;
+  /** Every category as its plugins left it, before `disable:` took anything out. */
+  pristine: PristineGraph;
+  /** What this project's `disable:` turns off, as last applied. */
+  categories: CategoryState;
+}
+
+/** Whether a category has anything left to advertise. */
+function hasActions(tool: ToolDef): boolean {
+  return Object.keys(tool.actions).length > 0;
 }
 
 /**
@@ -48,7 +65,7 @@ export function strategySurface(
   strategy: ContextStrategy,
   scope?: ReadonlySet<string>,
 ): { advertisedTools: ToolDef[]; registryTools: ToolDef[] } {
-  const enabled = surface.tools.filter((t) => !surface.disabled.has(t.name) && (!scope || scope.has(t.name)));
+  const enabled = surface.tools.filter((t) => !surface.disabled.has(t.name) && hasActions(t) && (!scope || scope.has(t.name)));
   if (strategy === "micro") {
     const gateway = buildMicroGateway(enabled);
     // Keep every category task in the registry so flows still resolve.
@@ -104,9 +121,21 @@ export async function buildSessionLoad(
   packageVersion: string,
   multi: boolean,
 ): Promise<SessionLoad> {
-  const project = session.project;
+  const load = await buildProjectLoad(session.project, packageVersion, multi ? `editor '${session.name}': ` : "");
+  return { ...load, surface: { session, ...load.surface } };
+}
+
+/**
+ * The surface one project builds, held by no session yet: what a server
+ * starting on it will advertise. Opens no editor connection.
+ */
+export async function buildProjectLoad(
+  project: ProjectContext,
+  packageVersion: string,
+  /** Prefixes this load's log lines, to say which editor they are about. */
+  label = "",
+): Promise<Omit<SessionLoad, "surface"> & { surface: ProjectSurface }> {
   const configDir = project.projectDir ?? undefined;
-  const label = multi ? `editor '${session.name}': ` : "";
 
   // Plugins are resolved, validated and injected BEFORE the flow registry is
   // built so plugin tasks register cleanly.
@@ -119,31 +148,24 @@ export async function buildSessionLoad(
   );
   const tools = pluginLoad.tools;
 
-  // Unreal's wrapped engine tools are declared in ALL_TOOLS, generated from a
-  // recorded catalog with a reviewed effect each. The user's `nativeTools:`
-  // config removes what it excludes; epic(call_tool) still reaches all of them.
-  const nativeCfg = project.config.nativeTools ?? {};
-  const epicSurface = applyNativeToolsConfig(tools, nativeCfg);
-  if (epicSurface.removed > 0) {
-    const why = nativeCfg.enabled === false
-      ? "nativeTools.enabled=false"
-      : `nativeTools.exclude=[${(nativeCfg.exclude ?? []).join(", ")}]`;
-    info(
-      "epic",
-      `${label}Wrapped engine tools withheld (${why}): ${epicSurface.removed} actions; `
-      + "epic(call_tool) still reaches every one of them.",
+  // What `disable:` turns off: whole categories, or only their native or
+  // Epic actions. Kept reversible: the graph as built is remembered, so
+  // project(set_category_enabled) can put a scope back without a restart.
+  const pristine = snapshotGraph(tools);
+  const categories = readCategoryState(project.config);
+  if (categories.deprecatedExclude.length > 0) {
+    warn(
+      "config",
+      `${label}nativeTools.exclude is deprecated and is read as disable: [${categories.deprecatedExclude.map((c) => `${c}:epic`).join(", ")}]. `
+      + "It still applies in this release. Move it with `ue-mcp tools disable <category> --epic`, or edit ue-mcp.yml.",
     );
   }
-  for (const name of epicSurface.droppedCategories) {
-    const i = tools.findIndex((t) => t.name === name);
-    if (i >= 0) tools.splice(i, 1);
-  }
+  applyLoggedState(tools, pristine, categories, label);
 
   return {
     surface: {
-      session,
       tools,
-      disabled: new Set(project.config.disable ?? []),
+      disabled: new Set(categories.all),
       pluginRecords: pluginLoad.records,
       knowledgeByCategory: pluginLoad.knowledgeByCategory,
     },
@@ -151,7 +173,20 @@ export async function buildSessionLoad(
     configDir,
     advertisedTools: tools,
     registryTools: tools,
+    pristine,
+    categories,
   };
+}
+
+/** Apply a category state in place and say what it took out. */
+function applyLoggedState(tools: ToolDef[], pristine: PristineGraph, categories: CategoryState, label: string): void {
+  const applied = applyCategoryState(tools, pristine, categories);
+  const epic = Object.values(applied.removed).reduce((n, r) => n + r.epic, 0);
+  const native = Object.values(applied.removed).reduce((n, r) => n + r.native, 0);
+  if (epic > 0) {
+    info("epic", `${label}Wrapped engine tools withheld by config: ${epic} actions; epic(call_tool) still reaches every one of them.`);
+  }
+  if (native > 0) info("server", `${label}Native actions withheld by config: ${native}.`);
 }
 
 /** The `plugins(list)` view of one load record, resolved against its project. */
@@ -202,7 +237,15 @@ export class SessionLoads {
     private readonly primary: EditorSession,
     private readonly contextStrategy: ContextStrategy,
     private readonly packageVersion: string,
-  ) {}
+  ) {
+    sessions.categories = {
+      view: (session) => {
+        const load = this.perSession.get(session);
+        return load ? { pristine: load.pristine, categories: load.categories, tools: load.surface.tools } : undefined;
+      },
+      apply: (session, state) => this.applyCategories(session, state),
+    };
+  }
 
   get(session: EditorSession): SessionLoad | undefined {
     return this.perSession.get(session);
@@ -295,7 +338,35 @@ export class SessionLoads {
         + "Re-register it with project(add_editor); discovery does not fall back to another editor's graph.",
       );
     }
-    return load.surface.tools.filter((t) => !load.surface.disabled.has(t.name));
+    return load.surface.tools.filter((t) => !load.surface.disabled.has(t.name) && hasActions(t));
+  }
+
+  /** Told after a session's surface was rebuilt at runtime, so the advertised list can follow. */
+  onSurfaceRebuilt?: (session: EditorSession) => void;
+
+  /**
+   * Apply a new category state to a loaded session without a restart. The
+   * graph is put back as it was built and the state taken out again in place,
+   * the context strategy is re-applied, and the registry is rebuilt so the
+   * micro gateway and the lean catalog, which close over the categories they
+   * were built from, see the change. Plugins and guards are not reloaded:
+   * neither depends on which categories are advertised.
+   */
+  async applyCategories(session: EditorSession, categories: CategoryState): Promise<void> {
+    const load = this.perSession.get(session);
+    if (!load) {
+      throw new McpError(ErrorCode.NOT_FOUND, `Editor '${session.name}' has no tool surface built, so there is nothing to turn on or off in it.`);
+    }
+    load.categories = categories;
+    applyLoggedState(load.surface.tools, load.pristine, categories, this.sessions.size > 1 ? `editor '${session.name}': ` : "");
+    load.surface.disabled.clear();
+    for (const name of categories.all) load.surface.disabled.add(name);
+    this.applyContextStrategy(load);
+    await this.buildRegistryFor(load);
+    session.toolGraph = load.registryTools;
+    session.bridge.expectEpicToolsets?.(epicToolsetsOf(load.registryTools));
+    this.dispatchUnion = unionSurface(this.all().map((l) => ({ ...l.surface, tools: l.registryTools })));
+    this.onSurfaceRebuilt?.(session);
   }
 
   /** A context bound to one session, with its accessors bound to it too. */

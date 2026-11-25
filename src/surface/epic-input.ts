@@ -1,3 +1,4 @@
+// @session independent: Pure argument shaping for one wrapped engine tool call; no editor to scope it to.
 /**
  * The argument envelope for a wrapped engine tool.
  *
@@ -148,6 +149,29 @@ function exampleFor(name: string, prop: SchemaProp | undefined): string {
  * argument cannot be assembled, rather than dispatching a call the engine will
  * reject with "input params Json is empty".
  */
+/**
+ * The keys a wrapped engine tool's action accepts beside its own properties:
+ * the `input` object and the raw `inputJson`, and the category's canonical
+ * asset path, which fills the tool's one unresolved asset reference.
+ */
+export const EPIC_ENVELOPE_KEYS = ["input", "inputJson"] as const;
+
+/**
+ * The Graph DSL tools that rewrite a Blueprint's graphs. epic_call_tool checks
+ * what such a rewrite would delete before it runs and refuses unless the caller
+ * passes allowDestructive (#1908).
+ */
+const DSL_REWRITE_TOOLS: ReadonlySet<string> = new Set([
+  "BlueprintToolsets.BlueprintDslToolset.Write",
+  "BlueprintToolsets.BlueprintDslToolset.Edit",
+]);
+
+/** The bridge's own switches a wrapped tool takes beside its arguments. */
+export function epicBridgeKeys(tool: { readonly name: string } | undefined): string[] {
+  return tool && DSL_REWRITE_TOOLS.has(tool.name) ? ["allowDestructive"] : [];
+}
+export const EPIC_ASSET_KEYS = ["assetPath", "path"] as const;
+
 export function resolveEpicToolInput(
   toolName: string,
   schema: EpicInputSchema | undefined,
@@ -185,7 +209,7 @@ export function resolveEpicToolInput(
   const unresolvedRefs = propNames.filter(
     (n) => input[n] === undefined && isAssetRefProp(asProp(props[n])),
   );
-  const canonicalAsset = coerceAssetPathValue(params.assetPath) ?? coerceAssetPathValue(params.path);
+  const canonicalAsset = EPIC_ASSET_KEYS.map((k) => coerceAssetPathValue(params[k])).find((v) => v !== undefined);
   if (unresolvedRefs.length === 1 && canonicalAsset) {
     input[unresolvedRefs[0]] = canonicalAsset;
   }
@@ -211,7 +235,7 @@ export function resolveEpicToolInput(
   }
   const missing = required.filter((n) => input[n] === undefined);
   if (missing.length > 0) {
-    const known = new Set([...propNames, "action", "input", "inputJson"]);
+    const known = new Set<string>([...propNames, "action", "allowDestructive", ...EPIC_ENVELOPE_KEYS]);
     const ignored = Object.keys(params).filter(
       (k) => !known.has(k) && params[k] !== undefined && params[k] !== null,
     );
@@ -239,7 +263,12 @@ export function epicToolCall(
   schema: EpicInputSchema | undefined,
   params: Record<string, unknown>,
 ): Record<string, unknown> {
-  return { toolset, tool, ...resolveEpicToolInput(tool, schema, params) };
+  // allowDestructive is the bridge's own switch, read by epic_call_tool's guard
+  // on Graph DSL rewrites (#1908), so it rides beside `input` rather than in it.
+  const optIn = params.allowDestructive === true && epicBridgeKeys({ name: tool }).length > 0
+    ? { allowDestructive: true }
+    : {};
+  return { toolset, tool, ...resolveEpicToolInput(tool, schema, params), ...optIn };
 }
 
 /**
@@ -256,6 +285,61 @@ export interface EpicToolRef {
   readonly toolset: string;
   /** The qualified tool name, e.g. `UMGToolSet.UMGToolSet.GetWidgets`. */
   readonly name: string;
+  /** The recorded engine versions (major.minor) whose registry has this tool. */
+  readonly engines?: readonly string[];
+  /**
+   * The same tool as a newer engine ships it under another toolset, for the
+   * engines that no longer carry this one. One action keeps its name across
+   * the rename; the attached engine decides which tool a call reaches.
+   */
+  readonly successors?: readonly EpicToolSuccessor[];
+}
+
+/** A newer engine's replacement for a wrapped tool, with its own arguments. */
+export interface EpicToolSuccessor {
+  readonly toolset: string;
+  readonly name: string;
+  readonly engines: readonly string[];
+  /** The successor's input schema; what it forwards. */
+  readonly schema?: EpicInputSchema;
+  /** Older argument names the successor spells differently, old to new. */
+  readonly rename?: Readonly<Record<string, string>>;
+}
+
+/** "5.8" out of "5.8", "5.8.1" or "5.8.0-12345+++UE5+Release-5.8"; null when there is none. */
+export function engineMinor(version: string | null | undefined): string | null {
+  const m = /^(\d+)\.(\d+)/.exec(String(version ?? "").trim());
+  return m ? `${Number(m[1])}.${Number(m[2])}` : null;
+}
+
+/** The successor an editor on `engineVersion` should be sent, or undefined for the tool itself. */
+export function epicSuccessorFor(
+  tool: EpicToolRef | undefined,
+  engineVersion: string | null | undefined,
+): EpicToolSuccessor | undefined {
+  const editor = engineMinor(engineVersion);
+  if (!tool?.successors || !editor) return undefined;
+  return tool.successors.find((s) => s.engines.includes(editor));
+}
+
+/** `params` with every renamed argument under its new name, at the top level and inside `input`. */
+export function renameEpicParams(
+  params: Record<string, unknown>,
+  rename: Readonly<Record<string, string>> | undefined,
+): Record<string, unknown> {
+  if (!rename) return params;
+  const move = (bag: Record<string, unknown>): Record<string, unknown> => {
+    const out = { ...bag };
+    for (const [from, to] of Object.entries(rename)) {
+      if (out[from] !== undefined && out[to] === undefined) out[to] = out[from];
+      if (from !== to) delete out[from];
+    }
+    return out;
+  };
+  const out = move(params);
+  const given = parseObjectish(out.input);
+  if (given && typeof given === "object" && !Array.isArray(given)) out.input = move(given as Record<string, unknown>);
+  return out;
 }
 
 type ParamMapper = (p: Record<string, unknown>) => Record<string, unknown>;
@@ -263,15 +347,20 @@ type ParamMapper = (p: Record<string, unknown>) => Record<string, unknown>;
 /**
  * How a bridge action turns its parameters into the bridge call's arguments:
  * its own `mapParams`, the envelope for a declared `epicTool`, or none (the bag
- * is sent as given). Every dispatch route asks here.
+ * is sent as given). Every dispatch route asks here. With the attached engine's
+ * version, a wrapped tool that engine replaced is sent as its successor.
  */
 export function paramMapperOf(spec: {
   mapParams?: ParamMapper;
   epicTool?: EpicToolRef;
   epicSchema?: EpicInputSchema;
-}): ParamMapper | undefined {
+}, engineVersion?: string | null): ParamMapper | undefined {
   if (spec.mapParams) return spec.mapParams;
   const tool = spec.epicTool;
   if (!tool) return undefined;
+  const successor = epicSuccessorFor(tool, engineVersion);
+  if (successor) {
+    return (p) => epicToolCall(successor.toolset, successor.name, successor.schema, renameEpicParams(p, successor.rename));
+  }
   return (p) => epicToolCall(tool.toolset, tool.name, spec.epicSchema, p);
 }

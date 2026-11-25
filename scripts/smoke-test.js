@@ -18,7 +18,10 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import WebSocket from "ws";
+import { bridgeSocketOptions, watchUpgradeRefusal } from "./lib/bridge-token.mjs";
 import { listRegistrations } from "./lib/cpp-registrations.mjs";
+import { JSON_RPC_ERRORS } from "./lib/wire-contract.mjs";
+import { closeEditorTabWindows, guardUserLayoutsUntilExit } from "./user-layout-guard.mjs";
 import {
   assertLoopbackHost,
   bridgePortCandidates,
@@ -75,11 +78,21 @@ function discoverHandlers() {
 // ---------------------------------------------------------------------------
 function connect(url, timeoutMs = TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    let ws;
+    try {
+      ws = new WebSocket(url, bridgeSocketOptions(url));
+    } catch (err) {
+      reject(err);
+      return;
+    }
     const timer = setTimeout(() => {
       ws.terminate();
       reject(new Error(`Connection to ${url} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
+    watchUpgradeRefusal(ws, url, (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
 
     ws.on("open", () => {
       clearTimeout(timer);
@@ -226,9 +239,9 @@ const HOME_LEVEL = "/Game/MCP_Home";
 // we're not currently sitting on the scratch we're about to delete.
 async function preFlight(ws, idGen) {
   console.log(`${DIM}  preflight: anchor MCP_Home + create blank ${SCRATCH_LEVEL}${RESET}`);
-  await rpcRaw(ws, "demo_go_home", {}, idGen());
+  await rpcRaw(ws, "demo_go_home", { discardUnsaved: true, endPIE: true }, idGen());
   await rpcRaw(ws, "delete_asset", { assetPath: SCRATCH_LEVEL, force: true }, idGen());
-  const r = await rpcRaw(ws, "create_new_level", { levelPath: SCRATCH_LEVEL }, idGen());
+  const r = await rpcRaw(ws, "create_new_level", { levelPath: SCRATCH_LEVEL, discardUnsaved: true, endPIE: true }, idGen());
   if (r.error) {
     console.error(`${YELLOW}  preflight warning: create_new_level failed: ${r.error.message}${RESET}`);
   }
@@ -244,10 +257,13 @@ async function teardown(ws, idGen) {
   await rpcRaw(ws, "delete_asset", { assetPath: HOME_LEVEL, force: true }, idGen());
   // Create a fresh blank MCP_Home; this also switches the editor to it,
   // unloading SCRATCH.
-  await rpcRaw(ws, "create_new_level", { levelPath: HOME_LEVEL }, idGen());
+  // The scratch map is full of unsaved smoke spawns, and a smoke case may have left play running.
+  await rpcRaw(ws, "create_new_level", { levelPath: HOME_LEVEL, discardUnsaved: true, endPIE: true }, idGen());
   await rpcRaw(ws, "save_level", {}, idGen());
   // SCRATCH now unloaded; safe to delete.
   await rpcRaw(ws, "delete_asset", { assetPath: SCRATCH_LEVEL, force: true }, idGen());
+  // open_settings, open_tab and the imports leave floating windows the editor would save as open.
+  await closeEditorTabWindows(async (method, params) => (await rpcRaw(ws, method, params, idGen())).result);
 }
 
 function rpcCall(ws, method, id) {
@@ -278,7 +294,7 @@ function rpcCall(ws, method, id) {
         const code = msg.error.code;
         const message = (msg.error.message || "").toLowerCase();
         const isUnknown =
-          code === -32601 || message.includes("method not found") || message.includes("unknown method");
+          code === JSON_RPC_ERRORS.methodNotFound || message.includes("method not found") || message.includes("unknown method");
         if (isUnknown) {
           resolve({ status: "FAILURE", reason: "unknown method", detail: msg.error.message });
         } else {
@@ -298,6 +314,8 @@ function rpcCall(ws, method, id) {
 // 3. Main
 // ---------------------------------------------------------------------------
 async function main() {
+  // The sweep calls open_settings and open_tab on an editor that stays open; keep those tabs out of the shared layout.
+  guardUserLayoutsUntilExit((msg) => console.error(msg));
   // Discover
   const handlers = discoverHandlers();
   if (handlers.length === 0) {

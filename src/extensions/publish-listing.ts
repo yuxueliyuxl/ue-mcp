@@ -1,9 +1,11 @@
+// @session independent: Pure listing choice, derived fields and diff for plugin publish.
 /**
  * Pure pieces of `ue-mcp plugin publish`: which registry row a package
  * publishes to, the listing fields its manifest already declares, and the
  * field-by-field change a publish would make.
  */
 import type { PluginManifest } from "./manifest.js";
+import { pluginSlug } from "./plugin-groups.js";
 
 export interface ListingRow {
   slug: string;
@@ -41,7 +43,7 @@ export function chooseListing(
     if (taken) return { ok: false, error: `slug '${slugFlag}' is already listed for ${taken.packageName ?? "another plugin"}` };
     return { ok: true, slug: slugFlag, existing: byPackage, renamed: byPackage.slug };
   }
-  const slug = slugFlag ?? pkgName.replace(/^ue-mcp-/, "");
+  const slug = slugFlag ?? pluginSlug(pkgName);
   const bySlug = catalog.find((r) => r.slug === slug);
   if (bySlug && bySlug.packageName && bySlug.packageName !== pkgName) {
     return { ok: false, error: `slug '${slug}' is listed for ${bySlug.packageName}, not ${pkgName}; pass --slug to choose another` };

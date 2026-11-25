@@ -1,3 +1,4 @@
+// @session per-session: Follows the connection of the one session's bridge a flow runs against.
 /**
  * What a flow does when the editor goes away mid-run (`on_editor_loss`).
  *
@@ -17,8 +18,9 @@
  */
 import type { TaskRegistry, TaskResult } from "@db-lyon/flowkit";
 
-export type EditorLossPolicy = "resume" | "rollback" | "fail";
-export const EDITOR_LOSS_POLICIES: readonly EditorLossPolicy[] = ["resume", "rollback", "fail"];
+/** The policies a flow's `on_editor_loss` accepts; the schema and the type both read this. */
+export const EDITOR_LOSS_POLICIES = ["resume", "rollback", "fail"] as const;
+export type EditorLossPolicy = (typeof EDITOR_LOSS_POLICIES)[number];
 export const DEFAULT_EDITOR_LOSS_TIMEOUT_MS = 300_000;
 
 /** The slice of EditorBridge the guard reads. */

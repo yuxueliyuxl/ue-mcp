@@ -52,6 +52,8 @@ private:
 	static TSharedPtr<FJsonValue> ListOverridableFunctions(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ConnectPins(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteNode(const TSharedPtr<FJsonObject>& Params);
+	// #1487: open the Blueprint editor on one node. BlueprintHandlers_Focus.cpp.
+	static TSharedPtr<FJsonValue> FocusNode(const TSharedPtr<FJsonObject>& Params);
 	// #1132: ReconstructNode on one node, and breaking one or all links on a pin.
 	static TSharedPtr<FJsonValue> RefreshNode(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DisconnectPins(const TSharedPtr<FJsonObject>& Params);
@@ -59,10 +61,13 @@ private:
 	static TSharedPtr<FJsonValue> ListGraphs(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ResolveGraph(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetComponentProperty(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetComponentPropertiesBatch(const TSharedPtr<FJsonObject>& Params);
 	// #442: dedicated OverrideMaterials writer for mesh-component templates.
 	static TSharedPtr<FJsonValue> SetComponentOverrideMaterials(const TSharedPtr<FJsonObject>& Params);
 	// #457: timeline track authoring (float / vector / linear-color / event).
 	static TSharedPtr<FJsonValue> AddTimelineTrack(const TSharedPtr<FJsonObject>& Params);
+	// #1654: remove a timeline, its template and every node bound to it.
+	static TSharedPtr<FJsonValue> RemoveTimeline(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetClassDefault(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveComponent(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteVariable(const TSharedPtr<FJsonObject>& Params);
@@ -114,6 +119,8 @@ private:
 	// v1.0.0-rc.15 - agent-friendly BP authoring (#284 #285 #267 #277)
 	static TSharedPtr<FJsonValue> CompileBlueprints(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CleanupGraph(const TSharedPtr<FJsonObject>& Params);
+	// #1908: what a Graph DSL Write or Edit would delete, without writing.
+	static TSharedPtr<FJsonValue> PreflightDslWrite(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ConnectPinsBatch(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetNodePosition(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AutoLayoutGraph(const TSharedPtr<FJsonObject>& Params);

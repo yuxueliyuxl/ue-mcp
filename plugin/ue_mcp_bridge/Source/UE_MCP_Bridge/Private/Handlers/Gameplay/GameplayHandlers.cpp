@@ -14,7 +14,7 @@
 #include "StateTreeEditorData.h"
 #include "StateTreeSchema.h"
 #if UE_MCP_HAS_5_5_API
-#include "StateTreeEditingSubsystem.h"
+#include "HandlerStateTreeEditingSubsystem.h"
 #else
 // 5.4 has no editing subsystem; FStateTreeCompiler is the compile entry point
 // there and lives in the editor module this plugin already links.
@@ -134,11 +134,11 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	};
 	auto SaveFlag = []()
 	{
-		return MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Persist the asset (default true); false defers the write"));
+		return MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Persist the asset (default true); false defers the write")).Default(true);
 	};
 	auto PieInstance = [](const TCHAR* Description)
 	{
-		return MCPParam::Optional(TEXT("pieInstance"), EType::Number, Description);
+		return MCPSharedParam::PieInstance().Describe(Description);
 	};
 	auto QueryPath = []()
 	{
@@ -206,19 +206,19 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	};
 	auto LiveActorLabel = []()
 	{
-		return MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Live actor label or name (the pawn or its AIController)"));
+		return MCPSharedParam::ActorLabel().Describe(TEXT("Live actor label or name (the pawn or its AIController)"));
 	};
 	auto LiveActorPath = []()
 	{
-		return MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Full actor object path; wins over actorLabel"));
+		return MCPSharedParam::ActorPath();
 	};
 	auto LiveWorld = []()
 	{
-		return MCPParam::Optional(TEXT("world"), EType::String, TEXT("World scope: auto (default) | pie | editor"));
+		return MCPSharedParam::World().Describe(TEXT("World scope: auto (default) | pie | editor"));
 	};
 	auto LivePie = []()
 	{
-		return MCPParam::Optional(TEXT("pieInstance"), EType::Number, TEXT("PIE world instance (0 = server/primary); omit for the primary world"));
+		return MCPSharedParam::PieInstance().Describe(TEXT("PIE world instance (0 = server/primary); omit for the primary world"));
 	};
 	auto PerceptionComponent = []()
 	{
@@ -234,7 +234,7 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	};
 	auto NewAssetOnConflict = []()
 	{
-		return MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("skip (default, returns the existing asset) or error when the asset already exists"));
+		return MCPSharedParam::OnConflict();
 	};
 	const FMCPSpecRules CreatesAsset = MCPSpec::ContractExempt(
 		TEXT("Creates and saves an asset under the contract values; nothing it reads fails first"));
@@ -342,7 +342,7 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("displayCategory"), EType::String, TEXT("Display category (Movement, Combat, ...) written onto UPlayerMappableKeySettings")),
 		MCPParam::Optional(TEXT("settingBehavior"), EType::String, TEXT("Per-mapping behavior: InheritSettingsFromAction, OverrideSettings or IgnoreSettings")).Enum({ TEXT("InheritSettingsFromAction"), TEXT("OverrideSettings"), TEXT("IgnoreSettings") }),
 		MCPParam::Optional(TEXT("playerMappableKeySettings"), EType::Object, TEXT("Per-mapping reflected settings fields; null clears the override subobject")).Nullable(),
-		MCPParam::Optional(TEXT("dryRun"), EType::Boolean, TEXT("Validate and report proposed settings without changing the asset (default false)")),
+		MCPSharedParam::DryRun().Describe(TEXT("Validate and report proposed settings without changing the asset (default false)")),
 		SaveFlag(),
 	}, MCPSpec::ExactlyOne({ { TEXT("inputActionPath") }, { TEXT("imcPath"), TEXT("mappingIndex") } }));
 	Registry.RegisterHandler(TEXT("apply_mapping_context"), &ApplyMappingContext, {
@@ -393,10 +393,10 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("radius"), EType::Number, TEXT("How far from location a nearest-lane hit is accepted, in world units (default 100000)")),
 		MCPParam::Optional(TEXT("tags"), EType::Array, TEXT("Zone Graph tag names to keep, as the project settings name them")),
 		MCPParam::Optional(TEXT("limit"), EType::Number, TEXT("How many lanes to report (default 50)")),
-		MCPParam::Optional(TEXT("world"), EType::String, TEXT("editor | pie | auto (default editor)")),
+		MCPSharedParam::World().Describe(TEXT("editor | pie | auto (default editor)")),
 		PieInstance(TEXT("PIE world instance when world is pie or auto")),
-		MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Only this ZoneGraphData actor, by label or name")),
-		MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Only this ZoneGraphData actor, by full object path")),
+		MCPSharedParam::ActorLabel().Describe(TEXT("Only this ZoneGraphData actor, by label or name")),
+		MCPSharedParam::ActorPath().Describe(TEXT("Only this ZoneGraphData actor, by full object path")),
 	});
 	Registry.RegisterHandler(TEXT("create_blackboard"), &CreateBlackboard, {
 		NewAssetName(), NewAssetFolder(TEXT("Content folder (default /Game/AI)")), NewAssetOnConflict(),
@@ -404,7 +404,7 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("create_behavior_tree"), &CreateBehaviorTree, {
 		MCPParam::Required(TEXT("name"), EType::String, TEXT("Asset name")),
 		MCPParam::Optional(TEXT("packagePath"), EType::String, TEXT("Content folder (default /Game/AI)")),
-		MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("skip (default, returns the existing asset) or error when the asset already exists")),
+		MCPSharedParam::OnConflict(),
 		MCPParam::Optional(TEXT("blackboardPath"), EType::String, TEXT("BlackboardData assigned before the first save; an unknown path creates nothing")),
 	});
 	Registry.RegisterHandler(TEXT("create_eqs_query"), &CreateEqsQuery, {
@@ -542,7 +542,7 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("querierLabel"), EType::String, TEXT("Actor the query runs from, which querier-relative contexts resolve against")),
 		MCPParam::Optional(TEXT("querierPath"), EType::String, TEXT("Full object path of the querier; unambiguous where a label is not")),
 		MCPParam::Optional(TEXT("runMode"), EType::String, TEXT("all | best | random (default all)")),
-		MCPParam::Optional(TEXT("world"), EType::String, TEXT("auto | pie | editor (default auto)")),
+		MCPSharedParam::World().Describe(TEXT("auto | pie | editor (default auto)")),
 		PieInstance(TEXT("PIE world instance when world is pie or auto")),
 		MCPParam::Optional(TEXT("limit"), EType::Number, TEXT("How many scored items to return (default 50)")),
 	});
@@ -557,9 +557,9 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("includeActions"), EType::Boolean, TEXT("Include each context's action/key mappings")),
 	});
 	Registry.RegisterHandler(TEXT("get_state_tree_runtime"), &GetStateTreeRuntime, {
-		MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Actor label, name or path. Pass actorLabel or actorPath")),
-		MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Full actor object path; the unambiguous selector")),
-		MCPParam::Optional(TEXT("world"), EType::String, TEXT("pie (default) | editor | auto")),
+		MCPSharedParam::ActorLabel().Describe(TEXT("Actor label, name or path. Pass actorLabel or actorPath")),
+		MCPSharedParam::ActorPath(),
+		MCPSharedParam::World().Describe(TEXT("pie (default) | editor | auto")),
 		PieInstance(TEXT("PIE world instance (0 = server/primary)")),
 		MCPParam::Optional(TEXT("componentName"), EType::String, TEXT("StateTree component to read (default: first found)")),
 	});
@@ -594,7 +594,7 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("areaClass"), EType::String, TEXT("UNavArea subclass: NavArea_Null (default, cuts a hole), NavArea_Obstacle, or a /Script path")),
 		MCPParam::Optional(TEXT("label"), EType::String, TEXT("Actor label, also what onConflict dedupes on")),
 		MCPParam::Optional(TEXT("scale"), EType::Vec3, TEXT("Actor scale, applied after the brush is built")),
-		MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("skip (default, returns the actor already carrying label) or error when one does")),
+		MCPSharedParam::OnConflict().Describe(TEXT("skip (default, returns the actor already carrying label) or error when one does")),
 	}, MCPSpec::ContractExempt(TEXT("Spawns a NavModifierVolume under the contract values; nothing it reads fails first")));
 	Registry.RegisterHandler(TEXT("set_world_game_mode"), &SetWorldGameMode, {
 		MCPParam::Required(TEXT("gameModeClass"), EType::String, TEXT("GameMode class or Blueprint path")).Alias(TEXT("gameModePath")),
@@ -637,6 +637,8 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Required(TEXT("end"), EType::Vec3, TEXT("Query end (world point)")),
 		MCPParam::Optional(TEXT("pathfindingContext"), EType::String, TEXT("Actor label whose navigation agent and filter the query uses")),
 		MCPParam::Optional(TEXT("pathfindingContextPath"), EType::String, TEXT("Full object path of the pathfinding context actor; alternative to pathfindingContext")),
+		MCPSharedParam::World().Describe(TEXT("editor (default) | pie | game | auto; pie queries the running session's navmesh, including after a level change")),
+		MCPSharedParam::PieInstance().Describe(TEXT("PIE instance id; omitted selects the active PIE world")),
 	});
 	Registry.RegisterHandler(TEXT("list_nav_invokers"), &ListNavInvokers, {});
 	Registry.RegisterHandler(TEXT("get_behavior_tree_info"), &GetBehaviorTreeInfo, {
@@ -1013,7 +1015,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::CreateSmartObjectDefinition(const TSha
 	UClass* SmartObjectDefClass = FindObject<UClass>(nullptr, TEXT("/Script/SmartObjectsModule.SmartObjectDefinition"));
 	if (!SmartObjectDefClass)
 	{
-		return MCPError(TEXT("SmartObjectDefinition class not found. Enable SmartObjects plugin."));
+		return MCPPluginUnavailableError(TEXT("SmartObjectDefinition class"), TEXT("SmartObjects"));
 	}
 
 	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("SmartObjectDefinition"), SmartObjectDefClass, nullptr);
@@ -1901,7 +1903,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::CreateStateTree(const TSharedPtr<FJson
 	UClass* STClass = FindObject<UClass>(nullptr, TEXT("/Script/StateTreeModule.StateTree"));
 	if (!STClass)
 	{
-		return MCPError(TEXT("StateTree class not found. Enable StateTree plugin."));
+		return MCPPluginUnavailableError(TEXT("StateTree class"), TEXT("StateTree"));
 	}
 
 	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("StateTree"), STClass, nullptr);
@@ -1980,7 +1982,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::GetStateTreeRuntime(const TSharedPtr<F
 	// Read before the world or actor lookup can fail (#1057).
 	const FString CompName = OptionalString(Params, TEXT("componentName"));
 	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
-	if (!World) return MCPError(FString::Printf(TEXT("World not available for scope '%s'"), *WorldScope));
+	if (!World) return MCPWorldUnavailableError(WorldScope);
 
 	FMCPActorSelector ActorSel;
 	ActorSel.Match = EMCPActorMatch::LabelNameOrPath;
@@ -2314,8 +2316,11 @@ TSharedPtr<FJsonValue> FGameplayHandlers::FindNavPath(const TSharedPtr<FJsonObje
 	const FVector End = OptionalVec3(Params, TEXT("end"));
 	const FString ContextLabel = OptionalString(Params, TEXT("pathfindingContext"));
 	const bool bHasContextPath = HasParam(Params, TEXT("pathfindingContextPath"));
+	const FString WorldScope = OptionalString(Params, TEXT("world"), TEXT("editor"));
 
-	REQUIRE_EDITOR_WORLD(World);
+	// A PIE world has its own navigation system, which is the one a running pawn walks on (#1565).
+	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
+	if (!World) return MCPWorldUnavailableError(WorldScope);
 
 	UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
 	if (!NavSys) return MCPError(TEXT("Navigation system unavailable"));
@@ -2340,6 +2345,8 @@ TSharedPtr<FJsonValue> FGameplayHandlers::FindNavPath(const TSharedPtr<FJsonObje
 	auto Result = MCPSuccess();
 	Result->SetObjectField(TEXT("start"), MCPVec3ToJsonObject(Start));
 	Result->SetObjectField(TEXT("end"), MCPVec3ToJsonObject(End));
+	Result->SetStringField(TEXT("world"), MCPDescribeWorldType(World));
+	Result->SetStringField(TEXT("map"), UWorld::RemovePIEPrefix(World->GetOutermost()->GetName()));
 	if (!Path)
 	{
 		Result->SetBoolField(TEXT("valid"), false);
@@ -3541,7 +3548,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::AddStateTreeComponent(const TSharedPtr
 	UClass* CompClass = LoadClass<UActorComponent>(nullptr, TEXT("/Script/GameplayStateTreeModule.StateTreeComponent"));
 	if (!CompClass)
 	{
-		return MCPError(TEXT("StateTreeComponent not found. Enable the GameplayStateTree plugin."));
+		return MCPPluginUnavailableError(TEXT("StateTreeComponent"), TEXT("GameplayStateTree"));
 	}
 
 	// Idempotency: check for existing component by name/class on the SCS
@@ -3598,7 +3605,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::AddSmartObjectComponent(const TSharedP
 	UClass* CompClass = FindObject<UClass>(nullptr, TEXT("/Script/SmartObjectsModule.SmartObjectComponent"));
 	if (!CompClass)
 	{
-		return MCPError(TEXT("SmartObjectComponent not found. Enable SmartObjects plugin."));
+		return MCPPluginUnavailableError(TEXT("SmartObjectComponent"), TEXT("SmartObjects"));
 	}
 
 	// Idempotency: existing component of this class already on the SCS?

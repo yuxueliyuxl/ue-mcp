@@ -1,3 +1,4 @@
+// @session per-session: One guard per editor: the modal blocking IT, and the decision every route defers to.
 /**
  * The dialog guard. One per editor, one implementation, one decision.
  *
@@ -24,14 +25,18 @@
  * refusal and an on-demand probe both feed the same state, so a dialog is
  * caught by whichever notices first.
  */
-import type { EditorSession } from "../sessions/session.js";
-import type { IBridge } from "../bridge/bridge.js";
-import type { DialogPromptFn, ElicitFn, ElicitPrimitiveSchema, ElicitResult } from "../core/types.js";
-import type { DialogMode } from "../config/user-state.js";
+import type { BridgeCallOptions, IBridge } from "../bridge/bridge.js";
+import type { ProjectContext } from "../config/project.js";
+import { isDialogRefusal } from "../bridge/dialog-refusal.js";
+import { ACTION_FACTS } from "../bridge/action-facts.generated.js";
+import type { DialogBlock, DialogPromptFn } from "../contract/daemon.js";
+import type { ElicitFn, ElicitPrimitiveSchema, ElicitResult } from "../core/elicit.js";
+import type { DialogMode } from "../config/modes.js";
 import { readEnv } from "../core/env.js";
-import { elicitationNeedsRelay } from "../dispatch/client-quirks.js";
+import { elicitationNeedsRelay, elicitationUnrenderedNote } from "../dispatch/client-quirks.js";
 import { resolveDialogMode } from "./dialog-mode.js";
 import { readEngineSnapshot, readLogState } from "./engine-observer.js";
+import { nativeDialogInfo, nativeDialogsForProject, pressNativeDialog, type NativeDialog, type NativeDialogInfo, type NativePressResult } from "./native-dialogs.js";
 
 /** One tickable row of a dialog that asks a question per item. */
 export interface DialogItem {
@@ -41,6 +46,26 @@ export interface DialogItem {
   /** Every cell in Slate order: name, package path, class path. */
   cells: string[];
   checked: boolean;
+}
+
+/** One drop-down picker of a dialog. */
+export interface DialogCombo {
+  index: number;
+  label: string;
+  value: string;
+  enabled: boolean;
+  /** False for a picker that builds its menu only when it opens. */
+  optionsReadable: boolean;
+  options: string[];
+}
+
+/** One editable text box of a dialog. */
+export interface DialogTextField {
+  index: number;
+  label: string;
+  value: string;
+  readOnly: boolean;
+  enabled: boolean;
 }
 
 export interface BlockingDialog {
@@ -56,30 +81,63 @@ export interface BlockingDialog {
    * offer was all or nothing.
    */
   items?: DialogItem[];
+  /**
+   * The body as paragraphs and tables in reading order, without the title or
+   * the button labels (#1891). Only list_dialogs reports it; the status file
+   * and the plugin's refusal carry `message` alone.
+   */
+  blocks?: DialogBlock[];
+  /**
+   * The dialog's drop-down pickers and text boxes, as list_dialogs reports
+   * them; respond_to_dialog's combos and textFields take their indices.
+   */
+  combos?: DialogCombo[];
+  textFields?: DialogTextField[];
+  /**
+   * Set for a native Win32 dialog the editor process shows (a GPU device loss,
+   * an assert box), read from outside the process because the bridge cannot
+   * answer while one is up. Its buttons are pressed by window handle.
+   */
+  native?: NativeDialogInfo;
 }
 
 /**
- * Bridge methods the plugin answers while a modal is up.
- *
- * Mirrors ModalSafeMethods in BridgeServer.cpp plus the handshake reads served
- * before the gate. Pinned by tests/unit/dialog-modal-safe-parity.test.ts,
- * because a method the plugin serves but this list omits would be read as proof
- * the editor is running.
+ * The call that presses `label`. Built here, not by the plugin: the bridge
+ * reports button labels and the tool syntax is this server's.
  */
-const MODAL_SAFE_METHODS = new Set([
-  "list_dialogs",
-  "respond_to_dialog",
-  "list_windows",
-  "press_window_button",
-  "close_window",
-  "get_dialog_policy",
-  "set_dialog_policy",
-  "clear_dialog_policy",
-  "get_engine_state",
-  "get_bridge_capabilities",
-  "get_param_echo",
-  "clear_param_echo",
-]);
+export function respondToDialogCall(label: string): string {
+  return /['’]/.test(label)
+    ? `editor(action='respond_to_dialog', buttonLabel="${label}")`
+    : `editor(action='respond_to_dialog', buttonLabel='${label}')`;
+}
+
+function choicesFor(buttons: readonly string[]): BlockingDialog["choices"] {
+  return buttons.map((b) => ({ buttonLabel: b, respondWith: respondToDialogCall(b) }));
+}
+
+/** A native dialog in the guard's terms, with the same choices a Slate dialog offers. */
+export function nativeAsBlocking(d: NativeDialog): BlockingDialog {
+  return {
+    title: d.title,
+    message: d.text.join("\n"),
+    buttons: d.buttons,
+    choices: choicesFor(d.buttons),
+    native: nativeDialogInfo(d),
+  };
+}
+
+/**
+ * Bridge methods the plugin answers while a modal is up: the ones that declare
+ * themselves modal-safe at their C++ registration, and the handshake reads it
+ * serves off the game thread, before the gate. Read from the recorded action
+ * facts, because a method the plugin serves but this set omitted would be read
+ * as proof the editor is running.
+ */
+const MODAL_SAFE_METHODS = new Set(
+  Object.entries(ACTION_FACTS)
+    .filter(([, facts]) => facts.modalSafe || facts.servedOffGameThread)
+    .map(([method]) => method),
+);
 
 export function isModalSafeMethod(method: string): boolean {
   return MODAL_SAFE_METHODS.has(method);
@@ -155,6 +213,7 @@ export function oneLine(text: string, limit = 220): string {
  * recognise through untouched.
  */
 export function renderDialog(dialog: BlockingDialog): string {
+  if (dialog.blocks && dialog.blocks.length > 0) return renderBlocks(dialog.blocks);
   const raw = dialog.message.split("\n").map((l) => l.trim()).filter((l) => l !== "");
   const buttons = new Set(dialog.buttons.map((b) => b.trim()));
   // The button labels are repeated at the end of the flattened text.
@@ -192,11 +251,45 @@ export function renderDialog(dialog: BlockingDialog): string {
   return out.join("\n");
 }
 
-/** True for the refusal the plugin's own gate emits. */
-export function isDialogRefusal(v: unknown): boolean {
-  return typeof v === "object" && v !== null
-    && (v as Record<string, unknown>).dialogBlocking === true;
+/**
+ * The same layout as renderDialog's, from the structure the plugin read off the
+ * dialog rather than from a guess at the flattened lines: paragraphs, then each
+ * table under its own column headings, whatever its columns are.
+ */
+function renderBlocks(blocks: DialogBlock[]): string {
+  const out: string[] = [];
+  let prose: string[] = [];
+  const flush = () => {
+    if (prose.length > 0) {
+      if (out.length > 0) out.push("");
+      out.push(prose.join("\n"));
+    }
+    prose = [];
+  };
+  for (const block of blocks) {
+    if (block.type === "paragraph") {
+      prose.push(block.text);
+      continue;
+    }
+    flush();
+    const width = Math.max(block.columns.length, ...block.rows.map((r) => r.length));
+    if (width === 0) continue;
+    const at = (cells: string[], c: number) => cells[c] ?? "";
+    const cols = Array.from({ length: width }, (_, c) =>
+      Math.max(at(block.columns, c).length, ...block.rows.map((r) => at(r, c).length)));
+    const line = (cells: string[]) =>
+      "  " + cols.map((w, c) => at(cells, c).padEnd(w)).join("  ").trimEnd();
+    if (out.length > 0) out.push("");
+    if (block.columns.some((c) => c !== "")) {
+      out.push(line(block.columns));
+      out.push(line(cols.map((w) => "-".repeat(w))));
+    }
+    for (const r of block.rows) out.push(line(r));
+  }
+  flush();
+  return out.join("\n");
 }
+
 
 /** Schema key for one tickable row. Kept in one place so both ends agree. */
 function itemKey(index: number): string {
@@ -220,6 +313,34 @@ function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([promise, late]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * The first listed dialog the game thread is parked behind. A parented editor
+ * window is listed with blocksGameThread false and holds nothing (#1454); an
+ * older plugin omits the field and is believed, as the watcher does.
+ */
+function firstBlocking(list: unknown[]): unknown {
+  return list.find((d) => typeof d === "object" && d !== null
+    && (d as { blocksGameThread?: boolean }).blocksGameThread !== false);
+}
+
+/**
+ * Whether a published modal is only the editor's slow-task progress window
+ * (#1851). A save opens "Validating Assets", which sits on Slate's modal stack
+ * while the game thread keeps running the work it reports, so it holds nothing.
+ * The plugin no longer publishes one; this covers a plugin that still does, so
+ * a call made right after a save is not refused on timing. Recognised by shape:
+ * no title, no button but the task's own Cancel, and a slow task under way.
+ */
+export function isProgressReport(modal: unknown, slowTask: unknown): boolean {
+  if (typeof modal !== "object" || modal === null) return false;
+  if (typeof slowTask !== "object" || slowTask === null) return false;
+  const r = modal as { title?: unknown; buttons?: unknown };
+  const title = typeof r.title === "string" ? r.title.trim() : "";
+  if (title !== "") return false;
+  const buttons = Array.isArray(r.buttons) ? r.buttons : [];
+  return buttons.every((b) => typeof b === "string" && b.trim() === "Cancel");
+}
+
 /** Read a dialog out of whatever shape reported it. */
 function asDialog(v: unknown): BlockingDialog | null {
   if (typeof v !== "object" || v === null) return null;
@@ -229,17 +350,50 @@ function asDialog(v: unknown): BlockingDialog | null {
   if (title === null) return null;
   const message = typeof r.dialogMessage === "string" ? r.dialogMessage
     : typeof r.message === "string" ? r.message : "";
+  const buttons = Array.isArray(r.buttons) ? (r.buttons as unknown[]).filter((b): b is string => typeof b === "string") : [];
+  // The plugin's gate refusal reports labels only, so the call that presses one
+  // is built here when the choice does not carry one. Anything else a choice
+  // carries (enabled) is kept.
+  const reported = Array.isArray(r.choices)
+    ? (r.choices as unknown[]).filter((c): c is Record<string, unknown> =>
+        typeof c === "object" && c !== null && typeof (c as Record<string, unknown>).buttonLabel === "string")
+    : null;
+  const choices = reported
+    ? reported.map((c) => ({
+        ...c,
+        buttonLabel: c.buttonLabel as string,
+        respondWith: typeof c.respondWith === "string" ? c.respondWith : respondToDialogCall(c.buttonLabel as string),
+      }))
+    : choicesFor(buttons);
   return {
     title,
     message,
-    buttons: Array.isArray(r.buttons) ? (r.buttons as string[]) : [],
-    choices: Array.isArray(r.choices)
-      ? (r.choices as Array<{ buttonLabel: string; respondWith: string }>)
-      : [],
+    buttons,
+    choices,
     ...(Array.isArray(r.items) && r.items.length > 0
       ? { items: (r.items as DialogItem[]) }
       : {}),
+    ...(Array.isArray(r.blocks) && r.blocks.length > 0
+      ? { blocks: (r.blocks as DialogBlock[]) }
+      : {}),
+    ...(Array.isArray(r.combos) && r.combos.length > 0
+      ? { combos: (r.combos as DialogCombo[]) }
+      : {}),
+    ...(Array.isArray(r.textFields) && r.textFields.length > 0
+      ? { textFields: (r.textFields as DialogTextField[]) }
+      : {}),
   };
+}
+
+/** The rows, blocks and field values one read reported, for comparing two reads of the same dialog. */
+function contentOf(dialog: BlockingDialog): string {
+  return JSON.stringify([
+    dialog.items ?? null,
+    dialog.blocks ?? null,
+    dialog.native?.details ?? null,
+    dialog.combos?.map((c) => c.value) ?? null,
+    dialog.textFields?.map((f) => f.value) ?? null,
+  ]);
 }
 
 /**
@@ -260,23 +414,29 @@ interface AskOutcome {
  * these on its event stream). Observation only: nothing here decides anything.
  *
  *   opened     a dialog is blocking the editor
+ *   updated    the same dialog, read again with content the last event lacked
+ *              (rows, blocks) or with a tick changed: the status file that
+ *              usually reports a dialog first carries its message alone
  *   answered   a button was pressed: by the person through a prompt, or by an
  *              action call (respond_to_dialog)
  *   delegated  the person handed this dialog to the agent
  *   closed     the editor is no longer blocked by it
  */
 export interface DialogEvent {
-  type: "opened" | "answered" | "delegated" | "closed";
+  type: "opened" | "updated" | "answered" | "delegated" | "closed";
   editor: string;
   title: string;
   message: string;
   buttons: string[];
   items?: DialogItem[];
+  blocks?: DialogBlock[];
   /** opened: the mode that applies to it. */
   mode?: DialogMode;
-  /** answered: the button pressed, and the route it came by. */
+  /** answered: the button pressed, and the route it came by. `person` is a press a person made directly, such as from a UI's card. */
   button?: string;
-  via?: "prompt" | "action";
+  via?: "prompt" | "action" | "person";
+  /** A native Win32 dialog: its window handle, process, kind and what it means. */
+  native?: NativeDialogInfo;
 }
 
 const dialogListeners = new Set<(e: DialogEvent) => void>();
@@ -356,6 +516,12 @@ export interface GuardDeps {
   /** Present only when the connected client advertised elicitation. */
   elicit?: () => ElicitFn | undefined;
   /**
+   * Why the connected client cannot be shown a form although it advertised
+   * one, or null. Appended to a defer refusal so the person learns why no
+   * form appeared (#1459).
+   */
+  elicitationNote?: () => string | null;
+  /**
    * A daemon extension's own prompt, for a call that extension made in
    * process. Preferred over `elicit`, because it belongs to the caller of
    * this call.
@@ -370,7 +536,7 @@ export interface GuardDeps {
    * `status.<pid>.json` over the shared file two editors of one project
    * take turns writing, and which reports how old the snapshot is.
    */
-  readSnapshot?: () => { modal?: unknown; ageSeconds?: number } | null;
+  readSnapshot?: () => { modal?: unknown; slowTask?: unknown; ageSeconds?: number } | null;
   /**
    * Whether the editor's own log records it exiting. A dialog latched before
    * the exit began is not one to refuse on: the editor that showed it is
@@ -380,6 +546,14 @@ export interface GuardDeps {
   exiting?: () => boolean;
   /** Whether the bridge socket is currently up. */
   isConnected?: () => boolean;
+  /**
+   * The native Win32 dialogs this editor's process shows, read from outside
+   * it. One of these outranks anything the bridge says: the bridge cannot
+   * answer while the box is up, so asking it would only wait out a timeout.
+   */
+  nativeDialogs?: () => BlockingDialog[];
+  /** Press one button of a native dialog by its window handle. */
+  pressNative?: (dialog: BlockingDialog, button: string) => Promise<NativePressResult>;
   /**
    * How long one call waits on an open form before refusing, in ms.
    *
@@ -434,6 +608,7 @@ export class DialogGuard {
   private delegated = new Set<string>();
   /** The editor this guard watches, named in its events. */
   label = "";
+  private nativeListeners = new Set<(dialog: BlockingDialog) => void>();
 
   constructor(private deps: GuardDeps) {}
 
@@ -480,21 +655,108 @@ export class DialogGuard {
       message: dialog.message,
       buttons: dialog.buttons,
       ...(dialog.items ? { items: dialog.items } : {}),
+      ...(dialog.blocks ? { blocks: dialog.blocks } : {}),
+      ...(dialog.native ? { native: dialog.native } : {}),
       ...extra,
     });
   }
 
-  /** Record a button an action call pressed, for whoever watches. */
-  notePress(button: string, dialog: BlockingDialog | null): void {
-    if (dialog) this.emit("answered", dialog, { button, via: "action" });
+  /** Record a button an action call, or a person directly, pressed, for whoever watches. */
+  notePress(button: string, dialog: BlockingDialog | null, via: "action" | "person" = "action"): void {
+    if (dialog) this.emit("answered", dialog, { button, via });
+  }
+
+  /** The native dialog this editor's process shows, or null. A reader that throws says none. */
+  nativeDialog(): BlockingDialog | null {
+    try {
+      return this.deps.nativeDialogs?.()[0] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Called each time a native dialog starts blocking this editor, so a call
+   * already waiting on the bridge can stop waiting: the bridge will not answer
+   * it while the box is up. Returns the unsubscribe.
+   */
+  onNativeDialog(listener: (dialog: BlockingDialog) => void): () => void {
+    this.nativeListeners.add(listener);
+    return () => this.nativeListeners.delete(listener);
+  }
+
+  /** The native dialog, noted, or null with any latch it left cleared. */
+  private syncNative(): BlockingDialog | null {
+    const native = this.nativeDialog();
+    if (native) {
+      this.note(native);
+      return native;
+    }
+    if (this.blocking?.native) {
+      // Gone from the screen: whatever was believed about it goes too.
+      this.clear();
+      this.forgetDialogRecords();
+    }
+    return null;
+  }
+
+  /**
+   * Press a button on a native dialog by window handle. `via` names who
+   * pressed, for the answered event; null when the caller reports the press
+   * itself (the action route does, once the call succeeds).
+   */
+  async pressNativeButton(dialog: BlockingDialog, button: string, via: "action" | "person" | "prompt" | null): Promise<NativePressResult> {
+    if (!dialog.native || !this.deps.pressNative) {
+      return { pressed: false, closed: false, error: "No native dialog is open in this editor." };
+    }
+    // Known before it is answered, whichever came first: the watcher's next
+    // tick or this press. A no-op for the dialog already noted.
+    this.note(dialog);
+    const r = await this.deps.pressNative(dialog, button);
+    if (r.pressed) {
+      if (via) this.emit("answered", dialog, { button: r.button ?? button, via });
+      if (r.closed) {
+        this.clear();
+        this.forgetDialogRecords();
+      }
+    }
+    return r;
   }
 
   /** Record a dialog. Called by the watcher, a probe, or a plugin refusal. */
   note(dialog: BlockingDialog): void {
-    const fresh = !this.blocking || eventIdentity(this.blocking) !== eventIdentity(dialog);
+    // A native dialog is one window: another handle is another dialog. A read
+    // without the handle (a refusal naming it) is the same one, not a new one.
+    const fresh = !this.blocking || eventIdentity(this.blocking) !== eventIdentity(dialog)
+      || (dialog.native !== undefined && this.blocking.native?.hwnd !== dialog.native.hwnd);
     if (fresh && this.blocking) this.emit("closed", this.blocking);
-    this.blocking = dialog;
-    if (fresh) this.emit("opened", dialog, { mode: DialogGuard.effectiveMode(this.deps.mode(), this.canElicit) });
+    if (fresh) {
+      this.blocking = dialog;
+      this.emit("opened", dialog, { mode: DialogGuard.effectiveMode(this.deps.mode(), this.canElicit) });
+      if (dialog.native) {
+        for (const l of [...this.nativeListeners]) {
+          try {
+            l(dialog);
+          } catch {
+            // A broken listener must not break the guard.
+          }
+        }
+      }
+      return;
+    }
+    // The same dialog read again. The status file and the refusal carry no
+    // rows or blocks, so a read from them keeps what list_dialogs reported
+    // rather than erasing it every second; a read that adds or changes them
+    // is reported, because the first event usually came from the status file.
+    const previous = this.blocking!;
+    const merged: BlockingDialog = {
+      ...dialog,
+      ...(!dialog.items && previous.items ? { items: previous.items } : {}),
+      ...(!dialog.blocks && previous.blocks ? { blocks: previous.blocks } : {}),
+      ...(!dialog.native && previous.native ? { native: previous.native } : {}),
+    };
+    this.blocking = merged;
+    if (contentOf(merged) !== contentOf(previous)) this.emit("updated", merged);
   }
 
   /**
@@ -800,6 +1062,11 @@ export class DialogGuard {
     //
     // So: keep what is known. A genuinely dead editor is already handled, its
     // status file is absent or stale and the watcher has cleared the latch.
+    //
+    // A native dialog comes first. It is read from outside the process, and
+    // while one is up the bridge cannot answer, so a probe would only wait.
+    const native = this.syncNative();
+    if (native) return native;
     if (this.deps.isConnected?.() === false) {
       // Nothing refreshing the status file means there is no editor to be
       // blocked. Returning the latch unconditionally here is what made a dead
@@ -848,9 +1115,10 @@ export class DialogGuard {
       // not positive evidence the screen is clear, so keep what we know.
       return this.blocking;
     }
-    const first = list[0];
+    const first = firstBlocking(list);
     if (!first) {
-      // The editor ANSWERED and listed nothing, so the screen really is clear.
+      // The editor ANSWERED and listed nothing that holds the game thread, so
+      // nothing is blocking.
       // That is the only place the asked-once record is reset: clearing after
       // a press must not reset it, or the next check re-prompts for a dialog
       // that press was meant to answer and presses a second button.
@@ -886,6 +1154,8 @@ export class DialogGuard {
             message: dialog.message,
             buttons: dialog.buttons,
             ...(dialog.items ? { items: dialog.items } : {}),
+            ...(dialog.blocks ? { blocks: dialog.blocks } : {}),
+            ...(dialog.native ? { native: dialog.native } : {}),
             subject,
             minHumanMs,
           },
@@ -913,6 +1183,7 @@ export class DialogGuard {
     // two must spend both on the title and the question, not one on padding.
     const message = [
       `Unreal is blocked: ${dialog.title === "" ? "(untitled dialog)" : dialog.title}`,
+      ...(dialog.native ? [dialog.native.summary] : []),
       body,
     ];
     message.push("", "Nothing else can run until this is answered, and nothing is pressed unless you choose it.");
@@ -996,6 +1267,13 @@ export class DialogGuard {
     // a new one with the same buttons. A press is only for the dialog the
     // person was shown.
     if (!(await this.stillShowing(dialog))) return { shown: true, press: null };
+    // A native dialog is pressed by its window handle, from outside the
+    // process; the bridge cannot reach it.
+    if (dialog.native) {
+      const r = await this.pressNativeButton(dialog, chosen, "prompt");
+      if (!r.pressed) return { shown: true, press: null };
+      return { shown: true, press: { button: chosen, confirmed: r.closed } };
+    }
     // Three outcomes, not two.
     //
     //   pressed      the editor confirmed it
@@ -1048,9 +1326,10 @@ export class DialogGuard {
 
   /** Whether the editor is still showing this dialog, read fresh. */
   private async stillShowing(dialog: BlockingDialog): Promise<boolean> {
+    if (dialog.native) return this.nativeDialog()?.native?.hwnd === dialog.native.hwnd;
     try {
       const list = ((await this.deps.probe()) as { dialogs?: unknown })?.dialogs;
-      const current = Array.isArray(list) ? asDialog(list[0]) : null;
+      const current = Array.isArray(list) ? asDialog(firstBlocking(list)) : null;
       return current !== null && dialogIdentity(current) === dialogIdentity(dialog);
     } catch {
       return false;
@@ -1064,7 +1343,7 @@ export class DialogGuard {
     opts: { canElicit?: boolean } = {},
     phase: DialogPhase = "asking",
   ): Record<string, unknown> {
-    return DialogGuard.describeRefusal(
+    const refusal = DialogGuard.describeRefusal(
       subject,
       dialog,
       this.modeFor(dialog),
@@ -1072,6 +1351,9 @@ export class DialogGuard {
       phase,
       this.isDelegated(dialog),
     );
+    const note = refusal.dialogMode === "defer" ? this.deps.elicitationNote?.() : null;
+    if (note) refusal.error = `${String(refusal.error)} ${note}`;
+    return refusal;
   }
 
   /**
@@ -1106,10 +1388,20 @@ export class DialogGuard {
       dialogTitle: dialog.title,
       dialogMessage: dialog.message,
       buttons: dialog.buttons,
+      ...(dialog.native
+        ? {
+            nativeDialog: true,
+            dialogKind: dialog.native.kind,
+            dialogSummary: dialog.native.summary,
+            ...(dialog.native.details ? { dialogDetails: dialog.native.details } : {}),
+          }
+        : {}),
     };
-    const preamble =
-      `A modal dialog is blocking the editor, so '${subject}' was refused without running. `
-      + "Unreal cannot execute anything else until the dialog is answered. ";
+    const preamble = dialog.native
+      ? `A native Windows dialog from the editor process is blocking the editor, so '${subject}' was refused without running. `
+        + `${dialog.native.summary} The bridge cannot answer while it is up, so waiting on the editor will not help. `
+      : `A modal dialog is blocking the editor, so '${subject}' was refused without running. `
+        + "Unreal cannot execute anything else until the dialog is answered. ";
 
     // Only auto hands the decision over, so only auto is told how to press.
     //
@@ -1192,11 +1484,16 @@ export class DialogGuard {
    */
   observe(method: string, result: unknown): void {
     if (isDialogRefusal(result)) {
-      const dialog = asDialog(result);
-      if (dialog) this.note(dialog);
+      this.noteRefusal(result);
       return;
     }
     if (!isModalSafeMethod(method)) this.clear();
+  }
+
+  /** Learn the dialog a refusal names, whichever call it came back on. */
+  noteRefusal(refusal: unknown): void {
+    const dialog = asDialog(refusal);
+    if (dialog) this.note(dialog);
   }
 
   /**
@@ -1211,8 +1508,11 @@ export class DialogGuard {
   startWatching(intervalMs = 1000): void {
     if (this.poll) return;
     const read = () => {
+      // A native dialog is known without the snapshot, and outranks it: the
+      // plugin cannot see a Win32 box, so its snapshot reads as clear.
+      if (this.syncNative()) return;
       if (!this.deps.readSnapshot) return;
-      let snap: { modal?: unknown; ageSeconds?: number } | null;
+      let snap: { modal?: unknown; slowTask?: unknown; ageSeconds?: number } | null;
       try {
         snap = this.deps.readSnapshot();
       } catch {
@@ -1237,7 +1537,8 @@ export class DialogGuard {
       // window stayed open, with no button that could clear it (#1118). An
       // older plugin omits the field and is believed, which is the behaviour
       // that existed before it.
-      const blocking = modal != null && modal.blocksGameThread !== false;
+      const blocking = modal != null && modal.blocksGameThread !== false
+        && !isProgressReport(modal, snap?.slowTask);
       // An editor that has begun to exit stops rewriting the file, so the modal
       // it last recorded (the Save Content prompt the quit raised, answered a
       // moment ago) reads as current for another 15 seconds. Its log knows
@@ -1282,13 +1583,13 @@ export class DialogGuard {
  * This refuses those two methods and nothing else, from state already held, so
  * it adds no round-trip and cannot recurse.
  */
-export function withoutDialogActuation<T extends IBridge>(session: EditorSession, raw: T): T {
+export function withoutDialogActuation<T extends IBridge>(session: GuardedSession, raw: T): T {
   return new Proxy(raw, {
     get(target, prop, receiver) {
       if (prop !== "call") return Reflect.get(target, prop, receiver);
-      return async (method: string, params?: Record<string, unknown>, timeoutMs?: number) => {
+      return async (method: string, params?: Record<string, unknown>, timeoutMs?: number, options?: BridgeCallOptions) => {
         const armsAPolicy = method === "set_dialog_policy" || method === "clear_dialog_policy";
-        if (!armsAPolicy) return target.call(method, params, timeoutMs);
+        if (!armsAPolicy) return target.call(method, params, timeoutMs, options);
 
         // This is the ONLY thing standing in front of an unattended button
         // press: the plugin serves both methods during a modal on purpose, so
@@ -1312,7 +1613,7 @@ export function withoutDialogActuation<T extends IBridge>(session: EditorSession
               + "editor(respond_to_dialog).",
           };
         }
-        return target.call(method, params, timeoutMs);
+        return target.call(method, params, timeoutMs, options);
       };
     },
   });
@@ -1361,8 +1662,22 @@ export function stampBlockedEditor(
   return out;
 }
 
+/**
+ * What the guard reads of an editor session. Structural, so the guard needs no
+ * import of the session registry, which itself builds on the guard.
+ */
+export interface GuardedSession {
+  readonly name: string;
+  readonly projectDir: string | null;
+  readonly project: ProjectContext;
+  /** The raw bridge. */
+  readonly bridge: IBridge;
+  /** The session's guard pipeline around `bridge`. */
+  readonly guarded: IBridge;
+}
+
 /** One guard per editor. */
-const guards = new WeakMap<EditorSession, DialogGuard>();
+const guards = new WeakMap<GuardedSession, DialogGuard>();
 
 /**
  * The guard for a session, created from the session itself if it has none.
@@ -1377,7 +1692,7 @@ const guards = new WeakMap<EditorSession, DialogGuard>();
  * capability, which is not knowable here; guardFor replaces the deps, so that
  * pass upgrades this guard rather than competing with it.
  */
-export async function ensureGuard(session: EditorSession): Promise<DialogGuard> {
+export async function ensureGuard(session: GuardedSession): Promise<DialogGuard> {
   const existing = guards.get(session);
   if (existing) return existing;
   const guard = guardFor(session, sessionGuardDeps(session, false));
@@ -1386,11 +1701,39 @@ export async function ensureGuard(session: EditorSession): Promise<DialogGuard> 
 }
 
 /**
+ * The dialog gate for one call into an editor: the refusal to send back, or
+ * null to let the call through.
+ *
+ * `kind` says what is checked. A bridge method is checked at the guarded
+ * bridge, the boundary every route to the editor shares (a tool action, a
+ * flow step, a nested flow, a guard task's own calls), so refusing there holds
+ * without a second copy of the rule. An action is an in-process handler that
+ * never reaches that boundary (flow/run-action.ts). The plugin refuses too,
+ * and agrees, but it cannot see a call that never reaches it and does not
+ * know this machine's dialog mode.
+ *
+ * A session without a guard gets one built rather than being refused: failing
+ * closed is right only because no session reaches this without a guard, and a
+ * session registered outside the startup pass was refused every call it made.
+ */
+export async function refuseIfBlocked(
+  session: GuardedSession | undefined,
+  subject: string,
+  kind: "bridge" | "action" = "bridge",
+): Promise<Record<string, unknown> | null> {
+  if (!session) return null;
+  if (kind === "bridge" && DialogGuard.bridgeAllowed(subject)) return null;
+  const guard = await ensureGuard(session);
+  const decision = await guard.check(subject, kind);
+  return decision.allow ? null : (decision.refusal ?? null);
+}
+
+/**
  * A guard's dependencies for one session. `canElicit` is whether the connected
  * client can be shown a form; `elicit` is consulted only when it can.
  */
 export function sessionGuardDeps(
-  session: EditorSession,
+  session: GuardedSession,
   canElicit: boolean,
   elicit?: () => ElicitFn | undefined,
   extension?: { prompt: DialogPromptFn; askWaitMs?: number },
@@ -1403,6 +1746,7 @@ export function sessionGuardDeps(
     press: (buttonLabel: string, items?: Array<{ index: number; checked: boolean }>) =>
       session.guarded.call("respond_to_dialog", { buttonLabel, ...(items ? { items } : {}) }),
     ...(elicit ? { elicit: () => (canElicit ? elicit() : undefined) } : {}),
+    ...(elicit ? { elicitationNote: () => elicitationUnrenderedNote(elicit()?.client?.()) } : {}),
     isConnected: () => session.bridge.isConnected,
     // The instance-aware reader: it prefers status.<pid>.json over the shared
     // file and reports the snapshot's age, so a crashed editor's leftover is
@@ -1415,10 +1759,22 @@ export function sessionGuardDeps(
       const proj = session.project.projectPath ?? session.bridge.getTarget().projectPath ?? null;
       return proj ? readLogState(proj).exiting : false;
     },
+    // Read from the shared window scan, which runs outside every editor; a
+    // dialog counts as this session's only when its process has this
+    // session's .uproject on its command line.
+    nativeDialogs: () => {
+      const proj = session.project.projectPath ?? session.bridge.getTarget().projectPath ?? null;
+      return nativeDialogsForProject(proj).map(nativeAsBlocking);
+    },
+    pressNative: (dialog: BlockingDialog, button: string) => {
+      const proj = session.project.projectPath ?? session.bridge.getTarget().projectPath ?? null;
+      if (!dialog.native) return Promise.resolve({ pressed: false, closed: false, error: "Not a native dialog." });
+      return pressNativeDialog({ hwnd: dialog.native.hwnd, pid: dialog.native.pid, button }, proj);
+    },
   };
 }
 
-export function guardFor(session: EditorSession, deps: GuardDeps): DialogGuard {
+export function guardFor(session: GuardedSession, deps: GuardDeps): DialogGuard {
   const existing = guards.get(session);
   if (existing) {
     // The guard is kept, but its dependencies are REPLACED. They close over
@@ -1436,12 +1792,12 @@ export function guardFor(session: EditorSession, deps: GuardDeps): DialogGuard {
   return created;
 }
 
-export function existingGuard(session: EditorSession): DialogGuard | undefined {
+export function existingGuard(session: GuardedSession): DialogGuard | undefined {
   return guards.get(session);
 }
 
 /** Test seam. */
-export function forgetGuard(session: EditorSession): void {
+export function forgetGuard(session: GuardedSession): void {
   guards.get(session)?.stopWatching();
   guards.delete(session);
 }

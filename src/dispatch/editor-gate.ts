@@ -1,3 +1,4 @@
+// @session per-session: Routes a call to an editor and refuses an untargeted change.
 /**
  * Write gating and response attribution beyond one editor (#817, plan 5.2/5.3).
  *
@@ -19,41 +20,12 @@
  * directive envelopes already use.
  */
 import { requiresExplicitEditor, type ActionClass } from "../surface/action-class.js";
-import { taskEffect } from "../surface/action-effects.js";
-import type { ToolDef } from "../core/types.js";
+import { actionSpecOf, taskEffect } from "../surface/action-effects.js";
+import type { ToolDef } from "../surface/tool-types.js";
 import { stripEditorTarget } from "../surface/target-params.js";
 import { EDITOR_TARGET_PARAM, stripAction } from "../surface/routing-params.js";
 import { MICRO_GATEWAY_TOOL, MICRO_GATEWAY_CALL, microCallParams } from "../surface/context/micro-context.js";
 import type { EditorSession, SessionRegistry } from "../sessions/session.js";
-
-/**
- * Actions whose subject is the SESSION REGISTRY, not any editor.
- *
- * Three of these really do change something: `add_editor` registers a session
- * and can launch an editor process, `drop_editor` closes a socket, and
- * `use_editor` moves the default target. They declare `mutate`, because that is
- * what they do, and locking and the guard pipeline are right to see them as
- * changes.
- *
- * This gate asks a narrower question: could an untargeted call land in the
- * wrong EDITOR? For these it could not. They never reach a bridge, and they
- * name their subject in their own parameters. Demanding `editor="<name>"` on
- * "register an editor" would be a riddle rather than a safeguard.
- *
- * The exemption used to be spelled as an override in the classifier, which
- * recorded all four as reads. That made every other consumer of the answer
- * wrong in order to make this one right: locking and the guard pipeline were
- * told that launching an editor process observes something. The gate carries
- * its own exception now, and the declaration stays true.
- */
-const ADDRESSES_THE_SERVER = new Set([
-  "project.list_editors",
-  "project.use_editor",
-  "project.add_editor",
-  "project.drop_editor",
-  // Posts an issue to GitHub; it reads no editor and changes none.
-  "feedback.submit",
-]);
 
 export interface UntargetedCall {
   /** `category.action`, already resolved through any gateway indirection. */
@@ -75,7 +47,11 @@ export interface UntargetedCall {
  * between, so there is nothing to refuse.
  */
 export function refuseUntargetedCall(call: UntargetedCall): string | null {
-  if (ADDRESSES_THE_SERVER.has(call.taskName)) return null;
+  // Its subject is the session registry or a service outside every editor
+  // (add_editor, feedback(submit)). It may still declare `mutate`, which is
+  // what locking and the guards should see; it just cannot land in the wrong
+  // editor, so demanding a target would be a riddle rather than a safeguard.
+  if (actionSpecOf(call.taskName, call.graph)?.addressesServer) return null;
   // The action's own declaration, not a reading of its name. A name is only
   // consulted for a task the tool graph does not carry, and the answer there
   // is a flat `mutate` rather than a second opinion about the name.
@@ -98,51 +74,45 @@ function describeWhy(taskName: string, cls: ActionClass): string {
     : `'${taskName}' changes the editor it runs in.`;
 }
 
-export interface RoutedCall {
-  /** The editor this call runs in. */
-  session: EditorSession;
-  /** Params with every routing instruction removed, at both nesting levels. */
+/** The editor a call named, taken off its parameters. */
+export interface TakenTarget {
+  /** The name, project or path the caller gave; undefined when it gave none. */
+  target: unknown;
+  /** Params with the routing instruction removed, at both nesting levels. */
   params: Record<string, unknown>;
-  /** True when the caller named the editor rather than taking the default. */
-  targeted: boolean;
 }
 
 /**
- * Route one call to the editor it addressed.
+ * Take the editor a call names off its parameters, before anything validates
+ * them, so validation never sees or strips a routing instruction (#1278).
  *
  * `editor` is a routing instruction only on a tool that had the parameter
- * injected; on any other tool it is that tool's own parameter and is left
- * alone. It is stripped here, at both nesting levels, so no dispatch path can
- * forward it into a bridge call.
+ * injected, or on one that does not declare it (one editor: not advertised,
+ * but a name a caller still holds resolves strictly). On a tool that declares
+ * its own `editor` it is that tool's parameter and is left alone. The micro
+ * gateway carries every real parameter inside `args`, so both levels are read
+ * and both stripped.
  */
-export function routeEditorCall(
-  tool: ToolDef,
-  params: Record<string, unknown>,
-  sessions: SessionRegistry,
-): RoutedCall {
-  // The micro gateway carries every real parameter inside `args`, so a target
-  // arrives there rather than at the top level. Read both, and strip both.
+export function takeEditorTarget(tool: ToolDef, params: Record<string, unknown>): TakenTarget {
+  if (!tool.injectedEditorParam && EDITOR_TARGET_PARAM in tool.schema) return { target: undefined, params };
   const nested = params.args && typeof params.args === "object"
     ? (params.args as Record<string, unknown>)
     : undefined;
-  if (!tool.injectedEditorParam) {
-    // One editor: the parameter is not advertised, but a name a caller still
-    // holds resolves strictly, so a stale one refuses instead of falling
-    // through to the active editor (#1278). A tool's own `editor` is left alone.
-    if (EDITOR_TARGET_PARAM in tool.schema) return { session: sessions.active, params, targeted: false };
-    const held = params[EDITOR_TARGET_PARAM] ?? nested?.[EDITOR_TARGET_PARAM];
-    if (held === undefined || held === null || held === "") return { session: sessions.active, params, targeted: false };
-    const session = sessions.resolve(held);
-    const stripped = { ...stripEditorTarget(params) };
-    if (nested) stripped.args = stripEditorTarget(nested);
-    return { session, params: stripped, targeted: true };
-  }
   const target = params[EDITOR_TARGET_PARAM] ?? nested?.[EDITOR_TARGET_PARAM];
+  if (!tool.injectedEditorParam && (target === undefined || target === null || target === "")) return { target: undefined, params };
   const stripped = stripEditorTarget(params);
   if (nested) stripped.args = stripEditorTarget(nested);
+  return { target, params: stripped };
+}
+
+/**
+ * The editor a taken target names, and whether the caller named one. No name
+ * is the active editor; a name that matches nothing throws rather than falling
+ * through to it.
+ */
+export function resolveEditorTarget(sessions: SessionRegistry, target: unknown): { session: EditorSession; targeted: boolean } {
   return {
     session: sessions.resolve(target),
-    params: stripped,
     targeted: typeof target === "string" && target.trim() !== "",
   };
 }

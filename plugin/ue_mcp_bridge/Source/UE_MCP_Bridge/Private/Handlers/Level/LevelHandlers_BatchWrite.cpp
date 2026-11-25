@@ -26,6 +26,7 @@
 // would be worse than no batch at all.
 
 #include "LevelHandlers.h"
+#include "LevelSpawnFinalize.h"
 
 #include "Components/ActorComponent.h"
 #include "Components/MeshComponent.h"
@@ -141,17 +142,7 @@ namespace
 		{
 			return false;
 		}
-		if (!Selector.FolderPath.IsEmpty() &&
-			!MCPActorFolderPath(Actor).Equals(Selector.FolderPath, ESearchCase::IgnoreCase))
-		{
-			return false;
-		}
-		if (!Selector.FolderPathPrefix.IsEmpty() &&
-			!MCPActorFolderPath(Actor).StartsWith(Selector.FolderPathPrefix, ESearchCase::IgnoreCase))
-		{
-			return false;
-		}
-		return true;
+		return MCPActorInFolder(Actor, Selector.FolderPath, Selector.FolderPathPrefix);
 	}
 
 	/** Every actor the selector picks, in a deterministic order. */
@@ -241,8 +232,8 @@ TSharedPtr<FJsonValue> FLevelHandlers::BatchSetActorProperties(const TSharedPtr<
 	}
 	if ((*PropertiesObject)->Values.Num() > MCPBatchMaxProperties)
 	{
-		return MCPError(FString::Printf(
-			TEXT("'properties' exceeds the maximum of %d entries"), MCPBatchMaxProperties));
+		return MCPBatchTooLargeError(FString::Printf(
+			TEXT("'properties' exceeds the maximum of %d entries"), MCPBatchMaxProperties), MCPBatchMaxProperties);
 	}
 
 	FMCPBatchSelector Selector;
@@ -1074,8 +1065,10 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnActorsBatch(const TSharedPtr<FJsonOb
 	{
 		Result->SetBoolField(TEXT("success"), false);
 		Result->SetStringField(TEXT("error"), FString::Printf(
-			TEXT("The plan produced %d spawns, over maxSpawn (%d). Narrow the selector or raise maxSpawn deliberately."),
-			Planned.Num(), MaxSpawn));
+			TEXT("The plan produced %d spawns, over maxSpawn (%d). %s"),
+			Planned.Num(), MaxSpawn,
+			*MCPRaiseOrSplitNote(TEXT("maxSpawn"), MaxSpawn, MCPBatchHardMaxSpawn,
+				TEXT("Split the work across several calls, each covering part of the spline range or a narrower selector."))));
 		Result->SetNumberField(TEXT("maxSpawn"), MaxSpawn);
 		return MCPResult(Result);
 	}
@@ -1173,6 +1166,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnActorsBatch(const TSharedPtr<FJsonOb
 		};
 		ApplyProperties(SharedProperties ? *SharedProperties : nullptr);
 		ApplyProperties(Plan.Properties);
+		MCPSpawnFinalize::FinishEditorSpawn(Actor);
 		if (PropertyRows.Num() > 0)
 		{
 			Row->SetArrayField(TEXT("properties"), PropertyRows);

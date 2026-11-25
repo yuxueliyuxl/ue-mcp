@@ -104,7 +104,7 @@ bool ParseAssetIdentity(
 	const FString LongPackageName = OutItem.PackagePath + TEXT("/") + OutItem.Name;
 	if (MCPIsProtectedAssetPath(LongPackageName))
 	{
-		OutError = FString::Printf(TEXT("Refusing to mutate protected package '%s'"), *LongPackageName);
+		OutError = FString::Printf(TEXT("Refusing to mutate protected package '%s'. %s"), *LongPackageName, *MCPProtectedMountWayForward());
 		return false;
 	}
 	OutItem.AssetPath = LongPackageName + TEXT(".") + OutItem.Name;
@@ -230,10 +230,14 @@ bool ApplyPreparedProperties(
 			LeafOwner->Modify();
 		}
 		FString SetError;
-		if (!MCPJsonProperty::SetJsonOnProperty(
+		// Owner passed for the same reason as bulk_set_asset_properties. Only
+		// here, not in the preflight pass, which writes into a transient staging
+		// duplicate whose subobjects are thrown away with it.
+		if (!MCPJsonProperty::SetJsonOnPropertyWithOwner(
 			Property,
 			ValueAddress,
 			Prepared.RequestedValue,
+			LeafOwner ? LeafOwner : Asset,
 			SetError))
 		{
 			OutError = FString::Printf(TEXT("Failed to set '%s': %s"), *Prepared.Name, *SetError);
@@ -423,10 +427,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkUpsertDataAssets(const TSharedPtr<FJs
 	}
 	if (Items->Num() > MaxBulkUpsertItems)
 	{
-		return MCPError(FString::Printf(
+		return MCPBatchTooLargeError(FString::Printf(
 			TEXT("'items' exceeds the maximum batch size of %d (received %d)"),
 			MaxBulkUpsertItems,
-			Items->Num()));
+			Items->Num()), MaxBulkUpsertItems);
 	}
 
 	OnConflict.TrimStartAndEndInline();

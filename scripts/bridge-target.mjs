@@ -20,11 +20,12 @@
  *     open and aborting on any mismatch.
  */
 
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { bridgeSocketOptions, watchUpgradeRefusal } from "./lib/bridge-token.mjs";
+import { bridgeLockfilePath, DEFAULT_BRIDGE_PORT, deriveProjectPort, normalizeProjectRoot } from "./lib/wire-contract.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -57,32 +58,12 @@ export const TEST_PROJECT_DIR = SHARD_DIR ?? path.join(REPO_ROOT, "tests", "ue_m
 export const TEST_PROJECT_UPROJECT = path.join(TEST_PROJECT_DIR, "ue_mcp.uproject");
 
 /** Where the running bridge publishes the port it bound for that project. */
-export const TEST_PORT_LOCKFILE = path.join(
-  TEST_PROJECT_DIR, "Saved", "UE_MCP_Bridge", "port.json",
-);
+export const TEST_PORT_LOCKFILE = bridgeLockfilePath(TEST_PROJECT_DIR);
 
 /** Pre-derived-port bridges bound this. Kept as the last candidate. */
-export const LEGACY_BRIDGE_PORT = 9877;
+export const LEGACY_BRIDGE_PORT = DEFAULT_BRIDGE_PORT;
 
-// Ephemeral range used by the derived-port scheme. Must match src/bridge/port.ts and
-// FMCPBridgeServer::DeriveProjectPort; tests/unit/bridge-target.test.ts pins
-// this implementation against src/bridge/port.ts so the two cannot drift apart.
-const EPHEMERAL_BASE = 49152;
-const EPHEMERAL_SPAN = 65535 - EPHEMERAL_BASE + 1;
-
-/** Canonical form of a project root for hashing and for identity comparison. */
-export function normalizeProjectRoot(dir) {
-  return String(dir).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-}
-
-/** Port the bridge would bind for a project root when nothing is in its way. */
-export function deriveProjectPort(projectRootDir) {
-  const h = crypto.createHash("sha1")
-    .update(normalizeProjectRoot(projectRootDir), "utf8")
-    .digest();
-  const v = ((h[0] << 24) | (h[1] << 16) | (h[2] << 8) | h[3]) >>> 0;
-  return EPHEMERAL_BASE + (v % EPHEMERAL_SPAN);
-}
+export { deriveProjectPort, normalizeProjectRoot };
 
 /**
  * Read the port lockfile for the test project.
@@ -385,7 +366,13 @@ export async function verifyTestProjectTarget(call) {
  */
 export function askOnce(url, method, params, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    let ws;
+    try {
+      ws = new WebSocket(url, bridgeSocketOptions(url));
+    } catch (err) {
+      reject(err);
+      return;
+    }
     const timer = setTimeout(() => {
       ws.terminate();
       reject(new Error(`${method} on ${url} timed out after ${timeoutMs}ms`));
@@ -399,6 +386,7 @@ export function askOnce(url, method, params, timeoutMs) {
       }
       fn(value);
     };
+    watchUpgradeRefusal(ws, url, (err) => done(reject, err));
     ws.on("error", (err) => done(reject, err));
     ws.on("open", () => ws.send(JSON.stringify({ id: "ask-once", method, params: params ?? {} })));
     ws.on("message", (data) => {
@@ -481,11 +469,18 @@ export async function connectTestBridge(options = {}) {
 
 function openSocket(url, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    let ws;
+    try {
+      ws = new WebSocket(url, bridgeSocketOptions(url));
+    } catch (err) {
+      reject(err);
+      return;
+    }
     const timer = setTimeout(() => {
       ws.terminate();
       reject(new Error(`Connection to ${url} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
+    watchUpgradeRefusal(ws, url, (err) => { clearTimeout(timer); reject(err); });
     ws.on("open", () => { clearTimeout(timer); resolve(ws); });
     ws.on("error", (err) => { clearTimeout(timer); reject(err); });
   });

@@ -1,3 +1,4 @@
+// @session independent: Shared error codes and the McpError shape.
 /**
  * Structured error codes for the MCP bridge.
  * Allows callers to distinguish error types without string-matching.
@@ -18,6 +19,20 @@ export enum ErrorCode {
   /** Another session holds the exclusive lock on an asset this call would
    *  mutate. Retryable: the holder's lease expires or it releases the lock. */
   ASSET_LOCKED = "ASSET_LOCKED",
+  /** The client cancelled the call (MCP notifications/cancelled) before it answered. */
+  CANCELLED = "CANCELLED",
+  /** The action's category, or its native or Epic half, is turned off by the
+   *  project's `disable:` config. The message names the command that turns it back on. */
+  CATEGORY_DISABLED = "CATEGORY_DISABLED",
+  /** Another MCP session holds a lease on an asset this call would change.
+   *  The message names the holder and when the lease runs out. */
+  ASSET_LEASED = "ASSET_LEASED",
+  /** The action ran and failed for its own reasons; the message is the reason it gave. */
+  TASK_FAILED = "TASK_FAILED",
+  /** A failure that carried no code of its own. */
+  UNKNOWN = "UNKNOWN",
+  /** A gate refused the call before it ran (a blocking dialog, playtest mode, a missing engine tool); the refusal payload says why and what to do. */
+  REFUSED = "REFUSED",
 }
 
 /**

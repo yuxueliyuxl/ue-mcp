@@ -1,13 +1,15 @@
+// @session per-session: Loads each project's plugins into that session's graph.
 import * as fs from "node:fs";
 import type { GuardDeclarations } from "../flow/guard-schema.js";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { TaskConstructor, TaskDefinition, FlowDefinition } from "@db-lyon/flowkit";
-import type { ToolDef } from "../core/types.js";
+import type { ToolDef } from "../surface/tool-types.js";
 import type { PluginEntry } from "../flow/schema.js";
 import { warn, info } from "../core/log.js";
 import {
   loadManifest,
+  pluginVersionRefusal,
   type PluginManifest,
   type ManifestInjectAction,
   type ManifestProvidedAction,
@@ -15,14 +17,12 @@ import {
 import { bridgeTaskClass } from "../flow/task-factory.js";
 import {
   flatContractShape,
-  paramsClause,
   recordedSpecsProblems,
   type HandlerSpecs,
   type RecordedHandlerSpecs,
 } from "../surface/handler-spec.js";
 import type { NativeContractExtras } from "./native-contract.js";
 import { resolvePackage, type ResolvedPackage } from "./resolver.js";
-import { satisfiesMinimum } from "./version.js";
 import {
   supersededByName,
   supersededByUePlugin,
@@ -33,6 +33,7 @@ import { mergeInjectionsIntoTool, type InjectionPlan } from "./injection.js";
 import { buildProvidedTool, type ProvisionPlan } from "./provision.js";
 import { readDeployedBridgeApiVersion } from "./bridge-api.js";
 import { resolveServerImportsToSelf } from "./self-resolve.js";
+import { pathInPackage } from "./package-paths.js";
 import { requiredFieldNames, requiringParams, reservedParamName, reservedParamReason } from "./manifest-params.js";
 import { ROUTING_PARAM_NAMES } from "../surface/routing-params.js";
 import {
@@ -299,7 +300,13 @@ export async function loadPlugins(
     // Knowledge: load file contents now; the loader returns text so the
     // server can attach to instructions before the bridge connects.
     for (const [category, relPath] of Object.entries(manifest.knowledge)) {
-      const abs = path.join(pkg.pkgDir, relPath);
+      let abs: string;
+      try {
+        abs = pathInPackage(pkg.pkgDir, relPath, "knowledge file");
+      } catch (e) {
+        warn("plugin", `plugin ${pkg.name}: ${e instanceof Error ? e.message : e}, skipping`);
+        continue;
+      }
       if (!fs.existsSync(abs)) {
         warn("plugin", `plugin ${pkg.name}: knowledge file ${relPath} not found, skipping`);
         continue;
@@ -416,28 +423,14 @@ async function loadOne(
   base.minServerVersion = manifest.minServerVersion;
   base.uePluginDependency = manifest.uePluginDependency;
 
-  if (manifest.minServerVersion && !satisfiesMinimum(serverVersion, manifest.minServerVersion)) {
-    return skip(base, `requires server >= ${manifest.minServerVersion} (have ${serverVersion})`);
-  }
-
-  // Native module gate: the plugin ships C++ that registers handlers via
-  // UEMCP::RegisterExternalHandler. Refuse to load if its minBridgeApi
-  // exceeds the bridge ABI currently deployed in this project. We do NOT
-  // hard-fail when bridgeApiVersion is unknown (no bridge deployed yet);
-  // a warning lets users see the manifest but the C++ side won't run
-  // until they `ue-mcp init`/`update` to deploy a bridge.
-  if (manifest.nativeModule) {
-    if (bridgeApiVersion === null) {
-      warn(
-        "plugin",
-        `${entry.name}: declares nativeModule but no UE_MCP_Bridge is deployed yet - run \`ue-mcp init\` or \`ue-mcp deploy\` to deploy the bridge before invoking its native actions`,
-      );
-    } else if (manifest.nativeModule.minBridgeApi > bridgeApiVersion) {
-      return skip(
-        base,
-        `nativeModule requires bridge ABI >= ${manifest.nativeModule.minBridgeApi} (deployed bridge is ${bridgeApiVersion}). Run \`ue-mcp deploy\` to refresh the bridge.`,
-      );
-    }
+  const refusal = pluginVersionRefusal(entry.name, manifest, serverVersion, bridgeApiVersion);
+  if (refusal) return skip(base, refusal);
+  // No bridge deployed yet: the manifest loads, but its C++ side won't run until one is.
+  if (manifest.nativeModule && bridgeApiVersion === null) {
+    warn(
+      "plugin",
+      `${entry.name}: declares nativeModule but no UE_MCP_Bridge is deployed yet - run \`ue-mcp init\` or \`ue-mcp deploy\` to deploy the bridge before invoking its native actions`,
+    );
   }
 
   // #1282: the native module's recorded contracts. A file that is named and
@@ -445,9 +438,9 @@ async function loadOne(
   // contracts would advertise parameters nothing checks.
   let nativeSpecs: HandlerSpecs | undefined;
   if (manifest.nativeModule?.specs) {
-    const specsPath = path.join(pkg.pkgDir, manifest.nativeModule.specs);
     let raw: unknown;
     try {
+      const specsPath = pathInPackage(pkg.pkgDir, manifest.nativeModule.specs, "nativeModule.specs");
       raw = JSON.parse(fs.readFileSync(specsPath, "utf-8"));
     } catch (e) {
       return skip(base, `nativeModule.specs '${manifest.nativeModule.specs}' could not be read: ${(e as Error).message}`);
@@ -662,7 +655,7 @@ export function nativeHandlerSurface(
     // Injection and provisioning lift every key optional; the action keeps its required flags.
     if (!spec) return { description: hSpec.description, schema: hSpec.schema };
     return {
-      description: [hSpec.description, paramsClause(spec)].filter(Boolean).join(" "),
+      description: hSpec.description,
       contract: { method: hName, spec },
       zodSchema,
     };

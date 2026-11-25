@@ -1,3 +1,4 @@
+// @session per-session: Resolves the registry and config of the addressed editor.
 import { z } from "zod";
 import { FlowRunner } from "@db-lyon/flowkit";
 import type {
@@ -11,10 +12,12 @@ import type {
 } from "@db-lyon/flowkit";
 import type { FlowContext } from "./context.js";
 import { FlowStepKeySchema, type FlowConfig } from "./schema.js";
-import type { ToolDef, ToolContext, ActionSpec } from "../core/types.js";
-import { actionEnum } from "../surface/category-tool.js";
+import type { ToolDef, ToolContext, ActionSpec } from "../surface/tool-types.js";
+import { actionEnum, SELECT_PARAM, OMIT_PARAM } from "../surface/category-tool.js";
+import { takeFieldSelection, projectResult, attachFieldReport } from "../surface/context/field-select.js";
 import { McpError, ErrorCode } from "../core/errors.js";
 import { nearestActions } from "../surface/action-schema.js";
+import { actionSignature } from "../surface/action-signature.js";
 import { unknownRecord } from "../surface/context/call-envelope.js";
 import {
   takeSnapshot,
@@ -38,10 +41,10 @@ import {
   type EditorLossPolicy,
   type EditorLossReport,
 } from "./editor-loss.js";
-import { taskEffect } from "../surface/action-effects.js";
-import { LOCAL_ACTIONS } from "../dispatch/offline.js";
+import { actionSpecOf, taskEffect } from "../surface/action-effects.js";
 import { EDITOR_OPERATION_TASKS } from "./editor-op-task.js";
 import { deriveFlowInputs } from "./flow-inputs.js";
+import { withStepApproval } from "./step-approval.js";
 
 /**
  * Name a failed rollback by the bridge method it tried to call. Every record
@@ -76,11 +79,17 @@ export function createFlowTool(
     run: {
       kind: "handler",
       effect: "mutate",
+      params: {
+        required: ["flowName"],
+        optional: ["skip", "params", "rollback_on_failure"],
+        notes: {
+          skip: "step names or numbers",
+          params: "runtime options merged into every step's options, highest priority",
+          rollback_on_failure: "invoke inverse tasks in reverse order when a later step fails",
+        },
+      },
       description:
-        "Execute a named flow from ue-mcp.yml. Params: flowName, "
-        + "skip? (step names or numbers), params? (runtime options merged into every step's options, "
-        + "highest priority), rollback_on_failure? (invoke inverse tasks in reverse order when a "
-        + "later step fails). A step whose handler reports success:false FAILS the step and stops the "
+        "Execute a named flow from ue-mcp.yml. A step whose handler reports success:false FAILS the step and stops the "
         + "run, and the inverses collected up to and including it are what rollback_on_failure "
         + "unwinds. A step whose failure is EXPECTED says so itself, in the YAML, with "
         + "ignore_failure: true - the run walks on, and the step is still recorded as failed with its "
@@ -97,8 +106,9 @@ export function createFlowTool(
     plan: {
       kind: "handler",
       effect: "read",
+      params: { required: ["flowName"] },
       description:
-        "Show a flow's execution plan without running a step of it. Params: flowName. Returns the ordered plan, "
+        "Show a flow's execution plan without running a step of it. Returns the ordered plan, "
         + "and the flow as declared under definition: its description and each step's task or nested flow, "
         + "options and conditions, with ${steps.N...} references left unresolved. inputs lists the params a run may pass: "
         + "each parameter the step tasks read and the steps leave unset, with its type, required flag and the steps that read it.",
@@ -107,37 +117,32 @@ export function createFlowTool(
     list: {
       kind: "handler",
       effect: "read",
+      params: {},
       description:
         "List the flows available to this project, merged from ue-mcp.yml, the user-global config "
-        + "and any loaded plugin. Params: none",
+        + "and any loaded plugin.",
       handler: async (ctx) => listFlows(configFor(ctx)),
     },
   };
 
+  const summary =
+    `Run pre-built named sequences for this project. ` +
+    `ALWAYS check project(action="get_status") first - its 'flows' field lists what's available. ` +
+    `If a flow matches the user's request, run it via ` +
+    `flow(action="run", flowName="...") instead of composing the sequence by hand. ` +
+    `Config reloads on every call - no restart needed.`;
   const def: ToolDef = {
     name: "flow",
-    description:
-      `Run pre-built named sequences for this project. ` +
-      `ALWAYS check project(action="get_status") first - its 'flows' field lists what's available. ` +
-      `If a flow matches the user's request, run it via ` +
-      `flow(action="run", flowName="...") instead of composing the sequence by hand. ` +
-      `Config reloads on every call - no restart needed.\n\n` +
-      `Actions:\n` +
-      Object.entries(actions)
-        .map(([name, spec]) => `- ${name}: ${spec.description ?? ""}`)
-        .join("\n") +
-      `\n\nStep types supported in YAML flows: any MCP action (category.action), nested flows (flow:),\n` +
-      `and 'shell' for running shell/exec commands. Per-step options: options, when, retries,\n` +
-      `retryDelay, retryOn, and ignore_failure (record this step's failure and carry on).\n` +
-      `Example shell step:\n` +
-      `  steps:\n` +
-      `    1: { task: shell, options: { command: "npm run up:build" } }`,
+    summary,
+    description: "",
     schema: {
       action: actionEnum(Object.keys(actions) as [string, ...string[]]),
       flowName: z.string().optional().describe("Flow name from ue-mcp.yml"),
       skip: z.array(z.string()).optional().describe("run: step names or numbers to skip"),
       params: unknownRecord().optional().describe("run: runtime options merged into every step's options (highest priority)"),
       rollback_on_failure: z.boolean().optional().describe("run: invoke inverse tasks in reverse order on failure"),
+      select: SELECT_PARAM,
+      omit: OMIT_PARAM,
     },
     actions,
     handler: async (ctx, params) => {
@@ -153,9 +158,25 @@ export function createFlowTool(
             + ` Available: ${available.join(", ")}.`,
         );
       }
-      return spec.handler(ctx, params);
+      // select/omit narrow what the flow tool answers, as they do on every
+      // category tool. They are the caller's, so no step ever receives them.
+      const { selection, rest } = takeFieldSelection(params);
+      const answered = await spec.handler(ctx, rest);
+      const projection = projectResult(answered, selection);
+      return attachFieldReport(projection.result, projection);
     },
   };
+  // Each action's line leads with its signature, built from its declaration.
+  def.description =
+    `${summary}\n\n` +
+    `Actions:\n` +
+    Object.entries(actions).map(([name, spec]) => `- ${actionSignature(def, name)}: ${spec.description ?? ""}`).join("\n") +
+    `\n\nStep types supported in YAML flows: any MCP action (category.action), nested flows (flow:),\n` +
+    `and 'shell' for running shell/exec commands. Per-step options: options, when, retries,\n` +
+    `retryDelay, retryOn, and ignore_failure (record this step's failure and carry on).\n` +
+    `Example shell step:\n` +
+    `  steps:\n` +
+    `    1: { task: shell, options: { command: "npm run up:build" } }`;
   return def;
 }
 
@@ -232,7 +253,9 @@ async function runFlow(
   const policy: EditorLossPolicy = def?.on_editor_loss ?? "resume";
   const snapshot: SnapshotHolder = {};
   const guard = makeLossGuard(ctx, policy, def?.editor_loss_timeout_seconds, snapshot);
-  const runner = makeRunner(guard ? guard.wrap(registry) : registry, config, ctx, runId, flowName, snapshot, guard);
+  const guarded = guard ? guard.wrap(registry) : registry;
+  const approved = ctx.flowStepApproval ? withStepApproval(guarded, ctx.flowStepApproval, runId, flowName) : guarded;
+  const runner = makeRunner(approved, config, ctx, runId, flowName, snapshot, guard);
   try {
     // Under on_editor_loss: rollback a failed run unwinds, unless the caller said otherwise.
     const rollback = rollback_on_failure ?? (policy === "rollback" ? true : undefined);
@@ -264,7 +287,7 @@ function makeLossGuard(
     policy,
     timeoutMs: timeoutSeconds ? timeoutSeconds * 1000 : DEFAULT_EDITOR_LOSS_TIMEOUT_MS,
     isReadOnly: (taskName) => taskEffect(taskName, graph).effect === "read",
-    needsEditor: (taskName) => !Object.hasOwn(LOCAL_ACTIONS, taskName) && !EDITOR_OPERATION_TASKS.has(taskName),
+    needsEditor: (taskName) => !actionSpecOf(taskName, graph)?.offline && !EDITOR_OPERATION_TASKS.has(taskName),
     // Filesystem only, and only while the editor is away, so it never holds stale copies.
     restoreWhileDown: () => {
       if (!snapshot.current) return false;

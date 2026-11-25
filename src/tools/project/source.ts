@@ -1,10 +1,22 @@
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseHeader, collectFiles, findSourceRoots, resolveModuleDir } from "../../codeintel/cpp-parser.js";
 import { listContent } from "../../codeintel/content-index.js";
 import { specBp } from "../specs/project.generated.js";
-import type { ToolContext, ActionSpec } from "../../core/types.js";
+import type { ToolContext, ActionSpec } from "../../surface/tool-types.js";
 import { recordBeforeWrite } from "../../checkpoints/service.js";
+import { resolveInside, requireModuleName } from "../../core/path-guard.js";
+
+/**
+ * A project file named by a path relative to one of the Source roots, or an
+ * absolute path. Either way it must stay inside the project directory.
+ */
+function resolveProjectSourceFile(projectDir: string, projectName: string | null, rel: string): string {
+  if (path.isAbsolute(rel)) return resolveInside([projectDir], rel);
+  const candidates = findSourceRoots(projectDir, projectName).map((r) => resolveInside([projectDir], rel, { base: r }));
+  return candidates.find((c) => fs.existsSync(c)) ?? resolveInside([projectDir], rel, { base: path.join(projectDir, "Source") });
+}
 
 /**
  * Resolve a module name to its Source/<Module> directory, searching the project
@@ -13,6 +25,7 @@ import { recordBeforeWrite } from "../../checkpoints/service.js";
  * (#543: plugin-module source authoring.)
  */
 function resolveSourceModuleDir(projectDir: string, projectName: string | null, moduleName: string): string | null {
+  if (moduleName) requireModuleName(moduleName, "module");
   const roots = [...findSourceRoots(projectDir, projectName)];
   // Add each plugin's Source dir as a search root.
   const pluginsDir = path.join(projectDir, "Plugins");
@@ -50,16 +63,13 @@ export const sourceActions: Record<string, ActionSpec> = {
   read_cpp_header: {
     kind: "handler",
     effect: "read",
-    description: "Parse a .h file. Params: headerPath",
+    offline: "Reads a header from the project's Source tree.",
+    params: { required: ["headerPath"] },
+    description: "Parse a .h file.",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const headerPath = p.headerPath as string;
-      let resolved = headerPath;
-      if (!path.isAbsolute(headerPath)) {
-        const roots = findSourceRoots(ctx.project.projectDir!, ctx.project.projectName);
-        const candidate = roots.map(r => path.join(r, headerPath)).find(c => fs.existsSync(c));
-        resolved = candidate ?? path.join(ctx.project.projectDir!, "Source", headerPath);
-      }
+      const resolved = resolveProjectSourceFile(ctx.project.projectDir!, ctx.project.projectName, headerPath);
       if (!fs.existsSync(resolved)) throw new Error(`Header not found: ${resolved}`);
       return parseHeader(fs.readFileSync(resolved, "utf-8"), resolved);
     },
@@ -67,7 +77,9 @@ export const sourceActions: Record<string, ActionSpec> = {
   read_module: {
     kind: "handler",
     effect: "read",
-    description: "Read module source. Params: moduleName",
+    offline: "Reads a module's headers from the project's Source tree.",
+    params: { required: ["moduleName"] },
+    description: "Read module source.",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const moduleName = p.moduleName as string;
@@ -85,7 +97,9 @@ export const sourceActions: Record<string, ActionSpec> = {
   list_modules: {
     kind: "handler",
     effect: "read",
-    description: "List C++ modules. Params: none",
+    offline: "Enumerates the modules declared under the project's Source roots.",
+    params: {},
+    description: "List C++ modules.",
     handler: async (ctx) => {
       ctx.project.ensureLoaded();
       const roots = findSourceRoots(ctx.project.projectDir!, ctx.project.projectName);
@@ -104,7 +118,9 @@ export const sourceActions: Record<string, ActionSpec> = {
   search_cpp: {
     kind: "handler",
     effect: "read",
-    description: "Search .h/.cpp files. Params: query, directory?",
+    offline: "Searches the project's own C++ on disk.",
+    params: { required: ["query"], optional: ["directory"] },
+    description: "Search .h/.cpp files.",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const roots = findSourceRoots(ctx.project.projectDir!, ctx.project.projectName);
@@ -113,11 +129,13 @@ export const sourceActions: Record<string, ActionSpec> = {
       let searchDirs: string[] = roots;
       if (p.directory) {
         const sub = p.directory as string;
+        const projectDir = ctx.project.projectDir!;
         if (path.isAbsolute(sub)) {
-          if (!fs.existsSync(sub)) throw new Error(`Directory not found: ${sub}`);
-          searchDirs = [sub];
+          const dir = resolveInside([projectDir], sub);
+          if (!fs.existsSync(dir)) throw new Error(`Directory not found: ${dir}`);
+          searchDirs = [dir];
         } else {
-          const matches = roots.map(r => path.join(r, sub)).filter(d => fs.existsSync(d));
+          const matches = roots.map(r => resolveInside([projectDir], sub, { base: r })).filter(d => fs.existsSync(d));
           if (matches.length === 0) throw new Error(`Directory '${sub}' not found under any source root: ${roots.join(", ")}`);
           searchDirs = matches;
         }
@@ -153,6 +171,7 @@ export const sourceActions: Record<string, ActionSpec> = {
   list_content_assets: {
     kind: "handler",
     effect: "read",
+    offline: "Walks the package files under a mount path on disk. It is the one asset query that needs no editor, and it says which questions it cannot answer without one.",
     description:
       "List the project's assets from the package files on DISK, which is the one asset query that "
       + "works with no editor running. Takes a mount path (/Game, /Game/Characters, or a plugin's "
@@ -161,9 +180,16 @@ export const sourceActions: Record<string, ActionSpec> = {
       + "modified time, and it deliberately does not answer class, registry tags or dependencies: "
       + "those live in the editor's asset registry and are not in the file, so asset(list) and "
       + "asset(search) remain the answer once an editor is up. maxResults stops the walk rather "
-      + "than trimming the result, and truncated says when it did. "
-      + "Params: contentPath? (default /Game), recursive? (default true), namePattern? "
-      + "(case-insensitive substring of the asset name), maxResults? (default 1000)",
+      + "than trimming the result, and truncated says when it did.",
+    params: {
+      optional: ["contentPath", "recursive", "namePattern", "maxResults"],
+      notes: {
+        contentPath: "default /Game",
+        recursive: "default true",
+        namePattern: "case-insensitive substring of the asset name",
+        maxResults: "default 1000",
+      },
+    },
     handler: async (ctx: ToolContext, p: Record<string, unknown>) => listContent(ctx.project, {
       contentPath: p.contentPath as string | undefined,
       recursive: p.recursive as boolean | undefined,
@@ -174,12 +200,24 @@ export const sourceActions: Record<string, ActionSpec> = {
   list_files: {
     kind: "handler",
     effect: "read",
-    description: "List files on disk under a directory, optionally filtered by extension(s) and by name. Runs in the MCP server process (no editor round-trip). Params: directory (absolute, or relative to the project dir), extensions? (e.g. ['png','exr'] or 'png'), namePattern? (case-insensitive substring of the file name; maxResults counts matches, so a name search over a large tree is not cut short by files that do not match), recursive? (default false), maxResults? (default 1000) (#608)",
+    offline: "Lists files on disk under a directory.",
+    params: {
+      required: ["directory"],
+      optional: ["extensions", "namePattern", "recursive", "maxResults"],
+      notes: {
+        directory: "inside the project: absolute, or relative to the project dir",
+        extensions: "e.g. ['png','exr'] or 'png'",
+        namePattern: "case-insensitive substring of the file name; maxResults counts matches, so a name search over a large tree is not cut short by files that do not match",
+        recursive: "default false",
+        maxResults: "default 1000",
+      },
+    },
+    description: "List files on disk under a directory, optionally filtered by extension(s) and by name. Runs in the MCP server process (no editor round-trip). (#608)",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const dirArg = p.directory as string;
       if (!dirArg) throw new Error("Missing 'directory'");
-      const base = path.isAbsolute(dirArg) ? dirArg : path.join(ctx.project.projectDir!, dirArg);
+      const base = resolveInside([ctx.project.projectDir!], dirArg);
       if (!fs.existsSync(base)) throw new Error(`Directory not found: ${base}`);
       const extsRaw = p.extensions;
       const exts = (Array.isArray(extsRaw) ? extsRaw : extsRaw ? [extsRaw] : [])
@@ -211,12 +249,7 @@ export const sourceActions: Record<string, ActionSpec> = {
   // v0.7.13 - native C++ authoring. Bridge handlers wrap
   // GameProjectUtils / ILiveCodingModule (same APIs used by the editor's
   // File → New C++ Class and Live Coding menus).
-  create_cpp_class: {
-    ...specBp("mutate", "Create a new native UCLASS in a project module. Uses the same engine template path as File → New C++ Class. Writes .h + .cpp; returns both paths plus needsEditorRestart (true unless Live Coding successfully hot-reloaded).", "create_cpp_class"),
-    // AddCodeToProject regenerates IDE project files synchronously - can
-    // easily exceed the default 30-second cap on first use.
-    timeoutMs: 300_000,
-  },
+  create_cpp_class: specBp("mutate", "Create a new native UCLASS in a project module. Uses the same engine template path as File → New C++ Class. Writes .h + .cpp; returns both paths plus needsEditorRestart (true unless Live Coding successfully hot-reloaded).", "create_cpp_class"),
   list_project_modules: specBp("read", 
     "List native modules in the current project (name, host type, source path), in the .uproject's own declaration order. Feed moduleName from here into create_cpp_class.",
     "list_project_modules",
@@ -224,8 +257,16 @@ export const sourceActions: Record<string, ActionSpec> = {
   write_cpp_file: {
     kind: "handler",
     effect: "mutate",
+    offline: "Writes a file under the project's Source tree.",
+    params: {
+      required: ["path", "content"],
+      notes: {
+        path: "relative to Source/ or absolute within Source/",
+        content: "full file contents",
+      },
+    },
     description:
-      "Write a .h / .cpp / .inl file under the project's Source/ tree. Used to append UPROPERTYs/UFUNCTIONs or method bodies after create_cpp_class. Writes are scoped to Source/ for safety. Params: path (relative to Source/ or absolute within Source/), content (full file contents). After editing, call live_coding_compile (for existing classes) or build_project (for new classes).",
+      "Write a .h / .cpp / .inl file under the project's Source/ tree. Used to append UPROPERTYs/UFUNCTIONs or method bodies after create_cpp_class. Writes are scoped to Source/ for safety. After editing, call live_coding_compile (for existing classes) or build_project (for new classes).",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const sourceDir = path.join(ctx.project.projectDir!, "Source");
@@ -234,11 +275,7 @@ export const sourceActions: Record<string, ActionSpec> = {
       const content = p.content as string;
       if (typeof content !== "string") throw new Error("Missing or invalid 'content' parameter (must be a string)");
 
-      const resolved = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(sourceDir, rel);
-      const sourceAbs = path.resolve(sourceDir);
-      if (!resolved.startsWith(sourceAbs + path.sep) && resolved !== sourceAbs) {
-        throw new Error(`Refusing to write outside project Source/: ${resolved}`);
-      }
+      const resolved = resolveInside([sourceDir], rel);
       if (!/\.(h|cpp|inl|cs)$/i.test(resolved)) {
         throw new Error(`write_cpp_file only accepts .h/.cpp/.inl/.cs files (got '${path.extname(resolved)}')`);
       }
@@ -260,17 +297,19 @@ export const sourceActions: Record<string, ActionSpec> = {
   read_cpp_source: {
     kind: "handler",
     effect: "read",
-    description: "Read a .cpp file from the project Source/ tree. Companion to read_cpp_header for round-trip edits. Params: sourcePath (relative to Source/ or absolute).",
+    offline: "Reads a .cpp from the project's Source tree.",
+    params: {
+      required: ["sourcePath"],
+      notes: {
+        sourcePath: "relative to Source/ or absolute",
+      },
+    },
+    description: "Read a .cpp file from the project Source/ tree. Companion to read_cpp_header for round-trip edits.",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const sp = p.sourcePath as string;
       if (!sp) throw new Error("Missing 'sourcePath' parameter");
-      let resolved = sp;
-      if (!path.isAbsolute(sp)) {
-        const roots = findSourceRoots(ctx.project.projectDir!, ctx.project.projectName);
-        const candidate = roots.map(r => path.join(r, sp)).find(c => fs.existsSync(c));
-        resolved = candidate ?? path.join(ctx.project.projectDir!, "Source", sp);
-      }
+      const resolved = resolveProjectSourceFile(ctx.project.projectDir!, ctx.project.projectName, sp);
       if (!fs.existsSync(resolved)) throw new Error(`File not found: ${resolved}`);
       const content = fs.readFileSync(resolved, "utf-8");
       return { path: resolved, bytes: content.length, content };
@@ -279,8 +318,16 @@ export const sourceActions: Record<string, ActionSpec> = {
   write_source_file: {
     kind: "handler",
     effect: "mutate",
+    offline: "Writes into a named module's Public or Private folder.",
+    params: {
+      required: ["module", "visibility", "fileName", "content"],
+      notes: {
+        module: "module name, default the project's primary module",
+        visibility: "Public|Private, default Private",
+      },
+    },
     description:
-      "Write a .h/.cpp/.inl into a named module's Public/Private folder (resolves the module dir for you, including plugin modules under Plugins/*/Source/ that write_cpp_file refuses). After a new file, build_project + restart; after a body edit, live_coding_compile. Params: module (module name, default the project's primary module), visibility (Public|Private, default Private), fileName, content.",
+      "Write a .h/.cpp/.inl into a named module's Public/Private folder (resolves the module dir for you, including plugin modules under Plugins/*/Source/ that write_cpp_file refuses). After a new file, build_project + restart; after a body edit, live_coding_compile.",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const moduleName = (p.module as string) ?? "";
@@ -294,7 +341,7 @@ export const sourceActions: Record<string, ActionSpec> = {
       const moduleDir = resolveSourceModuleDir(ctx.project.projectDir!, ctx.project.projectName, moduleName);
       if (!moduleDir) throw new Error(`Module not found: '${moduleName || "(default)"}'. Use list_modules to see available modules.`);
 
-      const target = vis ? path.join(moduleDir, vis, fileName) : path.join(moduleDir, fileName);
+      const target = resolveInside([moduleDir], fileName, { base: vis ? path.join(moduleDir, vis) : moduleDir });
       if (!/\.(h|cpp|inl)$/i.test(target)) throw new Error(`write_source_file only accepts .h/.cpp/.inl files (got '${path.extname(target)}')`);
 
       const overwrote = fs.existsSync(target);
@@ -315,8 +362,10 @@ export const sourceActions: Record<string, ActionSpec> = {
   read_source_file: {
     kind: "handler",
     effect: "read",
+    offline: "Reads from a named module's folder.",
+    params: { required: ["module", "fileName"], optional: ["visibility"] },
     description:
-      "Read a .h/.cpp/.inl from a named module's folder (companion to write_source_file; resolves plugin modules too). With no visibility it tries Public then Private then the module root. Params: module, visibility?, fileName.",
+      "Read a .h/.cpp/.inl from a named module's folder (companion to write_source_file; resolves plugin modules too). With no visibility it tries Public then Private then the module root.",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const moduleName = (p.module as string) ?? "";
@@ -327,9 +376,10 @@ export const sourceActions: Record<string, ActionSpec> = {
       const moduleDir = resolveSourceModuleDir(ctx.project.projectDir!, ctx.project.projectName, moduleName);
       if (!moduleDir) throw new Error(`Module not found: '${moduleName || "(default)"}'`);
 
-      const candidates = visibility
-        ? [path.join(moduleDir, /^public$/i.test(visibility) ? "Public" : "Private", fileName)]
-        : [path.join(moduleDir, "Public", fileName), path.join(moduleDir, "Private", fileName), path.join(moduleDir, fileName)];
+      const bases = visibility
+        ? [path.join(moduleDir, /^public$/i.test(visibility) ? "Public" : "Private")]
+        : [path.join(moduleDir, "Public"), path.join(moduleDir, "Private"), moduleDir];
+      const candidates = bases.map((base) => resolveInside([moduleDir], fileName, { base }));
       const found = candidates.find(c => fs.existsSync(c));
       if (!found) throw new Error(`Source file not found: ${fileName} in module '${path.basename(moduleDir)}'`);
       const content = fs.readFileSync(found, "utf-8");
@@ -339,19 +389,31 @@ export const sourceActions: Record<string, ActionSpec> = {
   add_module_dependency: {
     kind: "handler",
     effect: "mutate",
+    offline: "Edits a Build.cs dependency array on disk.",
+    params: {
+      required: ["moduleName", "dependency"],
+      optional: ["access"],
+      notes: {
+        moduleName: "the Build.cs to edit - must exist in the project",
+        dependency: "module name to add, e.g. 'UMG'",
+        access: "'public'|'private', default 'private'",
+      },
+    },
     description:
-      "Add a module to a target module's Build.cs dependency array. Params: moduleName (the Build.cs to edit - must exist in the project), dependency (module name to add, e.g. 'UMG'), access? ('public'|'private', default 'private'). Creates the corresponding AddRange block if missing. Rebuild required afterward.",
+      "Add a module to a target module's Build.cs dependency array. Creates the corresponding AddRange block if missing. Rebuild required afterward.",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const moduleName = p.moduleName as string;
       const dependency = p.dependency as string;
       const access = ((p.access as string) || "private").toLowerCase();
       if (!moduleName || !dependency) throw new Error("Missing 'moduleName' and/or 'dependency'");
+      requireModuleName(moduleName);
+      requireModuleName(dependency, "dependency");
       if (access !== "public" && access !== "private") {
         throw new Error("'access' must be 'public' or 'private'");
       }
 
-      const buildCs = path.join(ctx.project.projectDir!, "Source", moduleName, `${moduleName}.Build.cs`);
+      const buildCs = resolveInside([ctx.project.projectDir!], path.join("Source", moduleName, `${moduleName}.Build.cs`));
       if (!fs.existsSync(buildCs)) {
         throw new Error(`Build.cs not found for module '${moduleName}' at ${buildCs}`);
       }
@@ -399,6 +461,7 @@ export const sourceActions: Record<string, ActionSpec> = {
   add_cpp_member: {
     kind: "handler",
     effect: "mutate",
+    offline: "Edits a header on disk.",
     // #423: append a UPROPERTY / UFUNCTION declaration to an existing UCLASS
     // header in the right access-specifier block. The recurring trap is that
     // raw appending lands the declaration in whatever access section the
@@ -407,8 +470,18 @@ export const sourceActions: Record<string, ActionSpec> = {
     // handler inserts the requested access specifier before the declaration
     // and restores the previous one after, so the caller doesn't need to
     // know what section was active at the end of the class body.
+    params: {
+      required: ["headerPath", "declaration", "memberName"],
+      optional: ["access"],
+      notes: {
+        headerPath: "relative to Source/ or absolute",
+        declaration: "full multi-line UPROPERTY(...) / UFUNCTION(...) block plus its single-line member or function signature",
+        memberName: "the identifier the declaration introduces - used for idempotency",
+        access: "'public'|'protected'|'private', default 'public'",
+      },
+    },
     description:
-      "Append a UPROPERTY/UFUNCTION declaration to an existing UCLASS header inside the access specifier you choose. Idempotent: if a declaration containing the same memberName is already present, returns existed:true. Params: headerPath (relative to Source/ or absolute), declaration (full multi-line UPROPERTY(...) / UFUNCTION(...) block plus its single-line member or function signature), memberName (the identifier the declaration introduces - used for idempotency), access? ('public'|'protected'|'private', default 'public').",
+      "Append a UPROPERTY/UFUNCTION declaration to an existing UCLASS header inside the access specifier you choose. Idempotent: if a declaration containing the same memberName is already present, returns existed:true.",
     handler: async (ctx, p) => {
       ctx.project.ensureLoaded();
       const headerPath = p.headerPath as string;
@@ -422,11 +495,7 @@ export const sourceActions: Record<string, ActionSpec> = {
         throw new Error("'access' must be 'public' | 'protected' | 'private'");
       }
       const sourceDir = path.join(ctx.project.projectDir!, "Source");
-      const resolved = path.isAbsolute(headerPath) ? path.resolve(headerPath) : path.resolve(sourceDir, headerPath);
-      const sourceAbs = path.resolve(sourceDir);
-      if (!resolved.startsWith(sourceAbs + path.sep) && resolved !== sourceAbs) {
-        throw new Error(`Refusing to write outside project Source/: ${resolved}`);
-      }
+      const resolved = resolveInside([sourceDir], headerPath);
       if (!/\.h$/i.test(resolved)) {
         throw new Error(`add_cpp_member only accepts .h files (got '${path.extname(resolved)}')`);
       }

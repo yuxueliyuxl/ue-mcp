@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { UeMcpConfigSchema } from "../../src/surface/schemas.js";
+import { UeMcpConfigSchema } from "../../src/config/schemas.js";
 
 /**
  * `ue-mcp.bridge.port` is read twice.
@@ -71,7 +71,8 @@ describe("bridge.port config parity between the client and the plugin", () => {
     // project.ts merges exactly the files configLayerFiles lists, in its order.
     expect(functionBody(PROJECT_TS, "function loadLayeredUeMcpBlock(", "\n}")).toContain("configLayerFiles(");
     const tsOrder = layerOrder(
-      functionBody(CONFIG_TS, "export function configLayerFiles(", "\n}"),
+      functionBody(CONFIG_TS, "export function configLayerFiles(", "\n}")
+        + functionBody(CONFIG_TS, "export function projectLayerFiles(", "\n}"),
       TS_LAYERS,
     );
     const cppOrder = layerOrder(

@@ -40,6 +40,8 @@
 #include "Handlers/Dialog/DialogHandlers.h"
 #include "Handlers/Editor/EditorHandlers.h"
 #include "Handlers/Sequencer/SequencerHandlers.h"
+#include "Handlers/Sequencer/MovieRenderQueueHandlers.h"
+#include "Handlers/MachineLearning/MachineLearningHandlers.h"
 #include "Handlers/PCG/PCGHandlers.h"
 #include "Handlers/Niagara/NiagaraHandlers.h"
 #include "Handlers/Material/MaterialHandlers.h"
@@ -210,6 +212,8 @@ bool FMCPHandlerSpecContractTest::RunTest(const FString& Parameters)
 	FMassHandlers::RegisterHandlers(Registry);
 	FEditorHandlers::RegisterHandlers(Registry);
 	FSequencerHandlers::RegisterHandlers(Registry);
+	FMovieRenderQueueHandlers::RegisterHandlers(Registry);
+	FMachineLearningHandlers::RegisterHandlers(Registry);
 	FDialogHandlers::RegisterHandlers(Registry);
 	FPCGHandlers::RegisterHandlers(Registry);
 	FNiagaraHandlers::RegisterHandlers(Registry);
@@ -283,6 +287,12 @@ bool FMCPHandlerSpecContractTest::RunTest(const FString& Parameters)
 				FMCPParamReadScope Scope(Params);
 				(*Handler)(Params);
 				Read = Scope.ReadKeys();
+			}
+			// #1910: for a handler under the save policy, ExecuteHandler reads save
+			// before the handler runs, and this calls the handler directly.
+			if (Registry.FollowsSavePolicy(Method))
+			{
+				Read.Add(TEXT("save"));
 			}
 
 			const FString Sent = FString::Join(Run, TEXT(", "));

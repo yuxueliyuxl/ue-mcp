@@ -14,13 +14,14 @@ enum class EMCPPIEStepJudge : uint8
 UENUM(BlueprintType)
 enum class EMCPPIEExpectOp : uint8
 {
-	Decreasing UMETA(ToolTip="Value drops below its value at step start."),
-	Increasing UMETA(ToolTip="Value rises above its value at step start."),
+	Decreasing UMETA(ToolTip="Value drops below its value at step start, by at least Target when set."),
+	Increasing UMETA(ToolTip="Value rises above its value at step start, by at least Target when set."),
 	Eq UMETA(DisplayName="Equal", ToolTip="Value equals Target (small epsilon)."),
 	Gt UMETA(DisplayName="Greater Than", ToolTip="Value is greater than Target."),
 	Lt UMETA(DisplayName="Less Than", ToolTip="Value is less than Target."),
 	Visible UMETA(ToolTip="Widget is on screen. Target 0 means not visible."),
-	Exists UMETA(ToolTip="Actor resolves in the PIE world. Target 0 means gone.")
+	Exists UMETA(ToolTip="Actor resolves in the PIE world. Target 0 means gone."),
+	Triggered UMETA(ToolTip="The person playing fires the Input Action named by Value on player Client, after the step's act ends. WithinMs 0 waits with no timeout.")
 };
 
 USTRUCT(BlueprintType)
@@ -29,7 +30,7 @@ struct FMCPPIEStepExpect
 	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Expect",
-		meta=(ToolTip="Tracked value path (or its last segment), actor id for Exists, widget class or name for Visible."))
+		meta=(ToolTip="Tracked value path (or its last segment), actor id for Exists, widget class or name for Visible, Input Action object path for Triggered."))
 	FString Value;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Expect",
@@ -37,16 +38,20 @@ struct FMCPPIEStepExpect
 	EMCPPIEExpectOp Op = EMCPPIEExpectOp::Eq;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Expect",
-		meta=(ToolTip="Whether Target is set. Required for Eq, Gt and Lt; Visible and Exists default to true."))
+		meta=(ToolTip="Whether Target is set. Required for Eq, Gt and Lt; Visible and Exists default to true; optional for Decreasing and Increasing."))
 	bool bHasTarget = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Expect",
-		meta=(EditCondition="bHasTarget", ToolTip="Target number. For Visible and Exists, 0 means false and anything else true."))
+		meta=(EditCondition="bHasTarget", ToolTip="Target number. For Visible and Exists, 0 means false and anything else true. For Decreasing and Increasing, the least change from the value at step start."))
 	double Target = 0.0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Expect",
-		meta=(ClampMin="0", ToolTip="Milliseconds of game time the condition has to hold within. 0 uses the script default."))
+		meta=(ClampMin="0", ToolTip="Milliseconds of game time the condition has to hold within. 0 uses the script default, except on Triggered, where 0 waits with no timeout."))
 	int32 WithinMs = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Expect",
+		meta=(ClampMin="0", EditCondition="Op == EMCPPIEExpectOp::Triggered", ToolTip="Triggered only: the player whose input is watched. 0 is the editor's own player, 1..N a remote player in join order, as act's client."))
+	int32 Client = 0;
 };
 
 USTRUCT(BlueprintType)
@@ -83,7 +88,7 @@ struct FMCPPIETestStep
 	FString ArrangeJson;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Step",
-		meta=(MultiLine="true", ToolTip="JSON array of step actions run after arrange, before the expectation is watched: tape, press, hold, inject, console, place, capture, wait_ms, as pie(uat_run) takes them."))
+		meta=(MultiLine="true", ToolTip="JSON array of step actions run after arrange, before the expectation is watched: tape, press, hold, inject, console, place, capture, key, wait_ms, as pie(uat_run) takes them."))
 	FString ActJson;
 };
 

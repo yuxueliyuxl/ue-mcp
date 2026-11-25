@@ -65,8 +65,8 @@ void FSplineHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	FMCPHandlerRegistry::FCategoryScope CategoryScope(Registry, TEXT("level"));
 
 	using EType = EMCPParamType;
-	const FMCPParamSpec SpecActorLabel = MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Actor editor label; pass actorLabel or actorPath"));
-	const FMCPParamSpec SpecActorPath = MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Full actor object path; the unambiguous selector, and it wins over actorLabel"));
+	const FMCPParamSpec SpecActorLabel = MCPSharedParam::ActorLabel();
+	const FMCPParamSpec SpecActorPath = MCPSharedParam::ActorPath();
 	const FMCPSpecRules OneActor = MCPSpec::ExactlyOne({ { TEXT("actorLabel") }, { TEXT("actorPath") } });
 
 	// The contract world scope is refused before any actor is looked up.
@@ -74,8 +74,8 @@ void FSplineHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		SpecActorLabel, SpecActorPath,
 		MCPParam::Optional(TEXT("componentName"), EType::String, TEXT("Spline component, when the actor has several")),
 		MCPParam::Optional(TEXT("projectPoint"), EType::Vec3, TEXT("World point to project onto the spline")),
-		MCPParam::Optional(TEXT("world"), EType::String, TEXT("World scope: editor (default) | pie")),
-		MCPParam::Optional(TEXT("pieInstance"), EType::Integer, TEXT("Which PIE world when world is pie: 0 = server or primary, 1..N = clients")),
+		MCPSharedParam::World().Describe(TEXT("World scope: editor (default) | pie")),
+		MCPSharedParam::PieInstance().Describe(TEXT("Which PIE world when world is pie: 0 = server or primary, 1..N = clients")),
 	}, OneActor);
 	// The contract actor path names no actor, which is refused before any point is written.
 	Registry.RegisterHandler(TEXT("set_spline_points"), &SetSplinePoints, {
@@ -114,7 +114,7 @@ TSharedPtr<FJsonValue> FSplineHandlers::ReadSpline(const TSharedPtr<FJsonObject>
 	// #553: support editor or PIE world so runtime spline state is readable.
 	const FString WorldScope = OptionalString(Params, TEXT("world"), TEXT("editor"));
 	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
-	if (!World) return MCPError(TEXT("World not available"));
+	if (!World) return MCPWorldUnavailableError(WorldScope);
 
 	// #983: this is the action the report came in on. A level with several
 	// copy-pasted road Blueprints all labelled the same thing answered with
@@ -400,7 +400,7 @@ TSharedPtr<FJsonValue> FSplineHandlers::SetSplinePoints(const TSharedPtr<FJsonOb
 
 	// Point state is portable through MCP; Undo additionally captures complete component state.
 	TArray<TSharedPtr<FJsonValue>> PrevPoints;
-#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+#if UE_MCP_HAS_5_8_API
 	const FSplineCurves PreviousCurves = SplineComp->GetSplineCurves();
 #else
 	const FSplineCurves PreviousCurves = SplineComp->SplineCurves;

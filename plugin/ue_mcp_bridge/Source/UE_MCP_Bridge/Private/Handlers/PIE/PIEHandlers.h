@@ -20,6 +20,8 @@ public:
 	static void StartupSystems();
 	static void ShutdownSystems();
 
+	static TSharedPtr<FJsonValue> ViewTrace(const TSharedPtr<FJsonObject>& Params);
+
 	// PIE inspection
 	static TSharedPtr<FJsonValue> GetPieAnimState(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetPieAnimProperties(const TSharedPtr<FJsonObject>& Params);
@@ -48,10 +50,16 @@ public:
 	static TSharedPtr<FJsonValue> InjectInputStop(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> InjectInputTape(const TSharedPtr<FJsonObject>& Params);
 
+	// Pawn driving
+	static TSharedPtr<FJsonValue> PieDrivePawn(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> PieDriveStatus(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> PieDriveStop(const TSharedPtr<FJsonObject>& Params);
+
 	// Multiplayer players
 	static TSharedPtr<FJsonValue> PieClients(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> PieConsole(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> PieRemoteResult(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> PieSendKey(const TSharedPtr<FJsonObject>& Params);
 
 	// Multiplayer acceptance runs
 	static TSharedPtr<FJsonValue> PieUatRun(const TSharedPtr<FJsonObject>& Params);

@@ -1,3 +1,4 @@
+// @session independent: Generated parameter declarations from the recorded C++ specs; data only, with no editor state.
 // GENERATED FILE - do not edit.
 //
 // Written by scripts/generate-handler-specs.mjs from tests/golden/handler-specs.json,
@@ -66,7 +67,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "onConflict",
         "type": "string",
         "required": false,
-        "description": "skip (default) returns an existing asset untouched, error refuses"
+        "description": "When the asset already exists: skip (default) returns it untouched | error refuses; it never overwrites"
       }
     ],
     "contractExempt": "creates a MetaHumanCharacter asset"
@@ -183,18 +184,6 @@ export const handlerSpecs: HandlerSpecs = {
   }
 };
 
-/** The Params: clause of each spec'd bridge method. */
-export const paramsClauses: Readonly<Record<string, string>> = {
-  metahuman_assemble: "Params: assetPath (or characterPath), pipelineType?, quality?, nameOverride?, commonFolderPath?",
-  metahuman_create_character: "Params: name, packagePath?, onConflict?",
-  metahuman_read_character: "Params: assetPath (or characterPath), includeBody?",
-  metahuman_request_rig: "Params: assetPath (or characterPath), rigType?, blocking?",
-  metahuman_request_textures: "Params: assetPath (or characterPath), blocking?",
-  metahuman_set_body: "Params: assetPath (or characterPath), constraints",
-  metahuman_set_wardrobe: "Params: assetPath (or characterPath), items",
-  metahuman_status: "Params: none",
-};
-
 /** Every key the spec'd metahuman handlers declare, aliases included. */
 export const schema: Record<string, z.ZodType> = {
   assetPath: z.string().optional().describe("MetaHumanCharacter asset path"),
@@ -206,7 +195,7 @@ export const schema: Record<string, z.ZodType> = {
   items: z.record(z.string(), z.unknown()).optional().describe("{slotName: wardrobeItemPath}, e.g. {\"Top Garment\": \"/Game/Fab/MetaHuman/WI_Crewneck\"}"),
   name: z.string().optional().describe("Name of the new MetaHumanCharacter asset"),
   nameOverride: z.string().optional().describe("Name for the assembled assets instead of the character's"),
-  onConflict: z.string().optional().describe("skip (default) returns an existing asset untouched, error refuses"),
+  onConflict: z.string().optional().describe("When the asset already exists: skip (default) returns it untouched | error refuses; it never overwrites"),
   packagePath: z.string().optional().describe("Destination folder (default /Game/MetaHumans)"),
   pipelineType: z.string().optional().describe("Cinematic | Optimized (default) | UEFN"),
   quality: z.string().optional().describe("Pipeline quality level, e.g. Cinematic | High | Medium (default) | Low"),
@@ -214,4 +203,4 @@ export const schema: Record<string, z.ZodType> = {
 };
 
 /** Declare an action for a spec'd bridge method: effect, summary, method. */
-export const specBp = makeSpecBp(paramsClauses, handlerSpecs);
+export const specBp = makeSpecBp(handlerSpecs);

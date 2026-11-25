@@ -1,4 +1,5 @@
-import type { ToolDef } from "../core/types.js";
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
+import type { ToolDef } from "../surface/tool-types.js";
 import { categoryTool } from "../surface/category-tool.js";
 import { actions as epicActions, schema as epicSchema } from "./epic/dataflow.generated.js";
 
@@ -19,5 +20,5 @@ export const dataflowTool: ToolDef = categoryTool(
   "dataflow",
   "Dataflow graphs: node and pin authoring, variables, comment boxes, templates, and creation of Dataflow-compatible assets (Chaos geometry and simulation graphs). Requires UE 5.8+ with the Dataflow toolsets available.",
   { ...epicActions },
-  { ...epicSchema },
+  { ...epicSchema }, { label: { description: "Dataflow graphs, Chaos geometry and simulation assets (UE 5.8+)" } },
 );

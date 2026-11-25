@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { assetTool } from "../../src/tools/asset.js";
-import type { ToolContext } from "../../src/core/types.js";
+import type { ToolContext } from "../../src/surface/tool-types.js";
 
 describe("asset append_array_elements", () => {
   it("maps structured elements to the generic bridge handler", async () => {
@@ -23,6 +23,48 @@ describe("asset append_array_elements", () => {
       propertyName: "Slots",
       elements,
     }, undefined);
+  });
+
+  it("passes unique through to the append handler", async () => {
+    const call = vi.fn(async () => ({ success: true }));
+    const ctx = { bridge: { call } } as unknown as ToolContext;
+    await assetTool.handler(ctx, {
+      action: "append_array_elements",
+      assetPath: "/Game/Data/DA_BuildList",
+      propertyName: "OnlyInMaps",
+      elements: ["/Game/Maps/SurvivalArena"],
+      unique: true,
+    });
+    expect(call).toHaveBeenCalledWith("append_asset_array_elements", {
+      assetPath: "/Game/Data/DA_BuildList",
+      propertyName: "OnlyInMaps",
+      elements: ["/Game/Maps/SurvivalArena"],
+      unique: true,
+    }, undefined);
+  });
+
+  it.each([
+    { selector: { indices: [0, 2] } },
+    { selector: { elements: ["/Game/Maps/SurvivalArena"] } },
+  ])("maps remove_array_elements with $selector to the bridge handler", async ({ selector }) => {
+    const call = vi.fn(async () => ({ success: true }));
+    const ctx = { bridge: { call } } as unknown as ToolContext;
+    await assetTool.handler(ctx, {
+      action: "remove_array_elements",
+      assetPath: "/Game/Data/DA_BuildList",
+      propertyName: "OnlyInMaps",
+      ...selector,
+    });
+    expect(call).toHaveBeenCalledWith("remove_asset_array_elements", {
+      assetPath: "/Game/Data/DA_BuildList",
+      propertyName: "OnlyInMaps",
+      ...selector,
+    }, undefined);
+  });
+
+  it("refuses a non-integer index before dispatch", () => {
+    expect(assetTool.schema.indices.safeParse([1.5]).success).toBe(false);
+    expect(assetTool.schema.indices.safeParse([0, 3]).success).toBe(true);
   });
 
   it("rejects an empty element batch before dispatch", () => {

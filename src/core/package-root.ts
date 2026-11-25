@@ -1,3 +1,4 @@
+// @session independent: Where this installed package lives and its version; one answer per process.
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +18,16 @@ export function packageRoot(): string {
 /** A top-level entry point of the running build (e.g. "index.js"), whatever the caller's depth. */
 export function packageModulePath(fileName: string): string {
   return path.join(ENTRY_DIR, fileName);
+}
+
+/**
+ * The node arguments that run this ue-mcp's CLI again with `args`: the node
+ * flags this process runs under (a loader, for one), then `entry`. The default
+ * entry is the one this process was started with, so a source checkout under
+ * tsx runs its own source.
+ */
+export function selfCliArgs(args: readonly string[], entry: string = process.argv[1]): string[] {
+  return [...process.execArgv, entry, ...args];
 }
 
 /** Reported when package.json cannot be read: valid semver, older than any release. */

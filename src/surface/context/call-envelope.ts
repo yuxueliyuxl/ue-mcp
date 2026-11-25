@@ -1,3 +1,4 @@
+// @session independent: Unwraps and validates one call against the tool it names; holds nothing per editor.
 /**
  * The advertised call shape of a category tool: `action` plus `args` (#1172).
  *
@@ -24,7 +25,7 @@ import { z } from "zod";
 import { getParseErrorMessage, normalizeObjectSchema, safeParse as sdkSafeParse } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { McpError as SdkMcpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { EDITOR_TARGET_PARAM, MIGRATE_TARGET_PARAM, ROUTING_PARAM_NAMES } from "../routing-params.js";
-import type { ToolDef } from "../../core/types.js";
+import type { ToolDef } from "../tool-types.js";
 import { McpError, ErrorCode } from "../../core/errors.js";
 import { actionAccepts, undeclaredMessage } from "../action-schema.js";
 
@@ -79,6 +80,17 @@ export function envelopeInputSchema(tool: ToolDef): z.ZodTypeAny {
  */
 export function strippingInputSchema(shape: Record<string, z.ZodTypeAny>): z.ZodTypeAny {
   return z.object(shape).meta({ additionalProperties: false });
+}
+
+/**
+ * The flat input schema a tool is registered and advertised with. A tool whose
+ * parameters sit under a nested key (the micro gateway) passes undeclared keys
+ * through, so the routing keys it honours beside `args` reach dispatch without
+ * being advertised.
+ */
+export function flatInputSchema(tool: ToolDef, shape: Record<string, z.ZodTypeAny>): z.ZodTypeAny {
+  if (!tool.options?.nestedParamsKey) return strippingInputSchema(shape);
+  return z.looseObject(shape).meta({ additionalProperties: undefined });
 }
 
 /**

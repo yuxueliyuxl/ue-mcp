@@ -1,4 +1,5 @@
-import type { ToolDef } from "../core/types.js";
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
+import type { ToolDef } from "../surface/tool-types.js";
 import { categoryTool } from "../surface/category-tool.js";
 import { actions as epicActions, schema as epicSchema } from "./epic/conversation.generated.js";
 
@@ -14,5 +15,5 @@ export const conversationTool: ToolDef = categoryTool(
   "conversation",
   "Conversation graphs (UConversationDatabase): dialogue nodes, node connections, sub-nodes, speakers, and entry points. Requires UE 5.8+ with the Conversation toolsets available.",
   { ...epicActions },
-  { ...epicSchema },
+  { ...epicSchema }, { label: { description: "Conversation dialogue graphs, speakers, entry points (UE 5.8+)" } },
 );

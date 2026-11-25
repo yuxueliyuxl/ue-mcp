@@ -41,7 +41,7 @@ namespace MCPPIE
 		};
 
 		const TCHAR* const DraftCheckOps[] = {
-			TEXT("decreasing"), TEXT("increasing"), TEXT("eq"), TEXT("gt"), TEXT("lt"), TEXT("visible"), TEXT("exists")
+			TEXT("decreasing"), TEXT("increasing"), TEXT("eq"), TEXT("gt"), TEXT("lt"), TEXT("visible"), TEXT("exists"), TEXT("triggered")
 		};
 
 		FScriptStepIssue DraftCheckIssue(int32 Step, const FString& Field, const FString& Message, const TArray<FString>& Candidates = TArray<FString>())
@@ -664,6 +664,13 @@ namespace MCPPIE
 			const FString Op = ScriptExpectOpToString(E.Op);
 			const FString Where = FString::Printf(TEXT("steps[%d]"), I);
 
+			// An Input Action is an asset, so it resolves at draft time whether or not the step resolves in PIE.
+			if (IsScriptTriggerOp(E.Op))
+			{
+				DraftCheckLookup(I, TEXT("expect.value"), TEXT("Input Action"), E.Value, Ctx.ResolveInputAction, FString(), OutIssues);
+				continue;
+			}
+
 			if (IsScriptBooleanOp(E.Op))
 			{
 				if (E.bHasTarget && !E.bTargetIsBool && E.Target != 0.0 && E.Target != 1.0)
@@ -702,6 +709,9 @@ namespace MCPPIE
 					if (TrackedValuePathMatches(P, E.Value)) { Path = P; bFromProfile = true; break; }
 				}
 			}
+
+			// The observer reads a pawn channel off the sampled pawn state.
+			if (!bFromProfile && IsPawnChannelName(E.Value)) continue;
 
 			const FScriptLookup L = Ctx.ResolveValue ? Ctx.ResolveValue(Path) : FScriptLookup();
 			if (!L.bFound)
@@ -1049,6 +1059,11 @@ namespace MCPPIE
 			PawnObj->SetArrayField(TEXT("components"), ComponentNames);
 		}
 		R->SetObjectField(TEXT("pawn"), PawnObj);
+		{
+			TArray<TSharedPtr<FJsonValue>> Channels;
+			for (const FString& C : PawnChannelNames()) Channels.Add(MakeShared<FJsonValueString>(C));
+			R->SetArrayField(TEXT("pawn_channels"), Channels);
+		}
 		R->SetArrayField(TEXT("values"), Values);
 		R->SetBoolField(TEXT("truncated"), Values.Num() >= Limit);
 

@@ -1,3 +1,4 @@
+// @session per-session: Builds pipeline guards from what a plugin or a project declared.
 /**
  * Building guards from what somebody declared.
  *
@@ -12,7 +13,7 @@
  */
 import type { TaskRegistry } from "@db-lyon/flowkit";
 import type { IBridge } from "../bridge/bridge.js";
-import type { ToolContext } from "../core/types.js";
+import type { ToolContext } from "../surface/tool-types.js";
 import type { FlowContext } from "./context.js";
 import {
   mutationScope,
@@ -25,14 +26,29 @@ import {
 import { withoutDialogActuation } from "../editor/dialog-guard.js";
 import { DialogGatedBridge } from "./guarded-bridge.js";
 import { McpError, ErrorCode } from "../core/errors.js";
-import { debug } from "../core/log.js";
-import type { GuardDeclarations, GuardHook } from "./guard-schema.js";
+import { debug, info } from "../core/log.js";
+import { clientAdvertisesElicitation } from "../editor/dialog-mode.js";
+import { currentCallAsker } from "./call-elicit.js";
+import type { GuardDeclarations, GuardHook, GuardScope } from "./guard-schema.js";
 import {
   GUARD_CALL_KEY,
   GUARD_CONFIG_KEY,
   type GuardHookPayload,
   type GuardPhase,
 } from "../guard-task.js";
+
+/**
+ * What each declared scope means as a test on a call. `all` has none: the guard
+ * sees every call. The Record is exhaustive over GUARD_SCOPES, so a scope added
+ * to the schema without a meaning here does not compile.
+ */
+const SCOPE_PREDICATES: Record<GuardScope, ((cc: CallContext) => boolean) | undefined> = {
+  all: undefined,
+  mutations: mutationScope,
+  writes: writeScope,
+  reads: readScope,
+  unknown: unknownScope,
+};
 
 /** Where a declaration came from, so an error can say which file to open. */
 export interface GuardSource {
@@ -150,6 +166,76 @@ function refusalReason(r: HookResult): string {
   return r.error?.message ?? r.message ?? "no reason given";
 }
 
+/** The `_meta` key a guard override form carries its machine-readable fields under. */
+export const GUARD_OVERRIDE_META_KEY = "ue-mcp/guard";
+
+/** The answers an override form offers. */
+const ALLOW_ONCE = "allow";
+const ALLOW_SESSION = "allow_session";
+const DENY = "deny";
+
+/** `blueprint(create)` from `blueprint.create`, or the bridge method when no action is known. */
+function callLabel(subject: string | undefined, method: string): string {
+  const dot = subject ? subject.indexOf(".") : -1;
+  if (!subject || dot <= 0) return method;
+  return `${subject.slice(0, dot)}(${subject.slice(dot + 1)})`;
+}
+
+/**
+ * Put a denial to the person, for a guard declared with `allowsOverride`.
+ *
+ * Returns how the call was allowed, or null to keep the denial. Null covers
+ * every case without a clear yes: no caller to ask, a client that did not
+ * advertise elicitation, a decline, a cancel, or a form that failed.
+ */
+async function askOverride(
+  guardName: string,
+  cc: CallContext,
+  reason: string,
+  files: string[],
+): Promise<"once" | "session" | null> {
+  const asker = currentCallAsker();
+  const elicit = asker?.elicit;
+  if (!elicit || !clientAdvertisesElicitation(elicit)) return null;
+  const label = callLabel(asker?.subject, cc.method);
+  try {
+    const answer = await elicit({
+      message: `Guard ${guardName} blocked ${label}: ${reason}. Allow this call?`,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          decision: {
+            type: "string",
+            title: "Decision",
+            enum: [ALLOW_ONCE, ALLOW_SESSION, DENY],
+            enumNames: ["Allow this call", "Allow for this session", "Deny"],
+            default: DENY,
+          },
+        },
+        required: ["decision"],
+      },
+      _meta: {
+        [GUARD_OVERRIDE_META_KEY]: {
+          guard: guardName,
+          method: cc.method,
+          ...(asker?.subject ? { subject: asker.subject } : {}),
+          call: label,
+          reason,
+          paths: files,
+        },
+      },
+    });
+    if (answer.action !== "accept") return null;
+    const decision = answer.content?.decision;
+    if (decision === ALLOW_ONCE) return "once";
+    if (decision === ALLOW_SESSION) return "session";
+    return null;
+  } catch (e) {
+    debug("guard", `override form for '${guardName}' on ${cc.method} failed: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
 /**
  * Resolve every declared hook up front.
  *
@@ -196,15 +282,16 @@ export async function buildGuards(
     if (decl.before) await assertResolvable(name, "before", decl.before, deps, source);
     if (decl.after) await assertResolvable(name, "after", decl.after, deps, source);
 
+    // Calls a person allowed past this guard for the rest of the session,
+    // keyed by what was asked for and the bridge method it reached.
+    const allowedForSession = new Set<string>();
+
     const guard: BridgeGuard = {
       name,
       order: decl.order,
       // Both narrower scopes are lazy: a guard that does not ask pays nothing,
       // and a pipeline of guards that all ask pays once.
-      ...(decl.scope === "writes" ? { appliesTo: (cc: CallContext) => writeScope(cc) } : {}),
-      ...(decl.scope === "mutations" ? { appliesTo: (cc: CallContext) => mutationScope(cc) } : {}),
-      ...(decl.scope === "reads" ? { appliesTo: (cc: CallContext) => readScope(cc) } : {}),
-      ...(decl.scope === "unknown" ? { appliesTo: (cc: CallContext) => unknownScope(cc) } : {}),
+      ...(SCOPE_PREDICATES[decl.scope] ? { appliesTo: SCOPE_PREDICATES[decl.scope] } : {}),
 
       ...(decl.before
         ? {
@@ -224,10 +311,27 @@ export async function buildGuards(
               }
               if (answered?.success === false) {
                 const files = cc.writeFiles();
+                const reason = refusalReason(answered);
+                if (decl.allowsOverride) {
+                  // Only a deliberate denial can be overridden. A hook that
+                  // threw never decided, so there is nothing to put to anyone.
+                  const key = `${currentCallAsker()?.subject ?? ""}|${cc.method}`;
+                  if (allowedForSession.has(key)) return;
+                  const allowed = await askOverride(name, cc, reason, files);
+                  if (allowed) {
+                    if (allowed === "session") allowedForSession.add(key);
+                    info(
+                      "guard",
+                      `override: a person allowed ${cc.method} past guard '${name}'`
+                      + `${allowed === "session" ? " for this session" : ""}: ${reason}`,
+                    );
+                    return;
+                  }
+                }
                 const on = files.length > 0 ? ` on ${files.join(", ")}` : "";
                 throw new McpError(
                   ErrorCode.WRITE_BLOCKED,
-                  `blocked (${cc.method})${on}: ${refusalReason(answered)}`,
+                  `blocked (${cc.method})${on}: ${reason}`,
                 );
               }
             },
@@ -272,6 +376,14 @@ export async function buildGuards(
 const LEGACY_GUARD_TASK = /^guard\.[^.]+\.(before|after)[A-Za-z0-9]*$/;
 
 /**
+ * The ue-mcp version that deletes assertNoLegacyGuardTasks, LEGACY_GUARD_TASK
+ * and their callers in sessions/session-load.ts. From that release a leftover
+ * `guard.<name>.<phase>` task loads as the ordinary task it is, so the error
+ * below names the release while there is still time to migrate.
+ */
+export const LEGACY_GUARD_TASKS_REMOVED_IN = "1.4.30";
+
+/**
  * Refuse to start when a task is still named like a guard.
  *
  * Before guards were declared, a task with this name WAS a guard. Under the
@@ -281,7 +393,7 @@ const LEGACY_GUARD_TASK = /^guard\.[^.]+\.(before|after)[A-Za-z0-9]*$/;
  *
  * That is the exact failure the declaration model exists to prevent, so the
  * migration must not reintroduce it. A leftover name is fatal and says what to
- * write instead.
+ * write instead. The check is temporary: it goes in LEGACY_GUARD_TASKS_REMOVED_IN.
  */
 export function assertNoLegacyGuardTasks(
   taskNames: string[],
@@ -310,6 +422,9 @@ export function assertNoLegacyGuardTasks(
     + "them one. A guard is declared in a `guards:` section now, so these are ordinary tasks that "
     + "nothing calls: whatever they were gating is ungated while the config still says it is "
     + `guarded.\n\n${examples.join("\n\n")}\n\n`
-    + "See the guards documentation for the full shape, including order and the after hook.",
+    + "Rename each task to a plain guard name under `guards:` and move its class_path into the "
+    + "before or after hook, as above; delete the old `guard.<name>.<phase>` task. See the guards "
+    + "documentation for the full shape, including order and the after hook. This check is removed "
+    + `in ue-mcp ${LEGACY_GUARD_TASKS_REMOVED_IN}; from then on such a task loads as an ordinary task and nothing warns.`,
   );
 }

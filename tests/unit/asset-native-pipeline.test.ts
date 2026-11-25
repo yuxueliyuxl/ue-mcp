@@ -4,8 +4,8 @@ import { assetTool } from "../../src/tools/asset.js";
 import { materialTool } from "../../src/tools/material.js";
 import { handlerSpecs } from "../../src/tools/specs/asset.generated.js";
 import { paramZod, zodSignature } from "../../src/surface/handler-spec.js";
-import { classifyAction } from "../../src/dispatch/locking.js";
-import type { ToolContext } from "../../src/core/types.js";
+import { classifyAction } from "../../src/dispatch/written-paths.js";
+import type { ToolContext } from "../../src/surface/tool-types.js";
 
 async function forwards(action: string, method: string, params: Record<string, unknown>) {
   const result = { success: true, saved: false, readBack: { skeletonPath: "/Game/Skeleton" } };

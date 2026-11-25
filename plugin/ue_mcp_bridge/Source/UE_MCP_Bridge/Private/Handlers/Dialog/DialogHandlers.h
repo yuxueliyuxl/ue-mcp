@@ -38,6 +38,11 @@ public:
 
 	static void RegisterHandlers(class FMCPHandlerRegistry& Registry);
 
+	/** Arm a policy the way set_dialog_policy does, for the startup policies the
+	 *  launch configures. Its answer is set_dialog_policy's: success, or an error
+	 *  naming the response keywords it accepts. */
+	static TSharedPtr<FJsonValue> ArmPolicy(const FString& Pattern, const FString& Response);
+
 	// Call once during module startup to hook FCoreDelegates::ModalMessageDialog
 	static void InstallDialogHook();
 
@@ -111,6 +116,54 @@ public:
 		TSharedPtr<SCheckBox> Box;
 		TArray<FString> Cells;
 		bool bChecked = false;
+		/** The text labelling the box from before it in its own row, such as a
+		 *  details panel's property name. Empty for a row-leading box, whose
+		 *  label is the text after it. */
+		FString FieldLabel;
+		/** Whether the texts after this box are its cells: true for a row that
+		 *  starts with its box, false for a box labelled from before it. */
+		bool bOwnsFollowingText = true;
+	};
+
+	/**
+	 * One drop-down picker of a modal: an SComboBox, an STextComboBox (which
+	 * wraps one) or another SComboButton whose menu is a list of options, such
+	 * as the DataTable Options dialog's row type picker.
+	 *
+	 * Options are read from the picker's own list rows, so they are the labels
+	 * a person sees; a picker that builds its menu only when opened has no
+	 * rows to read, and reports that rather than a guess.
+	 */
+	struct FModalCombo
+	{
+		/** The SMenuAnchor the picker is: SComboButton and every subclass of it. */
+		TSharedPtr<class SWidget> Anchor;
+		FString Label;
+		/** The text the picker shows for its current selection. */
+		FString Value;
+		bool bEnabled = true;
+	};
+
+	/** One editable text field of a modal: an SEditableText, normally inside
+	 *  an SEditableTextBox, such as a details panel's string property. */
+	struct FModalTextField
+	{
+		/** The SEditableText itself, which owns the edit and the commit. */
+		TSharedPtr<class SWidget> Editable;
+		/** The widget type a person would name: SEditableTextBox, SSearchBox, ... */
+		FString WidgetType;
+		FString Label;
+		FString Value;
+		FString Hint;
+		bool bReadOnly = false;
+		bool bEnabled = true;
+	};
+
+	/** The fields of a modal besides its buttons and tickable rows. */
+	struct FModalFields
+	{
+		TArray<FModalCombo> Combos;
+		TArray<FModalTextField> TextFields;
 	};
 
 	/** What this window is, to a caller waiting on the editor (#1078/#1118).
@@ -119,6 +172,15 @@ public:
 	 *  under notTreatedAsDialogs, and is empty for a window that was never a
 	 *  candidate. */
 	static EMCPPromptKind ClassifyWindow(const TSharedRef<class SWindow>& Window, FString* OutSkipReason = nullptr);
+
+	/** Is this one of the editor's own progress windows (a slow task's, a
+	 *  build's), or a modal already emptied for closing? (#1851)
+	 *
+	 *  Those sit on Slate's modal stack without the modal loop: the game thread
+	 *  keeps running the work they report, so they are neither a prompt nor a
+	 *  reason to refuse a call. OutReason carries the sentence list_dialogs
+	 *  reports under notTreatedAsDialogs. */
+	static bool IsProgressWindow(const TSharedRef<class SWindow>& Window, FString* OutReason = nullptr);
 
 	/** Is the editor waiting on an answer from this window? (#1078)
 	 *
@@ -211,7 +273,7 @@ private:
 	// Shared modal walk. One traversal answers DescribeActiveModal,
 	// list_dialogs, respond_to_dialog and the policy applier, so the four
 	// cannot disagree about which buttons a dialog has.
-	static TSharedPtr<SWindow> CollectActiveModal(FString& OutTitle, FString& OutMessage, TArray<FModalButton>& OutButtons, TArray<FModalItem>* OutItems = nullptr, EMCPPromptKind* OutKind = nullptr);
+	static TSharedPtr<SWindow> CollectActiveModal(FString& OutTitle, FString& OutMessage, TArray<FModalButton>& OutButtons, TArray<FModalItem>* OutItems = nullptr, EMCPPromptKind* OutKind = nullptr, FModalFields* OutFields = nullptr);
 
 
 	/** First policy whose pattern appears in the title or the message. */

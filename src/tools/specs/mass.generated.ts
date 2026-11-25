@@ -1,3 +1,4 @@
+// @session independent: Generated parameter declarations from the recorded C++ specs; data only, with no editor state.
 // GENERATED FILE - do not edit.
 //
 // Written by scripts/generate-handler-specs.mjs from tests/golden/handler-specs.json,
@@ -91,12 +92,6 @@ export const handlerSpecs: HandlerSpecs = {
   }
 };
 
-/** The Params: clause of each spec'd bridge method. */
-export const paramsClauses: Readonly<Record<string, string>> = {
-  ensure_mass_entity_config: "Params: assetPath OR name, packagePath?, traits, onConflict?",
-  read_mass_entity_config: "Params: assetPath",
-};
-
 /** Every key the spec'd mass handlers declare, aliases included. */
 export const schema: Record<string, z.ZodType> = {
   assetPath: z.string().optional().describe("MassEntityConfigAsset path, /Game/Folder/Name[.Name] (ensure_mass_entity_config). MassEntityConfigAsset path (read_mass_entity_config)"),
@@ -107,4 +102,4 @@ export const schema: Record<string, z.ZodType> = {
 };
 
 /** Declare an action for a spec'd bridge method: effect, summary, method. */
-export const specBp = makeSpecBp(paramsClauses, handlerSpecs);
+export const specBp = makeSpecBp(handlerSpecs);

@@ -1,12 +1,19 @@
 #include "UE_MCP_BridgeModule.h"
+#include "Handlers/Fab/FabLibrary.h"
+#include "Handlers/Fab/FabDownloads.h"
 #include "Modules/ModuleManager.h"
 #include "BridgeServer.h"
+#include "MCPWireContract.h"
 #include "EngineStatusHooks.h"
+#include "DeletedActorPackages.h"
+#include "HandlerSceneCaptureJob.h"
 #include "MCPEngineStatus.h"
 #include "Toolbar/MCPToolbarStatus.h"
 #include "Handlers/Dialog/DialogHandlers.h"
 #include "Handlers/PIE/PIEHandlers.h"
 #include "Handlers/Checkpoint/CheckpointHandlers.h"
+#include "Handlers/Editor/EditorHandlers.h"
+#include "Handlers/Asset/AssetQuickSearch.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
 #include "HAL/PlatformMisc.h"
@@ -43,8 +50,8 @@ namespace
 	 *     UE_MCP_DIALOG_POLICY="Restore=no;Would you like to rebuild=yes"
 	 *
 	 * The response words are exactly the ones set_dialog_policy accepts,
-	 * because each entry is applied by dispatching set_dialog_policy itself
-	 * rather than by a second copy of its parsing. An entry that is not a
+	 * because each entry is armed by set_dialog_policy's own code
+	 * (FDialogHandlers::ArmPolicy) rather than by a second copy of its parsing. An entry that is not a
 	 * pattern=response pair is skipped and said out loud: a policy that
 	 * silently does nothing is worse than no policy at all.
 	 */
@@ -55,10 +62,10 @@ namespace
 		{
 			return FromCommandLine;
 		}
-		return FPlatformMisc::GetEnvironmentVariable(TEXT("UE_MCP_DIALOG_POLICY"));
+		return FPlatformMisc::GetEnvironmentVariable(UEMCPWire::EnvVar::DialogPolicy);
 	}
 
-	void ApplyConfiguredDialogPolicies(FMCPHandlerRegistry& Registry)
+	void ApplyConfiguredDialogPolicies()
 	{
 		const FString Spec = ReadConfiguredDialogPolicy();
 		if (Spec.IsEmpty())
@@ -87,10 +94,7 @@ namespace
 				continue;
 			}
 
-			TSharedPtr<FJsonObject> PolicyParams = MakeShared<FJsonObject>();
-			PolicyParams->SetStringField(TEXT("pattern"), Pattern);
-			PolicyParams->SetStringField(TEXT("response"), Response);
-			const TSharedPtr<FJsonValue> PolicyResult = Registry.ExecuteHandler(TEXT("set_dialog_policy"), PolicyParams);
+			const TSharedPtr<FJsonValue> PolicyResult = FDialogHandlers::ArmPolicy(Pattern, Response);
 
 			// The handler refuses a response keyword it does not recognise, and
 			// its error names the valid ones. Reporting "applied" regardless
@@ -138,8 +142,8 @@ void FUE_MCP_BridgeModule::StartupModule()
 	// order the client uses (#819). Deriving lets multiple checkouts run
 	// side-by-side without colliding; the probe loop in Run() resolves the rare
 	// clash and publishes the actual bound port to the per-project lockfile.
-	const FMCPBridgePortChoice PortChoice = FMCPBridgeServer::ResolveConfiguredPort();
-	G_BridgeServer = MakeShared<FMCPBridgeServer>(PortChoice.Port, PortChoice.Source, PortChoice.bPinned);
+	const FMCPBridgePortChoice PortChoice = MCPBridgePortPolicy::Resolve();
+	G_BridgeServer = MakeShared<FMCPBridgeServer>(PortChoice);
 
 	// The snapshot has been publishing since PostConfigInit, from the
 	// UE_MCP_BridgeStatus module. Now that Slate, the shader compiler and the
@@ -148,6 +152,9 @@ void FUE_MCP_BridgeModule::StartupModule()
 	FMCPEngineStatus::Get().SetPhase(TEXT("bridge starting"));
 
 	FDialogHandlers::InstallDialogHook();
+
+	// Deleted actors' emptied packages stay loaded until a save commits them (#1545).
+	FMCPDeletedActorPackages::Install();
 
 	// Recorder, replayer, observer, script runner, the PIE Studio panel and its Record button.
 	FPIEHandlers::StartupSystems();
@@ -169,10 +176,10 @@ void FUE_MCP_BridgeModule::StartupModule()
 	// caller asked for by name.
 	//
 	// #968: policies the LAUNCHER asked for are the one thing applied here, and
-	// they are applied by dispatching set_dialog_policy, so they are recorded as
+	// they are armed through set_dialog_policy's own code, so they are recorded as
 	// what they are: a caller arming an answer in advance, before the socket is
 	// listening, for a prompt they already know is coming.
-	ApplyConfiguredDialogPolicies(G_BridgeServer->GetHandlerRegistry());
+	ApplyConfiguredDialogPolicies();
 
 	if (G_BridgeServer->Start())
 	{
@@ -232,15 +239,21 @@ void FUE_MCP_BridgeModule::ShutdownModule()
 	// widget polls it once a second, and removing the menu entry destroys the
 	// widget synchronously.
 	FMCPToolbarStatus::Remove();
-
+	MCPFab::ResetLibrary();
+	MCPFab::ShutdownDownloads();
+	FEditorHandlers::ShutdownMeshStudioRenders();
+	UEMCP::SceneCapture::ShutdownWarmCapture();
 	if (G_EditorReadyTicker.IsValid())
 	{
 		FTSTicker::GetCoreTicker().RemoveTicker(G_EditorReadyTicker);
 		G_EditorReadyTicker.Reset();
 	}
 	FDialogHandlers::RemoveDialogHook();
+	FMCPDeletedActorPackages::Remove();
 	FPIEHandlers::ShutdownSystems();
 	FCheckpointHandlers::Shutdown();
+	// Unbinds the quick_search index from the Asset Registry while it is still loaded.
+	MCPQuickSearch::FAssetIndex::Shutdown();
 	// The snapshot itself outlives this module (its own module owns it and
 	// keeps publishing until PostConfigInit teardown); only the Slate and
 	// Engine sensors go away with us.

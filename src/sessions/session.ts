@@ -1,3 +1,4 @@
+// @session per-session: The registry of editors itself.
 /**
  * Editor sessions - one server, an arbitrary number of editors (#817).
  *
@@ -25,16 +26,19 @@ import { ProjectContext } from "../config/project.js";
 import { GuardedBridge } from "../flow/guarded-bridge.js";
 import { GuardRegistry } from "../flow/guard.js";
 import { makeResolveExistingFile } from "../flow/guard.js";
-import { normalizeProjectRoot } from "../bridge/port.js";
+import { normalizeProjectRoot } from "../bridge/wire-contract.js";
 import { McpError, ErrorCode } from "../core/errors.js";
 import { warn } from "../core/log.js";
+import { LeaseRegistry } from "../dispatch/leases.js";
+import type { CategoryControl } from "../surface/category-state.js";
 import { newLockOwnerId } from "../dispatch/lock-owner.js";
 import { withoutDialogActuation } from "../editor/dialog-guard.js";
 import { projectDirOf } from "../config/uproject-path.js";
-import type { ToolDef } from "../core/types.js";
+import type { ToolDef } from "../surface/tool-types.js";
 
-/** Key used for the session that has no project bound. */
-export const DEFAULT_SESSION_KEY = "";
+import { DEFAULT_SESSION_KEY } from "./session-key.js";
+
+export { DEFAULT_SESSION_KEY };
 /** Name of the session that has no project bound. */
 export const DEFAULT_SESSION_NAME = "default";
 
@@ -166,6 +170,13 @@ export class SessionRegistry {
    * the daemon; absent in process.
    */
   editorOperation?: (op: "restart" | "rebuild") => Promise<{ steps: Array<{ step: string; ok: boolean; result: string }> }>;
+  /**
+   * Turn categories on and off in a session without a restart. Installed by
+   * the session loads, which own each session's graph (#1827).
+   */
+  categories?: CategoryControl<EditorSession>;
+  /** Asset leases, shared by every MCP session dispatching through this registry. */
+  readonly leases = new LeaseRegistry();
   /** Held while a compound edit is mid-flight, so observers see one change. */
   private suppressNotify = false;
 

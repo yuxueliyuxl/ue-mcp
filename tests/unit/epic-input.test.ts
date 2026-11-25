@@ -11,9 +11,10 @@ import { describe, expect, it, vi } from "vitest";
 import { expandRefPath, resolveEpicToolInput, type EpicInputSchema } from "../../src/surface/epic-input.js";
 import { widgetTool } from "../../src/tools/widget.js";
 import { pcgTool } from "../../src/tools/pcg.js";
+import { blueprintTool } from "../../src/tools/blueprint.js";
 import { actionSignature } from "../../src/surface/action-signature.js";
 import { actionSchema } from "../../src/surface/action-schema.js";
-import type { ToolContext } from "../../src/core/types.js";
+import type { ToolContext } from "../../src/surface/tool-types.js";
 
 const GET_WIDGETS_NAME = "UMGToolSet.UMGToolSet.GetWidgets";
 const GET_WIDGETS: EpicInputSchema = {
@@ -161,7 +162,42 @@ describe("array-of-struct parameters on epic_* wrappers (#1281)", () => {
     expect(actionSignature(pcgTool, "epic_set_graph_params")).toContain("params:[o]");
     const described = actionSchema(pcgTool, "epic_set_graph_params").params.find((p) => p.name === "params")!;
     expect(described.items?.properties?.type.enumValues).toContain("Integer32");
-    expect(described.items?.properties?.containerType.enumValues).toEqual(["None", "Array", "Set", "Map", "Count"]);
+    // The newest engine's enum: UE 5.9 dropped the Count sentinel 5.8 listed.
+    expect(described.items?.properties?.containerType.enumValues).toEqual(["None", "Array", "Set", "Map"]);
+  });
+});
+
+describe("allowDestructive on Graph DSL rewrites (#1908)", () => {
+  const BP = "/Game/BP_Door";
+
+  it("rides beside input to epic_call_tool, where the bridge's guard reads it", async () => {
+    const call = vi.fn().mockResolvedValue({ success: true });
+    const ctx = { bridge: { call } } as unknown as ToolContext;
+    await blueprintTool.handler(ctx, { action: "epic_write", assetPath: BP, dsl: "(event `Foo`)", allowDestructive: true });
+    expect(call).toHaveBeenCalledWith(
+      "epic_call_tool",
+      {
+        toolset: "BlueprintToolsets.BlueprintDslToolset",
+        tool: "BlueprintToolsets.BlueprintDslToolset.Write",
+        input: { assetPath: BP, dsl: "(event `Foo`)" },
+        allowDestructive: true,
+      },
+      undefined,
+    );
+  });
+
+  it("is left off when not passed, so the guard refuses a lossy rewrite", async () => {
+    const call = vi.fn().mockResolvedValue({ success: true });
+    const ctx = { bridge: { call } } as unknown as ToolContext;
+    await blueprintTool.handler(ctx, { action: "epic_write", assetPath: BP, dsl: "(event `Foo`)" });
+    expect(call.mock.calls[0][1]).not.toHaveProperty("allowDestructive");
+  });
+
+  it("is documented on epic_write and epic_edit only", () => {
+    const names = (action: string) => actionSchema(blueprintTool, action).params.map((p) => p.name);
+    expect(names("epic_write")).toContain("allowDestructive");
+    expect(names("epic_edit")).toContain("allowDestructive");
+    expect(names("epic_read")).not.toContain("allowDestructive");
   });
 });
 

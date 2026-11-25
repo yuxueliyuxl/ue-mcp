@@ -1,3 +1,4 @@
+// @session per-session: Checks for and applies an update to the bridge installed in one project.
 /**
  * Updating an installed bridge (spec 5.4, 7.3): find the newest release on the
  * install's channel, then apply it whether or not the editor is running.
@@ -19,7 +20,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ProjectContext } from "../config/project.js";
-import { distTagForVersion, isNewer, resolveUpdateTarget } from "../core/version-check.js";
+import { distTagForVersion, isNewer, npmPackageUrl, resolveUpdateTarget } from "../core/version-check.js";
 import { packageVersion } from "../core/package-root.js";
 import {
   BRIDGE_PLUGIN_NAME,
@@ -40,8 +41,9 @@ import {
   type BinaryManifest,
   type BinaryTarget,
 } from "./bridge-binaries.js";
-import { deploy, projectEngineVersion } from "./deployer.js";
-import { detectMcpClients, liftsAgeGate, readUeMcpEntry, writeMcpConfig } from "../integrations/claude-code/mcp-client-config.js";
+import { deploy } from "./deployer.js";
+import { projectEngineVersion } from "./engine-root.js";
+import { detectMcpClients, liftsAgeGate, readUeMcpEntry, writeMcpConfig } from "../integrations/mcp-clients/mcp-client-config.js";
 import { readEnv } from "../core/env.js";
 import { ASIDE_FILE, UPDATER_FILES, treeFiles, verifyBridgeTree } from "./bridge-tree.js";
 import { buildProject, type BuildResult } from "./editor-build.js";
@@ -53,11 +55,6 @@ export type BridgeBuild = (uprojectPath: string) => Promise<BuildResult>;
 
 /** Minimal fetch, injected so the release lookups can be tested without a network. */
 export type ReleaseFetcher = (url: string) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
-
-/** The ue-mcp package document on the npm registry: UE_MCP_NPM_REGISTRY, else the public one. */
-export function npmPackageUrl(): string {
-  return `${(readEnv("npmRegistry") || "https://registry.npmjs.org").replace(/\/+$/, "")}/ue-mcp`;
-}
 
 export const PENDING_UPDATE_NAME = ".ue-mcp-update-pending.json";
 

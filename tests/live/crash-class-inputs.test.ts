@@ -74,7 +74,7 @@ async function exists(path: string): Promise<boolean> {
 beforeAll(async () => {
   bridge = await getBridge();
   // MCP_Home is not checked in; demo_go_home creates it on a fresh project and loads it.
-  const home = await callBridge(bridge, "demo_go_home", {});
+  const home = await callBridge(bridge, "demo_go_home", { discardUnsaved: true });
   expect(home.ok && body(home).success !== false, home.error ?? JSON.stringify(home.result)).toBe(true);
   const loaded = await callBridge(bridge, "load_level", { levelPath: MAP });
   expect(loaded.ok, loaded.error).toBe(true);
@@ -132,7 +132,7 @@ describe("the currently loaded map", () => {
 
   it("deletes a map while it is the loaded one, and the editor carries on", async () => {
     await callBridge(bridge, "delete_asset", { assetPath: SCRATCH_MAP, force: true });
-    const created = await survive("create_new_level", { levelPath: SCRATCH_MAP });
+    const created = await survive("create_new_level", { levelPath: SCRATCH_MAP, discardUnsaved: true });
     expect(refused(created), created.error ?? JSON.stringify(created.result)).toBe(false);
     if ((await currentMap()) !== SCRATCH_MAP) await survive("load_level", { levelPath: SCRATCH_MAP });
     expect(await currentMap()).toBe(SCRATCH_MAP);

@@ -8,10 +8,12 @@
 #include "SceneViewExtension.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/NetConnection.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
 #include "InputAction.h"
 #include "InputActionValue.h"
+#include "Misc/CoreDelegates.h"
 
 namespace
 {
@@ -37,6 +39,75 @@ namespace
 		return Action;
 	}
 }
+
+// ── Server-side report bookkeeping ──────────────────────────────────────────
+
+void FMCPPIERemoteReports::Expect(const FString& Id, bool bFresh)
+{
+	if (bFresh)
+	{
+		Results.Remove(Id);
+		Triggers.Remove(Id);
+	}
+	if (Expected.Contains(Id))
+	{
+		// A follow-up keeps a running request alive: it moves to the newest end, so the cap drops older ones first.
+		Order.Remove(Id);
+		Order.Add(Id);
+		return;
+	}
+	while (Order.Num() >= MaxRequests)
+	{
+		const FString Oldest = Order[0];
+		Forget(Oldest);
+	}
+	Order.Add(Id);
+	Expected.Add(Id);
+}
+
+bool FMCPPIERemoteReports::AcceptReport(const FString& Id, bool bOk, bool bFinished, const FString& Error)
+{
+	if (!Expected.Contains(Id))
+	{
+		return false;
+	}
+	FMCPPIERemoteResult& Result = Results.FindOrAdd(Id);
+	Result.Id = Id;
+	Result.bOk = bOk;
+	Result.bFinished = bFinished;
+	Result.Error = Error.Left(MaxTextLength);
+	return true;
+}
+
+bool FMCPPIERemoteReports::AcceptTrigger(const FString& Id, const FVector& Value)
+{
+	if (!Expected.Contains(Id))
+	{
+		return false;
+	}
+	FMCPPIERemoteTrigger& Trigger = Triggers.FindOrAdd(Id);
+	Trigger.Id = Id;
+	Trigger.Value = Value;
+	return true;
+}
+
+void FMCPPIERemoteReports::Forget(const FString& Id)
+{
+	Order.Remove(Id);
+	Expected.Remove(Id);
+	Results.Remove(Id);
+	Triggers.Remove(Id);
+}
+
+void FMCPPIERemoteReports::Reset()
+{
+	Order.Reset();
+	Expected.Reset();
+	Results.Reset();
+	Triggers.Reset();
+}
+
+// ── Component ───────────────────────────────────────────────────────────────
 
 UMCPPIERemoteControl::UMCPPIERemoteControl()
 {
@@ -68,11 +139,17 @@ void UMCPPIERemoteControl::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		MCPPIE::FPIEInputInjector::StopAny(Id);
 	}
 	OwnedTapes.Reset();
+	Watches.Reset();
+	UnbindWatchFrame();
 	if (Capture.IsValid())
 	{
 		Capture->SetEnabled(false);
 		Capture.Reset();
 	}
+	// Server side: the session or the player is gone, and nothing it reported is read again.
+	Reports.Reset();
+	bClientReady = false;
+	ClientLogFile.Reset();
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -80,29 +157,31 @@ void UMCPPIERemoteControl::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void UMCPPIERemoteControl::SendInject(const FString& Id, const FSoftObjectPath& Action, const FVector& Value)
 {
-	Results.Remove(Id);
+	Reports.Expect(Id, /*bFresh*/ true);
 	ClientInject(Id, Action, Value);
 }
 
 void UMCPPIERemoteControl::SendStartHold(const FString& Id, const FSoftObjectPath& Action, const FVector& Value)
 {
-	Results.Remove(Id);
+	Reports.Expect(Id, /*bFresh*/ true);
 	ClientStartHold(Id, Action, Value);
 }
 
 void UMCPPIERemoteControl::SendUpdateHold(const FString& Id, const FVector& Value)
 {
+	Reports.Expect(Id, /*bFresh*/ false);
 	ClientUpdateHold(Id, Value);
 }
 
 void UMCPPIERemoteControl::SendStop(const FString& Id)
 {
+	Reports.Expect(Id, /*bFresh*/ false);
 	ClientStop(Id);
 }
 
 void UMCPPIERemoteControl::SendTape(const FString& Id, const FSoftObjectPath& Action, const TArray<FVector>& Values)
 {
-	Results.Remove(Id);
+	Reports.Expect(Id, /*bFresh*/ true);
 	TArray<FVector_NetQuantize100> Quantized;
 	Quantized.Reserve(Values.Num());
 	for (const FVector& V : Values)
@@ -114,20 +193,31 @@ void UMCPPIERemoteControl::SendTape(const FString& Id, const FSoftObjectPath& Ac
 
 void UMCPPIERemoteControl::SendCapture(const FString& Id, const FString& OutputPath)
 {
-	Results.Remove(Id);
+	Reports.Expect(Id, /*bFresh*/ true);
 	ClientCapture(Id, OutputPath);
 }
 
 void UMCPPIERemoteControl::SendFace(const FString& Id, const FRotator& Rotation)
 {
-	Results.Remove(Id);
+	Reports.Expect(Id, /*bFresh*/ true);
 	ClientFace(Id, Rotation);
 }
 
 void UMCPPIERemoteControl::SendConsole(const FString& Id, const FString& Command)
 {
-	Results.Remove(Id);
+	Reports.Expect(Id, /*bFresh*/ true);
 	ClientConsole(Id, Command);
+}
+
+void UMCPPIERemoteControl::SendWatchTrigger(const FString& Id, const FSoftObjectPath& Action)
+{
+	Reports.Expect(Id, /*bFresh*/ true);
+	ClientWatchTrigger(Id, Action);
+}
+
+void UMCPPIERemoteControl::SendStopWatch(const FString& Id)
+{
+	ClientStopWatch(Id);
 }
 
 // ── Client-side execution ───────────────────────────────────────────────────
@@ -272,6 +362,77 @@ void UMCPPIERemoteControl::ClientConsole_Implementation(const FString& Id, const
 	Report(Id, true, true, FString());
 }
 
+void UMCPPIERemoteControl::ClientWatchTrigger_Implementation(const FString& Id, const FSoftObjectPath& Action)
+{
+	FString Error;
+	UInputAction* Loaded = LoadAction(Action, Error);
+	ULocalPlayer* LocalPlayer = Loaded ? ResolveOwnLocalPlayer(Error) : nullptr;
+	if (!LocalPlayer)
+	{
+		Report(Id, false, true, Error);
+		return;
+	}
+	Watches.RemoveAll([&Id](const FMCPPIERemoteWatch& W) { return W.Id == Id; });
+	FMCPPIERemoteWatch& Watch = Watches.AddDefaulted_GetRef();
+	Watch.Id = Id;
+	Watch.Path = Action;
+	Watch.Action = Loaded;
+	if (!WatchFrameHandle.IsValid())
+	{
+		WatchFrameHandle = FCoreDelegates::OnEndFrame.AddUObject(this, &UMCPPIERemoteControl::PollWatches);
+	}
+	Report(Id, true, false, FString());
+}
+
+void UMCPPIERemoteControl::ClientStopWatch_Implementation(const FString& Id)
+{
+	Watches.RemoveAll([&Id](const FMCPPIERemoteWatch& W) { return W.Id == Id; });
+	if (Watches.Num() == 0) UnbindWatchFrame();
+}
+
+void UMCPPIERemoteControl::PollWatches()
+{
+	FString Error;
+	ULocalPlayer* LocalPlayer = ResolveOwnLocalPlayer(Error);
+	for (int32 I = Watches.Num() - 1; I >= 0; --I)
+	{
+		FMCPPIERemoteWatch& Watch = Watches[I];
+		const UInputAction* Action = Watch.Action.Get();
+		if (!Action)
+		{
+			Action = Cast<UInputAction>(Watch.Path.TryLoad());
+			Watch.Action = Action;
+		}
+		if (!Action)
+		{
+			Report(Watch.Id, false, true, FString::Printf(TEXT("the watched Input Action '%s' no longer loads"), *Watch.Path.ToString()));
+			Watches.RemoveAt(I);
+			continue;
+		}
+		bool bTriggered = false;
+		FVector Value = FVector::ZeroVector;
+		// A player between pawns has no input to read this frame; the watch waits for it.
+		if (!LocalPlayer || !MCPPIE::ReadActionTriggerState(LocalPlayer, Action, bTriggered, Value, Error)) continue;
+		if (Watch.Gate.Feed(bTriggered))
+		{
+			UE_LOG(LogMCPPIERuntime, Log, TEXT("[PIEStudio] watch %s: %s triggered"), *Watch.Id, *Action->GetName());
+			ServerTriggered(Watch.Id, Value);
+			Report(Watch.Id, true, true, FString());
+			Watches.RemoveAt(I);
+		}
+	}
+	if (Watches.Num() == 0) UnbindWatchFrame();
+}
+
+void UMCPPIERemoteControl::UnbindWatchFrame()
+{
+	if (WatchFrameHandle.IsValid())
+	{
+		FCoreDelegates::OnEndFrame.Remove(WatchFrameHandle);
+		WatchFrameHandle.Reset();
+	}
+}
+
 void UMCPPIERemoteControl::HandleTapeFinished(const FString& Id)
 {
 	if (OwnedTapes.Remove(Id) > 0)
@@ -282,18 +443,48 @@ void UMCPPIERemoteControl::HandleTapeFinished(const FString& Id)
 
 // ── Server-side answers ─────────────────────────────────────────────────────
 
+bool UMCPPIERemoteControl::IsRemotePlayerController(const AActor* Owner)
+{
+	// On the server a remote player's controller is driven by that player's connection, not by a local player.
+	const APlayerController* PC = Cast<APlayerController>(Owner);
+	return PC && PC->HasAuthority() && Cast<UNetConnection>(PC->Player) != nullptr && !PC->IsLocalController();
+}
+
 void UMCPPIERemoteControl::ServerReady_Implementation(const FString& LogFile)
 {
+	if (!IsRemotePlayerController(GetOwner()))
+	{
+		UE_LOG(LogMCPPIERuntime, Warning, TEXT("[PIEStudio] ServerReady refused: %s is not a remote player's controller"), *GetNameSafe(GetOwner()));
+		return;
+	}
 	bClientReady = true;
-	ClientLogFile = LogFile;
+	ClientLogFile = LogFile.Left(FMCPPIERemoteReports::MaxTextLength);
 	UE_LOG(LogMCPPIERuntime, Log, TEXT("[PIEStudio] remote player %s is ready"), *GetNameSafe(GetOwner()));
+}
+
+void UMCPPIERemoteControl::ServerTriggered_Implementation(const FString& Id, FVector Value)
+{
+	if (!IsRemotePlayerController(GetOwner()))
+	{
+		UE_LOG(LogMCPPIERuntime, Warning, TEXT("[PIEStudio] ServerTriggered refused: %s is not a remote player's controller"), *GetNameSafe(GetOwner()));
+		return;
+	}
+	if (!Reports.AcceptTrigger(Id, Value))
+	{
+		UE_LOG(LogMCPPIERuntime, Verbose, TEXT("[PIEStudio] %s reported a trigger for a request the server did not send or no longer holds"), *GetNameSafe(GetOwner()));
+	}
 }
 
 void UMCPPIERemoteControl::ServerReport_Implementation(const FString& Id, bool bOk, bool bFinished, const FString& Error)
 {
-	FMCPPIERemoteResult& Result = Results.FindOrAdd(Id);
-	Result.Id = Id;
-	Result.bOk = bOk;
-	Result.bFinished = bFinished;
-	Result.Error = Error;
+	if (!IsRemotePlayerController(GetOwner()))
+	{
+		UE_LOG(LogMCPPIERuntime, Warning, TEXT("[PIEStudio] ServerReport refused: %s is not a remote player's controller"), *GetNameSafe(GetOwner()));
+		return;
+	}
+	if (!Reports.AcceptReport(Id, bOk, bFinished, Error))
+	{
+		// The client chose this id: it is not echoed back, as it can be any length.
+		UE_LOG(LogMCPPIERuntime, Verbose, TEXT("[PIEStudio] %s reported on a request the server did not send or no longer holds"), *GetNameSafe(GetOwner()));
+	}
 }

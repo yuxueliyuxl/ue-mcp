@@ -142,15 +142,17 @@ void MCPCheckpointRecordBeforeWrite(const FString& Filename)
 	R.Seen.Add(Key);
 	++R.Count;
 
+	namespace M = UEMCPWire::CheckpointManifest;
 	TSharedPtr<FJsonObject> Line = MakeShared<FJsonObject>();
-	Line->SetStringField(TEXT("path"), Full);
-	Line->SetBoolField(TEXT("existed"), bExisted);
-	if (bExisted) Line->SetStringField(TEXT("copy"), Copy);
+	Line->SetNumberField(M::VersionField, M::Version);
+	Line->SetStringField(M::PathField, Full);
+	Line->SetBoolField(M::ExistedField, bExisted);
+	if (bExisted) Line->SetStringField(M::CopyField, Copy);
 	FString Text;
 	TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Text);
 	FJsonSerializer::Serialize(Line.ToSharedRef(), Writer);
 	Text += TEXT("\n");
-	FFileHelper::SaveStringToFile(Text, *FPaths::Combine(R.PendingDir, TEXT("manifest.jsonl")),
+	FFileHelper::SaveStringToFile(Text, *FPaths::Combine(R.PendingDir, M::File),
 		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM, &FileManager, FILEWRITE_Append);
 }
 
@@ -196,6 +198,11 @@ TSharedPtr<FJsonValue> FCheckpointHandlers::Arm(const TSharedPtr<FJsonObject>& P
 		return MCPResult(Result);
 	}
 	if (PendingDir.IsEmpty()) return MCPError(TEXT("pendingDir is required when enabled is true"));
+	{
+		FString Resolved;
+		if (auto Err = MCPRequireWritablePath(PendingDir, Resolved)) return Err;
+		PendingDir = Resolved;
+	}
 
 	const FString Previous = R.bArmed ? R.PendingDir : FString();
 	R.PendingDir = CheckpointFullPath(PendingDir);
@@ -229,7 +236,7 @@ TSharedPtr<FJsonValue> FCheckpointHandlers::PrepareRestore(const TSharedPtr<FJso
 	const TSharedPtr<FJsonValue> FilesValue = TryGetParam(Params, TEXT("files"));
 	if (CheckpointPlaying())
 	{
-		return MCPErrorWithCode(TEXT("pie_running"), TEXT("Restore is refused while Play In Editor runs: stop it first."));
+		return MCPErrorWithCode(TEXT("pie_running"), TEXT("Restore is refused while Play In Editor runs. ") + MCPStopPlayInEditorStep());
 	}
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
 	if (bCheckOnly) return MCPResult(Result);

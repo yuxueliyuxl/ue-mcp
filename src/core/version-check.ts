@@ -1,3 +1,4 @@
+// @session independent: One npm check per process; the upgrade notice is emitted once.
 /**
  * Background check for newer ue-mcp releases on npm.
  *
@@ -16,8 +17,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { warn, debug } from "./log.js";
 import { userDir } from "./user-dir.js";
-import { compareVersions, parseVersion } from "../extensions/version.js";
+import { compareVersions, parseVersion } from "./semver.js";
 import { readEnv } from "./env.js";
+import { PLAIN_SEMVER_RE, runNpmSync } from "./safe-spawn.js";
 
 /**
  * Where the answer is cached.
@@ -36,7 +38,30 @@ function cacheFile(): string {
 }
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 5000;
-const REGISTRY_URL = "https://registry.npmjs.org/ue-mcp/latest";
+
+/**
+ * Where ue-mcp's releases are looked up. Two questions, each answered in one place:
+ *
+ *   npmPackageUrl()      the registry document over HTTP, from UE_MCP_NPM_REGISTRY or the public
+ *                        registry: the startup notice and `update` for the bridge read this.
+ *   npmResolvedLatest()  what npm itself resolves `ue-mcp` to, through the user's .npmrc: what
+ *                        `npm install -g` and npx would install, which doctor and `update` compare.
+ */
+export function npmPackageUrl(): string {
+  return `${(readEnv("npmRegistry") || "https://registry.npmjs.org").replace(/\/+$/, "")}/ue-mcp`;
+}
+
+/** The version npm resolves `ue-mcp` to (its `latest` dist-tag), or null when npm cannot answer. */
+export function npmResolvedLatest(): string | null {
+  const r = runNpmSync(["view", "ue-mcp", "version"], { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
+  return r.status === 0 ? latestFromNpmView(String(r.stdout ?? "")) : null;
+}
+
+/** npm's answer, used only when it is a version number, since it becomes an install argument. */
+export function latestFromNpmView(out: string | null): string | null {
+  const v = out?.trim().split(/\r?\n/).pop()?.trim();
+  return v && PLAIN_SEMVER_RE.test(v) ? v : null;
+}
 
 interface CacheEntry {
   checkedAt: number;
@@ -98,7 +123,7 @@ async function fetchLatest(): Promise<string | null> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(REGISTRY_URL, { signal: ctrl.signal });
+    const res = await fetch(`${npmPackageUrl()}/latest`, { signal: ctrl.signal });
     if (!res.ok) return null;
     const body = (await res.json()) as { version?: unknown };
     if (typeof body.version !== "string") return null;

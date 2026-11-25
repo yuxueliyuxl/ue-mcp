@@ -6,6 +6,8 @@
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "Handlers/PIE/PIEScriptRunner.h"
+#include "Handlers/PIE/PIEObserver.h"
+#include "MCPPIEActionTrigger.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -75,6 +77,9 @@ bool FPIEScriptEvaluatorTest::RunTest(const FString& /*Parameters*/)
 	TestFalse(TEXT("decreasing: equal does not hold"), EvaluateScriptCondition(MakeExpect(EScriptExpectOp::Decreasing, TEXT("H")), 100.0, 100.0));
 	TestTrue(TEXT("increasing: higher holds"), EvaluateScriptCondition(MakeExpect(EScriptExpectOp::Increasing, TEXT("H")), 1.0, 2.0));
 	TestFalse(TEXT("increasing: lower does not hold"), EvaluateScriptCondition(MakeExpect(EScriptExpectOp::Increasing, TEXT("H")), 1.0, 0.5));
+	TestTrue(TEXT("decreasing by at least 300: 320 holds"), EvaluateScriptCondition(MakeExpect(EScriptExpectOp::Decreasing, TEXT("X"), true, 300.0), -1000.0, -1320.0));
+	TestFalse(TEXT("decreasing by at least 300: 200 does not"), EvaluateScriptCondition(MakeExpect(EScriptExpectOp::Decreasing, TEXT("X"), true, 300.0), -1000.0, -1200.0));
+	TestTrue(TEXT("increasing by at least 2: exactly 2 holds"), EvaluateScriptCondition(MakeExpect(EScriptExpectOp::Increasing, TEXT("H"), true, 2.0), 1.0, 3.0));
 
 	const FScriptExpect Eq = MakeExpect(EScriptExpectOp::Eq, TEXT("H"), true, 1000.0);
 	TestTrue(TEXT("eq: within relative epsilon"), EvaluateScriptCondition(Eq, 0.0, 1000.05));
@@ -132,7 +137,9 @@ bool FPIEScriptStepParsingTest::RunTest(const FString& /*Parameters*/)
 	TestTrue(TEXT("missing value error"), Err.Contains(TEXT("value")));
 	TestFalse(TEXT("eq needs target"), Parse(TEXT("{\"instruction\":\"x\",\"expect\":{\"value\":\"H\",\"op\":\"eq\"}}"), Def, Err));
 	TestTrue(TEXT("target error"), Err.Contains(TEXT("target")));
-	TestFalse(TEXT("relative op takes no target"), Parse(TEXT("{\"instruction\":\"x\",\"expect\":{\"value\":\"H\",\"op\":\"increasing\",\"target\":1}}"), Def, Err));
+	TestTrue(TEXT("relative op takes a least-change target"), Parse(TEXT("{\"instruction\":\"x\",\"expect\":{\"value\":\"H\",\"op\":\"increasing\",\"target\":1}}"), Def, Err));
+	TestFalse(TEXT("relative op refuses a zero target"), Parse(TEXT("{\"instruction\":\"x\",\"expect\":{\"value\":\"H\",\"op\":\"decreasing\",\"target\":0}}"), Def, Err));
+	TestFalse(TEXT("relative op refuses a boolean target"), Parse(TEXT("{\"instruction\":\"x\",\"expect\":{\"value\":\"H\",\"op\":\"decreasing\",\"target\":true}}"), Def, Err));
 	TestFalse(TEXT("manual with expect refused"), Parse(TEXT("{\"instruction\":\"x\",\"judge\":\"manual\",\"expect\":{\"value\":\"H\",\"op\":\"gt\",\"target\":1}}"), Def, Err));
 	TestFalse(TEXT("bad judge refused"), Parse(TEXT("{\"instruction\":\"x\",\"judge\":\"robot\"}"), Def, Err));
 	TestFalse(TEXT("missing instruction refused"), Parse(TEXT("{\"judge\":\"auto\"}"), Def, Err));
@@ -814,6 +821,288 @@ bool FPIEScriptArrangeActManualTest::RunTest(const FString& /*Parameters*/)
 	SettleUnfinishedScriptSteps(Stopped, TEXT("stopped"));
 	TestTrue(TEXT("act failed on stop"), Stopped.Steps[0].Act.State == EScriptActState::Failed);
 	TestTrue(TEXT("step failed on stop"), Stopped.Steps[0].Status == EScriptStepStatus::Failed);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPIEScriptPawnChannelTest,
+	"UE.MCP.PIE.Script.PawnChannels",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPIEScriptPawnChannelTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MCPPIE;
+	FCSVRow Row;
+	Row.PawnLocation = FVector(-1326.8, 20.0, 90.0);
+	Row.PawnVelocity = FVector(375.0, 0.0, -10.0);
+	Row.PawnRotation = FRotator(0.0, 45.0, 0.0);
+	Row.Speed2D = 375.f;
+	double V = 0.0;
+	TestTrue(TEXT("pos_x reads"), ReadPawnChannel(Row, TEXT("pos_x"), V));
+	TestEqual(TEXT("pos_x value"), V, -1326.8);
+	TestTrue(TEXT("case-insensitive"), ReadPawnChannel(Row, TEXT("VEL_Z"), V));
+	TestEqual(TEXT("vel_z value"), V, -10.0);
+	TestTrue(TEXT("rot_yaw reads"), ReadPawnChannel(Row, TEXT("rot_yaw"), V));
+	TestEqual(TEXT("rot_yaw value"), V, 45.0);
+	TestTrue(TEXT("speed2d reads"), ReadPawnChannel(Row, TEXT("speed2d"), V));
+	TestFalse(TEXT("an unknown name is not a channel"), ReadPawnChannel(Row, TEXT("Health"), V));
+	TestTrue(TEXT("pos_z is a channel name"), IsPawnChannelName(TEXT("pos_z")));
+	TestFalse(TEXT("x alone is not"), IsPawnChannelName(TEXT("x")));
+	return true;
+}
+
+namespace MCPPIEScriptTests
+{
+	// Stands in for the editor's trigger source: each step reads whatever the test set for it.
+	class FFakeTriggerSource : public IScriptTriggerSource
+	{
+	public:
+		struct FEntry
+		{
+			EScriptTriggerRead Read = EScriptTriggerRead::Watching;
+			FScriptTrigger Trigger;
+			FString Why;
+		};
+		TMap<int32, FEntry> Entries;
+		TMap<int32, int32> Asked;
+		TMap<int32, double> FromMs;
+		TArray<int32> Ended;
+
+		virtual EScriptTriggerRead ReadTrigger(int32 Index, const FScriptExpect& Expect, double InFromMs,
+			FScriptTrigger& OutTrigger, FString& OutWhy) override
+		{
+			Asked.FindOrAdd(Index)++;
+			FromMs.Add(Index, InFromMs);
+			const FEntry* E = Entries.Find(Index);
+			if (!E) return EScriptTriggerRead::Watching;
+			OutTrigger = E->Trigger;
+			OutWhy = E->Why;
+			return E->Read;
+		}
+
+		virtual void EndWatch(int32 Index) override { Ended.Add(Index); }
+
+		void Fire(int32 Index, double AtMs, const FVector& Value, const FString& Type)
+		{
+			FEntry& E = Entries.FindOrAdd(Index);
+			E.Read = EScriptTriggerRead::Triggered;
+			E.Trigger.AtMs = AtMs;
+			E.Trigger.Value = Value;
+			E.Trigger.ValueType = Type;
+		}
+	};
+
+	FScriptStepDef TriggeredStep(int32 WithinMs = 0, int32 Client = 0)
+	{
+		FScriptExpect E = MakeExpect(EScriptExpectOp::Triggered, TEXT("/Game/Input/IA_Interact.IA_Interact"), false, 0.0, WithinMs);
+		E.Client = Client;
+		FScriptStepDef S = AutoStep(E);
+		S.Instruction = TEXT("Press Interact");
+		return S;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPIEScriptTriggeredParseTest,
+	"UE.MCP.PIE.Script.Triggered.Parse",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPIEScriptTriggeredParseTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MCPPIEScriptTests;
+
+	FScriptStepDef Def;
+	FString Err, Field;
+	TestTrue(TEXT("triggered step parses"), ParseScriptStepJson(ParseJsonValue(TEXT(
+		"{\"instruction\":\"Press Interact\",\"expect\":{\"op\":\"triggered\",\"value\":\"/Game/Input/IA_Interact\",\"client\":1,\"within_ms\":600000}}")), 0, Def, Err, &Field));
+	TestTrue(TEXT("op is triggered"), Def.Expect.Op == EScriptExpectOp::Triggered && IsScriptTriggerOp(Def.Expect.Op));
+	TestEqual(TEXT("a package path becomes the object path"), Def.Expect.Value, FString(TEXT("/Game/Input/IA_Interact.IA_Interact")));
+	TestEqual(TEXT("client read"), Def.Expect.Client, 1);
+	TestEqual(TEXT("a long window is kept"), Def.Expect.WithinMs, 600000);
+	TestEqual(TEXT("an object path is kept"), NormalizeScriptInputActionPath(TEXT("/Game/Input/IA_Jump.IA_Jump")), FString(TEXT("/Game/Input/IA_Jump.IA_Jump")));
+
+	const TSharedRef<FJsonObject> Back = ScriptStepDefToJson(Def);
+	const TSharedPtr<FJsonObject> BackExpect = Back->GetObjectField(TEXT("expect"));
+	TestEqual(TEXT("client written"), static_cast<int32>(BackExpect->GetNumberField(TEXT("client"))), 1);
+	FScriptStepDef Again;
+	TestTrue(TEXT("written step parses again"), ParseScriptStepJson(MakeShared<FJsonValueObject>(Back), 0, Again, Err));
+	TestTrue(TEXT("round trip keeps op and client"), Again.Expect.Op == EScriptExpectOp::Triggered && Again.Expect.Client == 1);
+
+	TestFalse(TEXT("client on another op refused"), ParseScriptStepJson(ParseJsonValue(TEXT(
+		"{\"instruction\":\"x\",\"expect\":{\"op\":\"gt\",\"value\":\"H\",\"target\":1,\"client\":1}}")), 0, Def, Err, &Field));
+	TestEqual(TEXT("names expect.client"), Field, FString(TEXT("expect.client")));
+	TestFalse(TEXT("negative client refused"), ParseScriptStepJson(ParseJsonValue(TEXT(
+		"{\"instruction\":\"x\",\"expect\":{\"op\":\"triggered\",\"value\":\"/Game/Input/IA_Interact\",\"client\":-1}}")), 0, Def, Err, &Field));
+	TestFalse(TEXT("a target on triggered refused"), ParseScriptStepJson(ParseJsonValue(TEXT(
+		"{\"instruction\":\"x\",\"expect\":{\"op\":\"triggered\",\"value\":\"/Game/Input/IA_Interact\",\"target\":true}}")), 0, Def, Err, &Field));
+	TestEqual(TEXT("names expect.target"), Field, FString(TEXT("expect.target")));
+	TestFalse(TEXT("triggered needs a value"), ParseScriptStepJson(ParseJsonValue(TEXT(
+		"{\"instruction\":\"x\",\"expect\":{\"op\":\"triggered\"}}")), 0, Def, Err, &Field));
+	TestTrue(TEXT("the error asks for an Input Action"), Err.Contains(TEXT("Input Action")));
+
+	// Without within_ms a triggered step has no timeout; every other op takes the run's default.
+	FScriptRun Run;
+	Run.DefaultWithinMs = 5000;
+	InitScriptRun(Run, { TriggeredStep(), AutoStep(MakeExpect(EScriptExpectOp::Gt, TEXT("H"), true, 1.0)) });
+	TestEqual(TEXT("triggered without within_ms waits with no timeout"), Run.Steps[0].WithinMs, 0);
+	TestEqual(TEXT("gt takes the default"), Run.Steps[1].WithinMs, 5000);
+
+	// The observer is not asked to track the action path as a value.
+	TArray<FString> Values, Actors, Widgets;
+	CollectScriptObservedNames({ TriggeredStep() }, {}, Values, Actors, Widgets);
+	TestEqual(TEXT("nothing observed for triggered"), Values.Num() + Actors.Num() + Widgets.Num(), 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPIEScriptTriggeredRunTest,
+	"UE.MCP.PIE.Script.Triggered.Run",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPIEScriptTriggeredRunTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MCPPIEScriptTests;
+	auto Reader = [](const FScriptExpect&, double&) { return false; };
+
+	// Passes on a trigger inside the window, with the trigger time and value as evidence. The window opens when act ends.
+	{
+		FScriptRun Run;
+		Run.RunId = TEXT("script_triggered");
+		InitScriptRun(Run, { WithAct(TriggeredStep(2000)), ManualStep(TEXT("Then?")) });
+		Run.State = EScriptRunState::Running;
+		FFakeStepDriver Driver;
+		Driver.TicksToRun = 1;
+		FFakeTriggerSource Triggers;
+		AdvanceScriptRun(Run, 0.0, 0, Reader, &Driver, &Triggers);
+		TestEqual(TEXT("not watched while act runs"), Triggers.Asked.FindRef(0), 0);
+		AdvanceScriptRun(Run, 100.0, 1, Reader, &Driver, &Triggers);
+		TestTrue(TEXT("act done"), Run.Steps[0].Act.State == EScriptActState::Done);
+		TestEqual(TEXT("watched from the end of act"), Triggers.FromMs.FindRef(0), 100.0);
+		TestTrue(TEXT("waits for the person"), Run.Steps[0].Status == EScriptStepStatus::Running);
+		TestTrue(TEXT("the run holds on the step"), Run.Steps[1].Status == EScriptStepStatus::Pending);
+
+		// A trigger stamped before the window (the act's own input) does not count.
+		Triggers.Fire(0, 90.0, FVector(1, 0, 0), TEXT("bool"));
+		AdvanceScriptRun(Run, 200.0, 2, Reader, &Driver, &Triggers);
+		TestTrue(TEXT("a trigger before the window is ignored"), Run.Steps[0].Status == EScriptStepStatus::Running);
+
+		Triggers.Fire(0, 1450.0, FVector(1, 0, 0), TEXT("bool"));
+		AdvanceScriptRun(Run, 1466.0, 3, Reader, &Driver, &Triggers);
+		TestTrue(TEXT("passes on the trigger"), Run.Steps[0].Status == EScriptStepStatus::Passed);
+		TestTrue(TEXT("evidence: triggered"), Run.Steps[0].Evidence.bTriggered);
+		TestEqual(TEXT("evidence: trigger time in run ms"), Run.Steps[0].Evidence.TriggeredAtMs, 1450.0);
+		TestTrue(TEXT("evidence: watched"), Run.Steps[0].Evidence.bObserved);
+		TestEqual(TEXT("the watch ended"), Triggers.Ended.Num(), 1);
+		TestTrue(TEXT("the run moves on"), Run.Steps[1].Status == EScriptStepStatus::AwaitingVerdict);
+
+		const TSharedRef<FJsonObject> StepJson = ScriptStepRunToJson(Run.Steps[0], 0);
+		const TSharedPtr<FJsonObject> Evidence = StepJson->GetObjectField(TEXT("evidence"));
+		TestEqual(TEXT("json: triggered_at_ms"), Evidence->GetNumberField(TEXT("triggered_at_ms")), 1450.0);
+		TestTrue(TEXT("json: a bool action value is a boolean"), Evidence->GetBoolField(TEXT("action_value")));
+		TestEqual(TEXT("json: value_type"), Evidence->GetStringField(TEXT("value_type")), FString(TEXT("bool")));
+
+		FScriptRun Back;
+		FString Err;
+		TestTrue(TEXT("results.json reads back"), ScriptRunFromResultsJson(ScriptRunToResultsJson(Run), Back, Err));
+		TestTrue(TEXT("trigger read back"), Back.Steps[0].Evidence.bTriggered && Back.Steps[0].Evidence.TriggeredAtMs == 1450.0);
+		TestTrue(TEXT("op read back"), Back.Steps[0].Def.Expect.Op == EScriptExpectOp::Triggered);
+	}
+
+	// Fails at its timeout when nothing triggers; a 2D value reads back as [x, y].
+	{
+		FScriptRun Run;
+		InitScriptRun(Run, { TriggeredStep(500), TriggeredStep(0) });
+		Run.State = EScriptRunState::Running;
+		FFakeTriggerSource Triggers;
+		AdvanceScriptRun(Run, 0.0, 0, Reader, nullptr, &Triggers);
+		AdvanceScriptRun(Run, 499.0, 1, Reader, nullptr, &Triggers);
+		TestTrue(TEXT("still waiting just before the timeout"), Run.Steps[0].Status == EScriptStepStatus::Running);
+		AdvanceScriptRun(Run, 500.0, 2, Reader, nullptr, &Triggers);
+		TestTrue(TEXT("fails at the timeout"), Run.Steps[0].Status == EScriptStepStatus::Failed);
+		TestTrue(TEXT("the reason says it was not triggered"), Run.Steps[0].Evidence.Reason.Contains(TEXT("was not triggered")));
+		TestFalse(TEXT("no trigger recorded"), Run.Steps[0].Evidence.bTriggered);
+
+		// within_ms 0: no timeout, however long the person takes.
+		AdvanceScriptRun(Run, 3600000.0, 3, Reader, nullptr, &Triggers);
+		TestTrue(TEXT("an hour later it still waits"), Run.Steps[1].Status == EScriptStepStatus::Running);
+		Triggers.Fire(1, 3600010.0, FVector(0.5, -1, 0), TEXT("axis2d"));
+		AdvanceScriptRun(Run, 3600016.0, 4, Reader, nullptr, &Triggers);
+		TestTrue(TEXT("passes when it finally fires"), Run.Steps[1].Status == EScriptStepStatus::Passed);
+		const TSharedPtr<FJsonObject> Evidence = ScriptStepRunToJson(Run.Steps[1], 1)->GetObjectField(TEXT("evidence"));
+		const TArray<TSharedPtr<FJsonValue>> Value = Evidence->GetArrayField(TEXT("action_value"));
+		TestTrue(TEXT("a 2D value is [x, y]"), Value.Num() == 2 && Value[0]->AsNumber() == 0.5 && Value[1]->AsNumber() == -1.0);
+	}
+
+	// No timeout and never triggered: script_stop fails it, saying so.
+	{
+		FScriptRun Run;
+		InitScriptRun(Run, { TriggeredStep() });
+		Run.State = EScriptRunState::Running;
+		FFakeTriggerSource Triggers;
+		AdvanceScriptRun(Run, 0.0, 0, Reader, nullptr, &Triggers);
+		SettleUnfinishedScriptSteps(Run, TEXT("stopped"));
+		TestTrue(TEXT("stop fails the waiting step"), Run.Steps[0].Status == EScriptStepStatus::Failed);
+		TestTrue(TEXT("with the reason"), Run.Steps[0].Evidence.Reason.Contains(TEXT("was not triggered")));
+	}
+
+	// A player that cannot be watched fails at the timeout with why.
+	{
+		FScriptRun Run;
+		InitScriptRun(Run, { TriggeredStep(100, 2) });
+		Run.State = EScriptRunState::Running;
+		FFakeTriggerSource Triggers;
+		FFakeTriggerSource::FEntry& E = Triggers.Entries.Add(0);
+		E.Read = EScriptTriggerRead::Unwatched;
+		E.Why = TEXT("no remote player 2");
+		AdvanceScriptRun(Run, 0.0, 0, Reader, nullptr, &Triggers);
+		AdvanceScriptRun(Run, 100.0, 1, Reader, nullptr, &Triggers);
+		TestTrue(TEXT("unwatchable fails at the timeout"), Run.Steps[0].Status == EScriptStepStatus::Failed);
+		TestFalse(TEXT("not observed"), Run.Steps[0].Evidence.bObserved);
+		TestTrue(TEXT("the reason carries why"), Run.Steps[0].Evidence.Reason.Contains(TEXT("no remote player 2")));
+
+		// Without any trigger source the step is never watched.
+		FScriptRun Bare;
+		InitScriptRun(Bare, { TriggeredStep(100) });
+		Bare.State = EScriptRunState::Running;
+		AdvanceScriptRun(Bare, 0.0, 0, Reader);
+		AdvanceScriptRun(Bare, 100.0, 1, Reader);
+		TestTrue(TEXT("no source fails at the timeout"), Bare.Steps[0].Status == EScriptStepStatus::Failed);
+		TestTrue(TEXT("saying nothing watches input"), Bare.Steps[0].Evidence.Reason.Contains(TEXT("nothing watches input")));
+	}
+
+	// A trigger later than within_ms after the window opened does not pass the step.
+	{
+		FScriptRun Run;
+		InitScriptRun(Run, { TriggeredStep(300) });
+		Run.State = EScriptRunState::Running;
+		FFakeTriggerSource Triggers;
+		AdvanceScriptRun(Run, 0.0, 0, Reader, nullptr, &Triggers);
+		Triggers.Fire(0, 350.0, FVector(1, 0, 0), TEXT("bool"));
+		AdvanceScriptRun(Run, 360.0, 1, Reader, nullptr, &Triggers);
+		TestTrue(TEXT("a late trigger fails"), Run.Steps[0].Status == EScriptStepStatus::Failed);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPIEScriptTriggerGateTest,
+	"UE.MCP.PIE.Script.Triggered.Gate",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPIEScriptTriggerGateTest::RunTest(const FString& /*Parameters*/)
+{
+	// Input still down when the watch begins (act's last frame, a held key) needs a release before it counts.
+	MCPPIE::FActionTriggerGate Held;
+	TestFalse(TEXT("held at the start does not fire"), Held.Feed(true));
+	TestFalse(TEXT("still held"), Held.Feed(true));
+	TestFalse(TEXT("released"), Held.Feed(false));
+	TestTrue(TEXT("a fresh press fires"), Held.Feed(true));
+	TestFalse(TEXT("fires once"), Held.Feed(true));
+	TestFalse(TEXT("and stays fired"), Held.Feed(false) || Held.Feed(true));
+
+	MCPPIE::FActionTriggerGate Idle;
+	TestFalse(TEXT("idle"), Idle.Feed(false));
+	TestTrue(TEXT("one frame tap fires"), Idle.Feed(true));
 	return true;
 }
 

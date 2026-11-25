@@ -1,3 +1,4 @@
+// @session independent: Generated parameter declarations from the recorded C++ specs; data only, with no editor state.
 // GENERATED FILE - do not edit.
 //
 // Written by scripts/generate-handler-specs.mjs from tests/golden/handler-specs.json,
@@ -16,7 +17,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "rendererType",
@@ -45,7 +49,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "emitterPath",
@@ -62,7 +69,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "eventName",
@@ -97,7 +107,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "moduleScript",
@@ -138,7 +151,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "stageName",
@@ -179,7 +195,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       },
       {
         "name": "componentName",
@@ -228,7 +244,8 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "pieInstance",
         "type": "integer",
         "required": false,
-        "description": "Which PIE world when world is pie: 0 = server or primary, 1..N = clients"
+        "description": "Which PIE world when world is pie: 0 = server or primary, 1..N = clients",
+        "minimum": 0
       }
     ],
     "choices": [
@@ -252,7 +269,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "force",
@@ -287,7 +307,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "onConflict",
         "type": "string",
         "required": false,
-        "description": "When the asset exists: skip (default, report it) | error"
+        "description": "When the asset already exists: skip (default) returns it untouched | error refuses; it never overwrites"
       },
       {
         "name": "templatePath",
@@ -328,7 +348,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "onConflict",
         "type": "string",
         "required": false,
-        "description": "When the asset exists: skip (default, report it) | error"
+        "description": "When the asset already exists: skip (default) returns it untouched | error refuses; it never overwrites"
       },
       {
         "name": "inputs",
@@ -394,7 +414,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "onConflict",
         "type": "string",
         "required": false,
-        "description": "When the asset exists: skip (default, report it) | error"
+        "description": "When the asset already exists: skip (default) returns it untouched | error refuses; it never overwrites"
       }
     ],
     "contractExempt": "Creates and saves a system under the contract values; nothing it reads fails first"
@@ -418,7 +438,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "onConflict",
         "type": "string",
         "required": false,
-        "description": "When the asset exists: skip (default, report it) | error"
+        "description": "When the asset already exists: skip (default) returns it untouched | error refuses; it never overwrites"
       },
       {
         "name": "emitters",
@@ -457,7 +477,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "onConflict",
         "type": "string",
         "required": false,
-        "description": "When the asset exists: skip (default, report it) | error"
+        "description": "When the asset already exists: skip (default) returns it untouched | error refuses; it never overwrites"
       },
       {
         "name": "inputs",
@@ -510,8 +530,39 @@ export const handlerSpecs: HandlerSpecs = {
       {
         "name": "assetPath",
         "type": "string",
-        "required": true,
-        "description": "NiagaraEmitter asset path"
+        "required": false,
+        "description": "NiagaraEmitter asset path, or a NiagaraSystem asset path to read one of its emitters"
+      },
+      {
+        "name": "systemPath",
+        "type": "string",
+        "required": false,
+        "description": "NiagaraSystem whose emitter to read, picked by emitterName or emitterIndex"
+      },
+      {
+        "name": "emitterName",
+        "type": "string",
+        "required": false,
+        "description": "Emitter handle name. Omit to address the emitter by emitterIndex"
+      },
+      {
+        "name": "emitterIndex",
+        "type": "number",
+        "required": false,
+        "description": "Emitter handle index, used when emitterName is omitted"
+      }
+    ],
+    "choices": [
+      {
+        "mode": "exactlyOne",
+        "branches": [
+          [
+            "assetPath"
+          ],
+          [
+            "systemPath"
+          ]
+        ]
       }
     ]
   },
@@ -522,7 +573,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "emitterName",
@@ -601,7 +655,8 @@ export const handlerSpecs: HandlerSpecs = {
         "required": true,
         "description": "NiagaraSystem asset path",
         "aliases": [
-          "path"
+          "path",
+          "systemPath"
         ]
       }
     ]
@@ -613,7 +668,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       }
     ]
   },
@@ -624,7 +682,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "emitterName",
@@ -647,7 +708,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       }
     ]
   },
@@ -658,7 +722,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "emitterName",
@@ -693,7 +760,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "emitterName",
@@ -751,7 +821,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "moduleName",
@@ -786,7 +859,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       }
     ]
   },
@@ -820,7 +896,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       }
     ],
     "choices": [
@@ -886,7 +962,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "emitterName",
@@ -909,7 +988,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "rendererIndex",
@@ -938,7 +1020,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "stackContext",
@@ -979,7 +1064,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "eventName",
@@ -1008,7 +1096,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "stackContext",
@@ -1043,7 +1134,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "stageName",
@@ -1164,7 +1258,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "stackContext",
@@ -1211,7 +1308,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "stackContext",
@@ -1252,7 +1352,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "moduleName",
@@ -1305,7 +1408,7 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       },
       {
         "name": "parameterName",
@@ -1378,7 +1481,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "moduleName",
@@ -1425,7 +1531,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "rendererIndex",
@@ -1466,7 +1575,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "location",
@@ -1501,7 +1613,10 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       },
       {
         "name": "location",
@@ -1554,67 +1669,22 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "systemPath",
         "type": "string",
         "required": true,
-        "description": "NiagaraSystem asset path"
+        "description": "NiagaraSystem asset path",
+        "aliases": [
+          "assetPath"
+        ]
       }
     ]
   }
-};
-
-/** The Params: clause of each spec'd bridge method. */
-export const paramsClauses: Readonly<Record<string, string>> = {
-  add_emitter_renderer: "Params: systemPath, rendererType, emitterName?, emitterIndex?",
-  add_emitter_to_system: "Params: systemPath, emitterPath",
-  add_niagara_event_handler: "Params: systemPath, eventName, emitterName?, emitterIndex?, sourceEmitterId?",
-  add_niagara_module: "Params: systemPath, moduleScript, stackContext, emitterName?, emitterIndex?, targetIndex?",
-  add_niagara_simulation_stage: "Params: systemPath, stageName, emitterName?, emitterIndex?, enabled?",
-  capture_niagara_sim_cache: "Params: actorLabel OR actorPath, componentName?, frames?, advanceSimulation?, tickDelta?, attributeCaptureMode?, explicitAttributes?, world?, pieInstance?",
-  compile_niagara_system: "Params: systemPath, force?, includeGpuShaders?",
-  create_niagara_emitter: "Params: name, packagePath?, onConflict?, templatePath?, inherit?",
-  create_niagara_module_from_hlsl: "Params: name, hlsl, packagePath?, onConflict?, inputs?, outputs?",
-  create_niagara_system: "Params: name, packagePath?, onConflict?",
-  create_niagara_system_from_spec: "Params: name, packagePath?, onConflict?, emitters?",
-  create_scratch_module: "Params: name, packagePath?, onConflict?, inputs?, outputs?",
-  get_emitter_info: "Params: assetPath",
-  get_niagara_compiled_hlsl: "Params: systemPath, emitterName?, emitterIndex?",
-  get_niagara_custom_hlsl: "Params: scriptPath OR systemPath, stackContext?, emitterName?, emitterIndex?, nodeIndex?",
-  get_niagara_info: "Params: assetPath (or path)",
-  inspect_data_interface: "Params: systemPath",
-  list_emitter_renderers: "Params: systemPath, emitterName?, emitterIndex?",
-  list_emitters_in_system: "Params: systemPath",
-  list_niagara_dynamic_inputs: "Params: systemPath, emitterName?, emitterIndex?, stackContext?, moduleName?",
-  list_niagara_module_inputs: "Params: systemPath, emitterName?, emitterIndex?, stackContext?, moduleName?",
-  list_niagara_modules: "Params: pathFilter?, cursor?, limit?",
-  list_niagara_static_switches: "Params: systemPath, moduleName?, emitterName?, emitterIndex?, stackContext?",
-  list_niagara_system_parameters: "Params: systemPath",
-  list_niagara_systems: "Params: cursor?, limit?",
-  reactivate_niagara: "Params: actorLabel OR actorPath",
-  read_niagara_sim_cache: "Params: simCachePath, emitterName?, attributes?, frameIndex?, limit?, summarize?",
-  remove_emitter_from_system: "Params: systemPath, emitterName?, emitterIndex?",
-  remove_emitter_renderer: "Params: systemPath, rendererIndex, emitterName?, emitterIndex?",
-  remove_niagara_dynamic_input: "Params: systemPath, stackContext, moduleName, inputName, emitterName?, emitterIndex?",
-  remove_niagara_event_handler: "Params: systemPath, eventName, emitterName?, emitterIndex?",
-  remove_niagara_module: "Params: systemPath, stackContext, moduleName, emitterName?, emitterIndex?",
-  remove_niagara_simulation_stage: "Params: systemPath, stageName, emitterName?, emitterIndex?",
-  set_emitter_property: "Params: systemPath (or assetPath), emitterName?, propertyName, value",
-  set_niagara_custom_hlsl: "Params: hlsl, scriptPath OR systemPath, stackContext?, emitterName?, emitterIndex?, nodeIndex?",
-  set_niagara_dynamic_input: "Params: systemPath, stackContext, moduleName, inputName, dynamicInputScript, emitterName?, emitterIndex?",
-  set_niagara_module_enabled: "Params: systemPath, stackContext, moduleName, enabled, emitterName?, emitterIndex?",
-  set_niagara_module_input: "Params: systemPath, moduleName, inputName, value, emitterName?, emitterIndex?, stackContext?",
-  set_niagara_parameter: "Params: actorLabel OR actorPath, parameterName, parameterType?, value OR valueX + valueY + valueZ",
-  set_niagara_static_switch: "Params: systemPath, moduleName, switchName, value, emitterName?, emitterIndex?, stackContext?",
-  set_renderer_property: "Params: systemPath, rendererIndex?, propertyName, value, emitterName?, emitterIndex?",
-  spawn_niagara_actor: "Params: systemPath, location?, rotation?, label?, activate?",
-  spawn_niagara_at_location: "Params: systemPath, location?, rotation?, label?, scaleX?, scaleY?, scaleZ?, autoDestroy?",
-  validate_niagara_system: "Params: systemPath",
 };
 
 /** Every key the spec'd niagara handlers declare, aliases included. */
 export const schema: Record<string, z.ZodType> = {
   activate: z.boolean().optional().describe("Activate the system on spawn (default true) (#537)"),
   actorLabel: z.string().optional().describe("Editor label of the actor holding the NiagaraComponent; a label naming several actors is refused"),
-  actorPath: z.string().optional().describe("Full actor object path; the unambiguous selector"),
+  actorPath: z.string().optional().describe("Full actor object path, the unambiguous selector; wins over actorLabel"),
   advanceSimulation: z.boolean().optional().describe("Advance one tick before the first frame too (default false)"),
-  assetPath: z.string().optional().describe("NiagaraEmitter asset path (get_emitter_info). NiagaraSystem asset path (get_niagara_info). Alias for systemPath (set_emitter_property)"),
+  assetPath: z.string().optional().describe("Alias for systemPath (add_emitter_renderer, add_emitter_to_system, add_niagara_event_handler, add_niagara_module, add_niagara_simulation_stage, compile_niagara_system, get_niagara_compiled_hlsl, inspect_data_interface, list_emitter_renderers, list_emitters_in_system, list_niagara_dynamic_inputs, list_niagara_module_inputs, list_niagara_static_switches, list_niagara_system_parameters, remove_emitter_from_system, remove_emitter_renderer, remove_niagara_dynamic_input, remove_niagara_event_handler, remove_niagara_module, remove_niagara_simulation_stage, set_emitter_property, set_niagara_dynamic_input, set_niagara_module_enabled, set_niagara_module_input, set_niagara_static_switch, set_renderer_property, spawn_niagara_actor, spawn_niagara_at_location, validate_niagara_system). NiagaraEmitter asset path, or a NiagaraSystem asset path to read one of its emitters (get_emitter_info). NiagaraSystem asset path (get_niagara_info)"),
   attributeCaptureMode: z.string().optional().describe("All (default) | RenderingOnly | ExplicitAttributes"),
   attributes: z.array(z.string()).optional().describe("Attribute names to read. Bare (Position) or qualified (Particles.Position). Omit to list the layout only"),
   autoDestroy: z.boolean().optional().describe("Destroy the spawned host actor once the system finishes (default false)"),
@@ -1622,7 +1692,7 @@ export const schema: Record<string, z.ZodType> = {
   cursor: z.string().optional().describe("Resume a paged read: pass back the 'nextCursor' from the previous page, unmodified"),
   dynamicInputScript: z.string().optional().describe("The dynamic-input NiagaraScript to wire in"),
   emitterIndex: z.number().optional().describe("Emitter handle index, used when emitterName is omitted"),
-  emitterName: z.string().optional().describe("Emitter handle name. Omit to address the emitter by emitterIndex (add_emitter_renderer, add_niagara_event_handler, add_niagara_module, add_niagara_simulation_stage, get_niagara_compiled_hlsl, get_niagara_custom_hlsl, list_emitter_renderers, list_niagara_dynamic_inputs, list_niagara_module_inputs, list_niagara_static_switches, remove_emitter_from_system, remove_emitter_renderer, remove_niagara_dynamic_input, remove_niagara_event_handler, remove_niagara_module, remove_niagara_simulation_stage, set_niagara_custom_hlsl, set_niagara_dynamic_input, set_niagara_module_enabled, set_niagara_module_input, set_niagara_static_switch, set_renderer_property). Emitter to read (default: the only emitter; required when there are several) (read_niagara_sim_cache). Emitter handle name (default: the first emitter) (set_emitter_property)"),
+  emitterName: z.string().optional().describe("Emitter handle name. Omit to address the emitter by emitterIndex (add_emitter_renderer, add_niagara_event_handler, add_niagara_module, add_niagara_simulation_stage, get_emitter_info, get_niagara_compiled_hlsl, get_niagara_custom_hlsl, list_emitter_renderers, list_niagara_dynamic_inputs, list_niagara_module_inputs, list_niagara_static_switches, remove_emitter_from_system, remove_emitter_renderer, remove_niagara_dynamic_input, remove_niagara_event_handler, remove_niagara_module, remove_niagara_simulation_stage, set_niagara_custom_hlsl, set_niagara_dynamic_input, set_niagara_module_enabled, set_niagara_module_input, set_niagara_static_switch, set_renderer_property). Emitter to read (default: the only emitter; required when there are several) (read_niagara_sim_cache). Emitter handle name (default: the first emitter) (set_emitter_property)"),
   emitterPath: z.string().optional().describe("NiagaraEmitter asset to add"),
   emitters: z.array(z.object({ path: z.string().describe("NiagaraEmitter asset path, e.g. /Game/VFX/E_Fire") })).optional().describe("Emitters to add; one that does not load is skipped"),
   enabled: z.boolean().optional().describe("Create the stage enabled (default true) (add_niagara_simulation_stage). The state to set (set_niagara_module_enabled)"),
@@ -1643,14 +1713,14 @@ export const schema: Record<string, z.ZodType> = {
   moduleScript: z.string().optional().describe("Stock module script path, e.g. /Niagara/Modules/Emitter/SpawnRate"),
   name: z.string().optional().describe("Emitter asset name (create_niagara_emitter). Module script asset name (create_niagara_module_from_hlsl, create_scratch_module). System asset name (create_niagara_system, create_niagara_system_from_spec)"),
   nodeIndex: z.number().int().optional().describe("Only this CustomHLSL node (default: every one in the graph) (get_niagara_custom_hlsl). Which CustomHLSL node when the graph has several (default 0) (set_niagara_custom_hlsl)"),
-  onConflict: z.string().optional().describe("When the asset exists: skip (default, report it) | error"),
+  onConflict: z.string().optional().describe("When the asset already exists: skip (default) returns it untouched | error refuses; it never overwrites"),
   outputs: z.array(z.object({ name: z.string().describe("Pin name"), type: z.string().optional().describe("HLSL type (default float)") })).optional().describe("Requested outputs, counted back as requestedOutputs; the pins come from the HLSL body (create_niagara_module_from_hlsl). Outputs declared on a pass-through CustomHLSL node (create_scratch_module)"),
   packagePath: z.string().optional().describe("Folder for the new emitter (default /Game/VFX) (create_niagara_emitter). Folder for the new module (default /Game/VFX/Modules) (create_niagara_module_from_hlsl). Folder for the new system (default /Game/VFX) (create_niagara_system, create_niagara_system_from_spec). Folder for the new module (default /Game/VFX) (create_scratch_module)"),
   parameterName: z.string().optional().describe("User parameter name"),
   parameterType: z.string().optional().describe("float (default) | vector | bool | int"),
   path: z.string().optional().describe("Alias for assetPath"),
   pathFilter: z.string().optional().describe("Case-sensitive substring of the module script object path, applied to the whole set before paging"),
-  pieInstance: z.number().int().optional().describe("Which PIE world when world is pie: 0 = server or primary, 1..N = clients"),
+  pieInstance: z.number().int().min(0).optional().describe("Which PIE world when world is pie: 0 = server or primary, 1..N = clients"),
   propertyName: z.string().optional().describe("Emitter property to set (set_emitter_property). Renderer property to set (set_renderer_property)"),
   rendererIndex: z.number().int().optional().describe("Index of the renderer on the emitter (remove_emitter_renderer). Index of the renderer on the emitter (default 0) (set_renderer_property)"),
   rendererType: z.string().optional().describe("sprite|mesh|ribbon or full class name"),
@@ -1665,7 +1735,7 @@ export const schema: Record<string, z.ZodType> = {
   stageName: z.string().optional().describe("Simulation stage name"),
   summarize: z.boolean().optional().describe("Include per-component min/max/avg (default true)"),
   switchName: z.string().optional().describe("Static switch input name"),
-  systemPath: z.string().optional().describe("NiagaraSystem asset path (add_emitter_renderer, add_emitter_to_system, add_niagara_event_handler, add_niagara_module, add_niagara_simulation_stage, compile_niagara_system, get_niagara_compiled_hlsl, inspect_data_interface, list_emitter_renderers, list_emitters_in_system, list_niagara_dynamic_inputs, list_niagara_module_inputs, list_niagara_static_switches, list_niagara_system_parameters, remove_emitter_from_system, remove_emitter_renderer, remove_niagara_dynamic_input, remove_niagara_event_handler, remove_niagara_module, remove_niagara_simulation_stage, set_emitter_property, set_niagara_dynamic_input, set_niagara_module_enabled, set_niagara_module_input, set_niagara_static_switch, set_renderer_property, spawn_niagara_actor, spawn_niagara_at_location, validate_niagara_system). NiagaraSystem whose emitter stack holds the CustomHLSL node (get_niagara_custom_hlsl, set_niagara_custom_hlsl)"),
+  systemPath: z.string().optional().describe("NiagaraSystem asset path (add_emitter_renderer, add_emitter_to_system, add_niagara_event_handler, add_niagara_module, add_niagara_simulation_stage, compile_niagara_system, get_niagara_compiled_hlsl, inspect_data_interface, list_emitter_renderers, list_emitters_in_system, list_niagara_dynamic_inputs, list_niagara_module_inputs, list_niagara_static_switches, list_niagara_system_parameters, remove_emitter_from_system, remove_emitter_renderer, remove_niagara_dynamic_input, remove_niagara_event_handler, remove_niagara_module, remove_niagara_simulation_stage, set_emitter_property, set_niagara_dynamic_input, set_niagara_module_enabled, set_niagara_module_input, set_niagara_static_switch, set_renderer_property, spawn_niagara_actor, spawn_niagara_at_location, validate_niagara_system). NiagaraSystem whose emitter to read, picked by emitterName or emitterIndex (get_emitter_info). NiagaraSystem whose emitter stack holds the CustomHLSL node (get_niagara_custom_hlsl, set_niagara_custom_hlsl). Alias for assetPath (get_niagara_info)"),
   targetIndex: z.number().int().optional().describe("Stack insert position; -1 (default) appends"),
   templatePath: z.string().optional().describe("Emitter asset to copy as the starting point (default: the empty emitter with the standard modules and a sprite renderer)"),
   tickDelta: z.number().optional().describe("Seconds per advanced tick (default 1/60)"),
@@ -1677,4 +1747,4 @@ export const schema: Record<string, z.ZodType> = {
 };
 
 /** Declare an action for a spec'd bridge method: effect, summary, method. */
-export const specBp = makeSpecBp(paramsClauses, handlerSpecs);
+export const specBp = makeSpecBp(handlerSpecs);

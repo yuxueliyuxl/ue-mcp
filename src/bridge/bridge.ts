@@ -1,26 +1,40 @@
+// @session per-session: One socket, port and lockfile per editor.
 import WebSocket from "ws";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { McpError, ErrorCode } from "../core/errors.js";
 import { resolveBridgeTimeout, TIMEOUT_ENV_VAR } from "./bridge-timeouts.js";
 import { debug, warn } from "../core/log.js";
-import { DEFAULT_BRIDGE_PORT, deriveProjectPort } from "./port.js";
-import { bridgeStateDir, isPidAlive, resolveLiveBridgeAddress } from "./editor-target.js";
+import {
+  BRIDGE_ERROR_CODES,
+  BRIDGE_STATE,
+  bridgeErrorPath,
+  DEFAULT_BRIDGE_PORT,
+  deriveProjectPort,
+  JSON_RPC_ERRORS,
+  PROTOCOL_VERSION,
+  RECORD_FIELDS,
+  recordState,
+} from "./wire-contract.js";
+import { isPidAlive, resolveBridgeTarget } from "./editor-target.js";
 import { syncRequestedPort } from "./requested-port.js";
+import { canvasPortReplacement } from "../integrations/epic/unreal-canvas.js";
 import { packageVersion } from "../core/package-root.js";
-import { readEnv } from "../core/env.js";
+import { resolveSetting } from "../core/env.js";
+import { bridgeAuthHeaders, watchUpgradeRefusal } from "./bridge-token.js";
+import type { ProgressUpdate } from "../core/progress.js";
 
 /**
- * The wire protocol this client speaks. Must match
- * UEMCP_BRIDGE_PROTOCOL_VERSION in the plugin's MCPHandlerRegistration.h.
+ * The wire protocol this client speaks, from the generated wire contract.
  *
  * The plugin is compiled by the user, and `attach` is deliberately
  * non-destructive, so an npm upgrade routinely leaves a new client talking to
- * an arbitrarily old binary. Comparing these two numbers is how that gets
- * named instead of surfacing as an unexplained "Unknown method".
+ * an arbitrarily old binary. Comparing this with the plugin's answer is how
+ * that gets named instead of surfacing as an unexplained "Unknown method".
  */
-export const CLIENT_PROTOCOL_VERSION = 2;
+export const CLIENT_PROTOCOL_VERSION = PROTOCOL_VERSION;
 
 /** Answer to get_bridge_capabilities, or what we infer when there is none. */
 export interface BridgeCapabilities {
@@ -90,8 +104,7 @@ export function describeProtocolMismatch(
   if (theirs < ours) {
     return (
       `The Unreal bridge plugin speaks protocol version ${theirs}, this ue-mcp client (v${packageVersion()}) speaks version ${ours}.` +
-      `${missing}${built}` +
-      ` Rebuild the plugin against the current package: run 'ue-mcp update --build' in the project (or 'ue-mcp deploy' then 'ue-mcp build'), then restart the editor.`
+      `${missing}${built} ${PLUGIN_UPGRADE_POINTER}`
     );
   }
   return (
@@ -104,6 +117,8 @@ export function describeProtocolMismatch(
 
 /** What the bridge leaves behind when the editor started but the bridge did not. */
 export interface BridgeErrorRecord {
+  state?: string;
+  /** What a bridge built before `state` writes instead. */
   status?: string;
   pid?: number;
   failedAt?: string;
@@ -129,12 +144,11 @@ function readJsonFile<T>(file: string): T | null {
  */
 export function readBridgeErrorRecord(uprojectPath: string | null): BridgeErrorRecord | null {
   if (!uprojectPath) return null;
-  const parsed = readJsonFile<BridgeErrorRecord>(
-    path.join(bridgeStateDir(path.dirname(uprojectPath)), "bridge-error.json"),
-  );
-  if (!parsed || parsed.status !== "bind-failed") return null;
+  const parsed = readJsonFile<BridgeErrorRecord & Record<string, unknown>>(bridgeErrorPath(path.dirname(uprojectPath)));
+  if (!parsed || recordState(parsed) !== BRIDGE_STATE.bindFailed) return null;
   // A record from an editor that has since exited describes nothing current.
-  if (typeof parsed.pid === "number" && parsed.pid > 0 && !isPidAlive(parsed.pid)) return null;
+  const pid = parsed[RECORD_FIELDS.bridgeError.pid];
+  if (typeof pid === "number" && pid > 0 && !isPidAlive(pid)) return null;
   return parsed;
 }
 
@@ -149,10 +163,49 @@ export interface BridgeResponse {
  * `timeoutMs` is the caller's explicit budget; the plugin waits at least that
  * long on the game thread instead of its 30s default (#1339).
  */
-export function encodeRequest(id: string, method: string, params?: Record<string, unknown>, timeoutMs?: number): string {
-  return JSON.stringify(timeoutMs === undefined
-    ? { id, method, params: params ?? {} }
-    : { id, method, params: params ?? {}, timeoutMs });
+export function encodeRequest(
+  id: string,
+  method: string,
+  params?: Record<string, unknown>,
+  timeoutMs?: number,
+  extras?: { cancelToken?: string; progress?: boolean },
+): string {
+  const frame: Record<string, unknown> = { id, method, params: params ?? {} };
+  if (timeoutMs !== undefined) frame.timeoutMs = timeoutMs;
+  if (extras?.cancelToken) frame.cancelToken = extras.cancelToken;
+  if (extras?.progress) frame.progress = true;
+  return JSON.stringify(frame);
+}
+
+/**
+ * What a caller can hand one bridge call besides its parameters. A plugin that
+ * defers its answer sends notifications/progress frames while it is awaited and
+ * honours cancel_request; one that answers at once sends nothing, and a cancel
+ * then only stops this side waiting.
+ */
+export interface BridgeCallOptions {
+  onProgress?: (update: ProgressUpdate) => void;
+  signal?: AbortSignal;
+}
+
+/** A notifications/progress frame the plugin sends for a request it is still answering. */
+interface BridgeProgressFrame {
+  method: "notifications/progress";
+  params: { id?: string; progress?: number; total?: number; message?: string };
+}
+
+function isProgressFrame(msg: unknown): msg is BridgeProgressFrame {
+  return !!msg && typeof msg === "object" && (msg as { method?: unknown }).method === "notifications/progress";
+}
+
+/** The error a cancelled call rejects with. The editor may still have run it. */
+function cancelledError(method: string, operationId?: string): McpError {
+  return new McpError(
+    ErrorCode.CANCELLED,
+    `Bridge call '${method}' was cancelled by the client. A handler that had already answered or that cannot be `
+    + "interrupted may have applied its changes; read the state back before running it again.",
+    { outcome: "unknown", method, ...(operationId ? { operationId } : {}) },
+  );
 }
 
 /**
@@ -192,7 +245,14 @@ export function callBridgeOnce(
 ): Promise<BridgeReply> {
   return new Promise<BridgeReply>((resolve) => {
     let settled = false;
-    const ws = new WebSocket(`ws://${host}:${port}`);
+    let headers: Record<string, string>;
+    try {
+      headers = bridgeAuthHeaders(port);
+    } catch {
+      resolve({ answered: false, methodError: false, refused: false, result: null });
+      return;
+    }
+    const ws = new WebSocket(`ws://${host}:${port}`, { headers });
     const finish = (reply: BridgeReply) => {
       if (settled) return;
       settled = true;
@@ -226,6 +286,7 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   /** Kept so an "unknown method" answer can name the method it was about. */
   method: string;
+  onProgress?: (update: ProgressUpdate) => void;
 }
 
 /**
@@ -302,7 +363,26 @@ export function epicToolsetNames(answer: unknown): readonly string[] | null {
       .filter((n): n is string => typeof n === "string" && n !== "")
       .sort();
   }
+  if (body.success === false && body.errorCode === BRIDGE_ERROR_CODES.toolsetRegistryUnavailable) return [];
+  // A bridge built before the errorCode says so only in its text.
   if (body.success === false && typeof body.error === "string" && /ToolsetRegistry not available/i.test(body.error)) return [];
+  return null;
+}
+
+/**
+ * The tool names in an epic_list_mcp_tools answer: the list when it has one,
+ * empty when Epic's MCP plugin is absent, null when the answer says neither.
+ */
+export function epicMcpToolNames(answer: unknown): readonly string[] | null {
+  if (!answer || typeof answer !== "object" || Array.isArray(answer)) return null;
+  const body = answer as Record<string, unknown>;
+  if (Array.isArray(body.tools)) {
+    if (body.available === false) return [];
+    return body.tools
+      .map((t) => (t && typeof t === "object" ? (t as Record<string, unknown>).name : undefined))
+      .filter((n): n is string => typeof n === "string" && n !== "")
+      .sort();
+  }
   return null;
 }
 
@@ -322,7 +402,15 @@ export interface IBridge {
   refreshEpicToolsets?(): Promise<readonly string[] | null>;
   /** The toolsets the surface declares, which a read after the handshake waits for (#1538). */
   expectEpicToolsets?(names: readonly string[]): void;
-  call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+  /**
+   * The tools Epic's Unreal MCP plugin serves beside the registry (plugin and
+   * tool-library tools), or null while unknown. An action that runs one of
+   * them through epic_call_mcp_tool is withheld when it is not listed (#1824).
+   */
+  readonly epicMcpTools?: readonly string[] | null;
+  /** Re-read epicMcpTools from the editor. */
+  refreshEpicMcpTools?(): Promise<readonly string[] | null>;
+  call(method: string, params?: Record<string, unknown>, timeoutMs?: number, options?: BridgeCallOptions): Promise<unknown>;
   connect(timeoutMs?: number): Promise<void>;
   /**
    * Move the connection to another project's editor (#818). Drops the current
@@ -391,6 +479,48 @@ export class EditorBridge implements IBridge {
     return run;
   }
 
+  private mcpTools: readonly string[] | null = null;
+  private mcpToolsInFlight: Promise<readonly string[] | null> | null = null;
+
+  /**
+   * The tools Epic's Unreal MCP plugin serves outside the toolset registry,
+   * or null while unknown. Read once after each handshake: they register when
+   * their modules start, before the bridge answers.
+   */
+  get epicMcpTools(): readonly string[] | null {
+    return this.mcpTools;
+  }
+
+  /**
+   * Read the MCP plugin's tool names. A plugin that is off is an empty list; a
+   * call that fails or a bridge without the method leaves it unknown.
+   */
+  refreshEpicMcpTools(): Promise<readonly string[] | null> {
+    if (this.mcpToolsInFlight) return this.mcpToolsInFlight;
+    if (!this.registered?.includes("epic_list_mcp_tools")) return Promise.resolve(this.mcpTools);
+    const run = (async () => {
+      let names: readonly string[] | null = null;
+      try {
+        names = epicMcpToolNames(await this.call("epic_list_mcp_tools", {}));
+      } catch {
+        names = null;
+      }
+      if (names !== null) {
+        const same = this.mcpTools !== null && names.length === this.mcpTools.length
+          && names.every((n, i) => n === this.mcpTools![i]);
+        if (!same) {
+          this.mcpTools = names;
+          this.notifyRegistered();
+        }
+      }
+      return this.mcpTools;
+    })().finally(() => {
+      this.mcpToolsInFlight = null;
+    });
+    this.mcpToolsInFlight = run;
+    return run;
+  }
+
   expectEpicToolsets(names: readonly string[]): void {
     this.expectedToolsets = [...new Set(names)];
     // Expectations that arrive after the handshake's read start the follow-up themselves.
@@ -452,6 +582,8 @@ export class EditorBridge implements IBridge {
   private connectedState = false;
   /** Whether an editor ever answered, so there is one to wait for. */
   private everConnected = false;
+  /** The last refused upgrade's explanation, so a retry loop warns once rather than every tick. */
+  private lastUpgradeRefusal: string | null = null;
   private readonly connectionListeners = new Set<(change: BridgeConnectionChange) => void>();
 
   /** Called when the socket opens or is lost. Returns the unsubscribe. */
@@ -482,6 +614,7 @@ export class EditorBridge implements IBridge {
     this.registered = actions;
     // Another plugin build may have another registry.
     this.toolsets = null;
+    this.mcpTools = null;
     this.notifyRegistered();
   }
 
@@ -515,19 +648,11 @@ export class EditorBridge implements IBridge {
     // where the IPv6 stack wins DNS, leaving the client stuck connecting to
     // an empty IPv6 socket while the plugin owns 127.0.0.1:9877.
     // UE_MCP_HOST overrides the default for non-standard topologies.
-    this.host = host ?? readEnv("host") ?? "127.0.0.1";
+    this.host = resolveSetting("bridgeHost", { explicit: host }).value!;
 
-    const envPort = Number.parseInt(readEnv("port") ?? "", 10);
-    if (typeof port === "number" && port > 0) {
-      this.port = port;
-      this.portSource = "explicit";
-    } else if (Number.isFinite(envPort) && envPort > 0) {
-      this.port = envPort;
-      this.portSource = "env";
-    } else {
-      this.port = DEFAULT_BRIDGE_PORT;
-      this.portSource = "default";
-    }
+    const pinned = resolveSetting("bridgePort", { explicit: port });
+    this.port = pinned.value ?? DEFAULT_BRIDGE_PORT;
+    this.portSource = pinned.source === "explicit" || pinned.source === "env" ? pinned.source : "default";
   }
 
   public host: string;
@@ -542,8 +667,8 @@ export class EditorBridge implements IBridge {
    * was, and this is what one project uses to differ when it is unset.
    */
   setConfigHost(host?: string): void {
-    if (readEnv("host")) return;
-    if (typeof host === "string" && host.trim() !== "") this.host = host.trim();
+    const resolved = resolveSetting("bridgeHost", { config: host });
+    if (resolved.source === "config") this.host = resolved.value!;
   }
 
   /**
@@ -551,10 +676,36 @@ export class EditorBridge implements IBridge {
    * explicit constructor arg or UE_MCP_PORT already pinned the port.
    */
   setConfigPort(port?: number): void {
-    if (typeof port === "number" && port > 0 && this.portSource !== "explicit" && this.portSource !== "env") {
-      this.port = port;
+    if (this.portSource === "explicit") return;
+    const resolved = resolveSetting("bridgePort", { config: port });
+    if (resolved.source === "config") {
+      this.port = resolved.value!;
       this.portSource = "config";
     }
+  }
+
+  /**
+   * Why the last project's pinned port was not used, or null. Set when the
+   * project enables the Unreal Canvas Bridge and the pin is a port it claims.
+   */
+  public canvasPortAvoided: { port: number; reason: string } | null = null;
+
+  /**
+   * Keep a pin off the ports a project's Unreal Canvas Bridge claims (9877 for
+   * its webcam server, 9880 for its viewport stream). The C++ bridge applies
+   * the same rule when it resolves the port, so both halves land on the
+   * derived port. A lockfile port is what an editor bound, so it is left alone.
+   */
+  private avoidCanvasPorts(uprojectPath: string | null): void {
+    this.canvasPortAvoided = null;
+    if (!uprojectPath || (this.portSource !== "explicit" && this.portSource !== "env" && this.portSource !== "config")) return;
+    const swap = canvasPortReplacement(uprojectPath, this.port, deriveProjectPort(path.dirname(uprojectPath)));
+    if (!swap) return;
+    warn("bridge", `Not using the pinned bridge port: ${swap.reason}.`);
+    this.canvasPortAvoided = { port: this.port, reason: swap.reason };
+    this.port = swap.port;
+    this.portSource = "derived";
+    this.unverifiedPin = false;
   }
 
   get isConnected(): boolean {
@@ -594,6 +745,7 @@ export class EditorBridge implements IBridge {
       this.portSource = "derived";
       debug("bridge", `derived per-project bridge port ${this.port} from ${path.dirname(uprojectPath)}`);
     }
+    this.avoidCanvasPorts(uprojectPath);
     // #817: hand the pin to the editor. An editor launched from Explorer
     // cannot see UE_MCP_PORT or the config merge that produced this number, so
     // without this file a pinned project has its two halves on different ports.
@@ -630,8 +782,8 @@ export class EditorBridge implements IBridge {
     // port.json a crashed editor left behind names a port that may since
     // belong to anything, and taking it here marked the target verified, which
     // is exactly the #818 guess this refusal exists to prevent.
-    const live = resolveLiveBridgeAddress(path.dirname(resolved));
-    if (live) {
+    const live = resolveBridgeTarget(path.dirname(resolved));
+    if (live.ok) {
       this.port = live.port;
       this.portSource = "lockfile";
     } else if (typeof configPort === "number" && configPort > 0) {
@@ -643,6 +795,7 @@ export class EditorBridge implements IBridge {
       this.port = deriveProjectPort(path.dirname(resolved));
       this.portSource = "derived";
     }
+    this.avoidCanvasPorts(resolved);
 
     // #817: publish the new target's pin, and only its own. An unverified pin
     // was chosen for the project we just left, so writing it into this one
@@ -676,18 +829,13 @@ export class EditorBridge implements IBridge {
     // port it advertises over the default. Lets multiple editors run side-
     // by-side without their npm clients colliding on 9877.
     //
-    // D6: resolved through the SAME rule the lifecycle path applies. The pid
-    // named by port.json is checked for liveness, because a record a crashed
-    // editor left behind is not evidence about a running one and clearing the
-    // #818 pin refusal on it dials a port that may belong to somebody else.
-    // And when port.json is gone - which is what happens to the survivor when
-    // one of two editors of a project quits - the editor's own
-    // instances/<pid>.json still names its port, so ordinary tool calls now
-    // find the editor that editor(stop_editor) could already resolve.
-    const live = resolveLiveBridgeAddress(
+    // D6: resolved through the SAME rule the lifecycle path applies
+    // (resolveBridgeTarget): a port.json naming a dead pid is no address, and
+    // without one a live instance record still finds the editor.
+    const live = resolveBridgeTarget(
       this.projectPathForLockfile ? path.dirname(this.projectPathForLockfile) : null,
     );
-    if (live) {
+    if (live.ok) {
       if (live.port !== this.port) {
         debug(
           "bridge",
@@ -718,6 +866,16 @@ export class EditorBridge implements IBridge {
     const url = `ws://${this.host}:${this.port}`;
     const generation = this.targetGeneration;
 
+    // The session token the editor published for this port, when it did. No
+    // file means a plugin that predates the token, which takes no header.
+    let headers: Record<string, string>;
+    try {
+      headers = bridgeAuthHeaders(this.port);
+    } catch (e) {
+      throw new McpError(ErrorCode.NOT_CONNECTED, e instanceof Error ? e.message : String(e));
+    }
+    const port = this.port;
+
     // #821: an editor whose bridge failed to bind is running and unreachable at
     // the same time. It leaves a record saying so, and quoting it here is the
     // difference between "start the editor" and "the editor is up, its bridge
@@ -733,10 +891,23 @@ export class EditorBridge implements IBridge {
         reject(new McpError(ErrorCode.BRIDGE_TIMEOUT, explainFailure(`Connection to editor bridge timed out (${url})`)));
       }, timeoutMs);
 
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(url, { headers });
+
+      // A refused upgrade says why. Without this the caller sees ws's bare
+      // "Unexpected server response: 401" and the reconnect loop retries it
+      // at debug level forever. Warned once per distinct reason.
+      watchUpgradeRefusal(ws, port, "Authorization" in headers, (message) => {
+        clearTimeout(timer);
+        if (message !== this.lastUpgradeRefusal) {
+          this.lastUpgradeRefusal = message;
+          warn("bridge", message);
+        }
+        reject(new McpError(ErrorCode.NOT_CONNECTED, message));
+      });
 
       ws.on("open", () => {
         clearTimeout(timer);
+        this.lastUpgradeRefusal = null;
         // The target moved while this handshake was in flight. Installing the
         // socket now would put the bridge back on the project we just left.
         if (this.targetGeneration !== generation) {
@@ -853,7 +1024,8 @@ export class EditorBridge implements IBridge {
     return new McpError(ErrorCode.NOT_CONNECTED, `${base}${cause}${waited}`);
   }
 
-  async call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
+  async call(method: string, params?: Record<string, unknown>, timeoutMs?: number, options?: BridgeCallOptions): Promise<unknown> {
+    if (options?.signal?.aborted) throw cancelledError(method);
     if (!this.isConnected) {
       try {
         await this.ensureConnected();
@@ -866,7 +1038,12 @@ export class EditorBridge implements IBridge {
 
     const id = String(++this.idCounter);
     const explicit = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0;
-    const frame = encodeRequest(id, method, params, explicit ? resolveBridgeTimeout(method, timeoutMs) : undefined);
+    const signal = options?.signal;
+    const cancelToken = signal ? randomUUID() : undefined;
+    const frame = encodeRequest(id, method, params, explicit ? resolveBridgeTimeout(method, timeoutMs) : undefined, {
+      cancelToken,
+      progress: !!options?.onProgress,
+    });
     // #989: not a flat 30s any more. An explicit per-call budget is honoured,
     // and a method the C++ side registered a longer timeout for is waited out
     // to that limit, so the client stops declaring a failure on a call the
@@ -901,7 +1078,20 @@ export class EditorBridge implements IBridge {
         ));
       }, timeout);
 
-      this.pending.set(id, { resolve, reject, timer, method });
+      this.pending.set(id, { resolve, reject, timer, method, onProgress: options?.onProgress });
+      if (signal && cancelToken) {
+        // The client cancelled: tell the editor on a socket of its own, since
+        // this one's request is the thing being waited on, and stop waiting.
+        const onAbort = (): void => {
+          if (!this.pending.has(id)) return;
+          clearTimeout(timer);
+          this.pending.delete(id);
+          this.rememberAbandoned(id, method);
+          void callBridgeOnce(this.host, this.port, "cancel_request", { cancelToken }, 5000);
+          reject(cancelledError(method, id));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
       ws.send(frame, (err) => {
         if (!err) return;
 
@@ -994,6 +1184,11 @@ export class EditorBridge implements IBridge {
           // Read off the handshake's critical path; a failure leaves it unknown.
           this.stopFollowingToolsets();
           queueMicrotask(() => this.followEpicToolsets(ws));
+          // An editor restarted with another plugin set answers with the same
+          // method list, so the MCP tools are read again on every handshake.
+          queueMicrotask(() => {
+            if (this.ws === ws) void this.refreshEpicMcpTools();
+          });
         }
 
         const mismatch = describeProtocolMismatch(capabilities);
@@ -1014,7 +1209,7 @@ export class EditorBridge implements IBridge {
         }
         if (msg.id !== id) return;
         if (msg.error || !msg.result) {
-          // -32601 from a bridge that has never heard of the handshake. That
+          // Method-not-found from a bridge that has never heard of the handshake. That
           // silence is itself the answer: it predates the protocol version.
           finish({ ...LEGACY_CAPABILITIES });
           return;
@@ -1059,7 +1254,19 @@ export class EditorBridge implements IBridge {
   private setupListeners(ws: WebSocket): void {
     ws.on("message", (data) => {
       try {
-        const msg = JSON.parse(data.toString()) as BridgeResponse;
+        const parsed = JSON.parse(data.toString()) as unknown;
+        if (isProgressFrame(parsed)) {
+          const target = parsed.params?.id !== undefined ? this.pending.get(String(parsed.params.id)) : undefined;
+          if (target?.onProgress && typeof parsed.params.progress === "number") {
+            target.onProgress({
+              progress: parsed.params.progress,
+              ...(typeof parsed.params.total === "number" ? { total: parsed.params.total } : {}),
+              message: typeof parsed.params.message === "string" ? parsed.params.message : "",
+            });
+          }
+          return;
+        }
+        const msg = parsed as BridgeResponse;
         const pending = this.pending.get(msg.id);
         if (!pending) {
           // A reply to a call that already timed out on this side. Nobody is
@@ -1083,12 +1290,12 @@ export class EditorBridge implements IBridge {
         clearTimeout(pending.timer);
 
         if (msg.error) {
-          // #821: -32601 against an older plugin used to read as a typo. Say
-          // which side is behind, and name both versions.
+          // #821: method-not-found against an older plugin used to read as a
+          // typo. Say which side is behind, and name both versions.
           // #1167: with the protocols in agreement it is still a missing
           // handler, so the upgrade pointer goes on either way.
           const mismatch =
-            msg.error.code === -32601
+            msg.error.code === JSON_RPC_ERRORS.methodNotFound
               ? describeProtocolMismatch(this.capabilities, pending.method) ?? describeUnregisteredMethod(pending.method)
               : null;
           pending.reject(

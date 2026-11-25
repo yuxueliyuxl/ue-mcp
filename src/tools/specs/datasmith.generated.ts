@@ -1,3 +1,4 @@
+// @session independent: Generated parameter declarations from the recorded C++ specs; data only, with no editor state.
 // GENERATED FILE - do not edit.
 //
 // Written by scripts/generate-handler-specs.mjs from tests/golden/handler-specs.json,
@@ -132,15 +133,6 @@ export const handlerSpecs: HandlerSpecs = {
   }
 };
 
-/** The Params: clause of each spec'd bridge method. */
-export const paramsClauses: Readonly<Record<string, string>> = {
-  datasmith_import: "Params: filePath, destinationPath, options?",
-  datasmith_inspect: "Params: filePath",
-  datasmith_query_actors: "Params: tagPrefix?, tags?, metadataKey?, metadataValue?, includeMetadata?, includeBounds?, limit?",
-  datasmith_reimport: "Params: sceneAssetPath, filePath?, syncActors?, respawnDeleted?, options?",
-  datasmith_status: "Params: none",
-};
-
 /** Every key the spec'd datasmith handlers declare, aliases included. */
 export const schema: Record<string, z.ZodType> = {
   destinationPath: z.string().optional().describe("Content folder for the scene asset and its assets, e.g. /Game/Datasmith/Site"),
@@ -159,4 +151,4 @@ export const schema: Record<string, z.ZodType> = {
 };
 
 /** Declare an action for a spec'd bridge method: effect, summary, method. */
-export const specBp = makeSpecBp(paramsClauses, handlerSpecs);
+export const specBp = makeSpecBp(handlerSpecs);

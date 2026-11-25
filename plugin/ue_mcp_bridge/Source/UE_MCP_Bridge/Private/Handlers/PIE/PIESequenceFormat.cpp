@@ -1,4 +1,5 @@
 #include "Handlers/PIE/PIESequenceFormat.h"
+#include "Handlers/PIE/PIEUIPointer.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
@@ -127,6 +128,7 @@ namespace MCPPIE
 		case EStepType::Console:   return TEXT("console");
 		case EStepType::InputTape: return TEXT("input_tape");
 		case EStepType::Mark:      return TEXT("mark");
+		case EStepType::UIInput:   return TEXT("ui_input");
 		}
 		return TEXT("input");
 	}
@@ -139,6 +141,7 @@ namespace MCPPIE
 		if (Str == TEXT("console"))    { Out = EStepType::Console;   return true; }
 		if (Str == TEXT("input_tape")) { Out = EStepType::InputTape; return true; }
 		if (Str == TEXT("mark"))       { Out = EStepType::Mark;      return true; }
+		if (Str == TEXT("ui_input"))   { Out = EStepType::UIInput;   return true; }
 		return false;
 	}
 
@@ -185,6 +188,13 @@ namespace MCPPIE
 			TrackedArr.Add(MakeShared<FJsonValueObject>(TO));
 		}
 		O->SetArrayField(TEXT("tracked_values"), TrackedArr);
+
+		if (M.Warnings.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> WarnArr;
+			for (const FString& W : M.Warnings) WarnArr.Add(MakeShared<FJsonValueString>(W));
+			O->SetArrayField(TEXT("warnings"), WarnArr);
+		}
 
 		TArray<TSharedPtr<FJsonValue>> MarkersArr;
 		for (const FMarker& Mk : M.Markers)
@@ -302,6 +312,16 @@ namespace MCPPIE
 			}
 		}
 
+		const TArray<TSharedPtr<FJsonValue>>* WarnArr = nullptr;
+		if (Obj->TryGetArrayField(TEXT("warnings"), WarnArr) && WarnArr)
+		{
+			for (const TSharedPtr<FJsonValue>& WV : *WarnArr)
+			{
+				FString W;
+				if (WV.IsValid() && WV->TryGetString(W)) Out.Warnings.Add(W);
+			}
+		}
+
 		const TArray<TSharedPtr<FJsonValue>>* Markers = nullptr;
 		if (Obj->TryGetArrayField(TEXT("markers"), Markers) && Markers)
 		{
@@ -388,6 +408,30 @@ namespace MCPPIE
 			case EStepType::Mark:
 				SO->SetStringField(TEXT("label"), Step.Label);
 				break;
+			case EStepType::UIInput:
+			{
+				SO->SetStringField(TEXT("event"), Step.UIEvent);
+				SO->SetNumberField(TEXT("x"), Step.PointerX);
+				SO->SetNumberField(TEXT("y"), Step.PointerY);
+				if (!Step.UIKey.IsEmpty())
+				{
+					SO->SetStringField(TEXT("button"), Step.UIKey);
+				}
+				if (Step.WheelDelta != 0.0)
+				{
+					SO->SetNumberField(TEXT("wheel_delta"), Step.WheelDelta);
+				}
+				if (Step.UIModifiers != 0)
+				{
+					TArray<TSharedPtr<FJsonValue>> Mods;
+					for (const FString& M : UIModifiersToStrings(Step.UIModifiers))
+					{
+						Mods.Add(MakeShared<FJsonValueString>(M));
+					}
+					SO->SetArrayField(TEXT("modifiers"), Mods);
+				}
+				break;
+			}
 			case EStepType::InputTape:
 			{
 				SO->SetStringField(TEXT("action"), Step.Action);
@@ -492,6 +536,38 @@ namespace MCPPIE
 			SO->TryGetStringField(TEXT("command"), Step.Command);
 			SO->TryGetStringField(TEXT("label"), Step.Label);
 
+			if (Step.Type == EStepType::UIInput)
+			{
+				SO->TryGetStringField(TEXT("event"), Step.UIEvent);
+				EUIPointerEvent Parsed;
+				if (!ParseUIPointerEvent(Step.UIEvent, Parsed))
+				{
+					OutError = FString::Printf(TEXT("sequence: ui_input step has unknown event '%s'"), *Step.UIEvent);
+					return false;
+				}
+				SO->TryGetNumberField(TEXT("x"), Step.PointerX);
+				SO->TryGetNumberField(TEXT("y"), Step.PointerY);
+				SO->TryGetStringField(TEXT("button"), Step.UIKey);
+				SO->TryGetNumberField(TEXT("wheel_delta"), Step.WheelDelta);
+				const TArray<TSharedPtr<FJsonValue>>* Mods = nullptr;
+				if (SO->TryGetArrayField(TEXT("modifiers"), Mods) && Mods)
+				{
+					TArray<FString> Names;
+					for (const TSharedPtr<FJsonValue>& M : *Mods)
+					{
+						if (M.IsValid()) Names.Add(M->AsString());
+					}
+					Step.UIModifiers = UIModifiersFromStrings(Names);
+				}
+				const bool bNeedsButton = Parsed == EUIPointerEvent::Down || Parsed == EUIPointerEvent::Up
+					|| Parsed == EUIPointerEvent::DoubleClick;
+				if (bNeedsButton && Step.UIKey.IsEmpty())
+				{
+					OutError = FString::Printf(TEXT("sequence: ui_input %s step needs 'button'"), *Step.UIEvent);
+					return false;
+				}
+			}
+
 			if (Step.Type == EStepType::InputTape)
 			{
 				const TArray<TSharedPtr<FJsonValue>>* Vals = nullptr;
@@ -562,12 +638,55 @@ namespace MCPPIE
 		{
 			TSharedRef<FJsonObject> FO = MakeShared<FJsonObject>();
 			FO->SetNumberField(TEXT("frame"), static_cast<double>(F.Frame));
+			FO->SetNumberField(TEXT("source_frame"), static_cast<double>(F.SourceFrame));
+			FO->SetNumberField(TEXT("time"), F.Time);
 			FO->SetNumberField(TEXT("position_delta_cm"), F.PositionDeltaCm);
 			FO->SetNumberField(TEXT("velocity_delta_cms"), F.VelocityDeltaCms);
 			FO->SetNumberField(TEXT("rotation_delta_deg"), F.RotationDeltaDeg);
+			auto Vec = [](const FVector& V)
+			{
+				TSharedRef<FJsonObject> VO = MakeShared<FJsonObject>();
+				VO->SetNumberField(TEXT("x"), V.X);
+				VO->SetNumberField(TEXT("y"), V.Y);
+				VO->SetNumberField(TEXT("z"), V.Z);
+				return VO;
+			};
+			FO->SetObjectField(TEXT("position_delta"), Vec(F.PositionDelta));
+			FO->SetObjectField(TEXT("velocity_delta"), Vec(F.VelocityDelta));
 			Frames.Add(MakeShared<FJsonValueObject>(FO));
 		}
 		O->SetArrayField(TEXT("frames_over_threshold"), Frames);
+
+		if (!D.Alignment.IsEmpty())
+		{
+			O->SetStringField(TEXT("alignment"), D.Alignment);
+			O->SetNumberField(TEXT("replay_offset_ms"), D.ReplayOffsetMs);
+		}
+		if (D.bHasInputOnset)
+		{
+			TSharedRef<FJsonObject> On = MakeShared<FJsonObject>();
+			On->SetNumberField(TEXT("source_ms"), D.SourceInputOnsetMs);
+			On->SetNumberField(TEXT("replay_ms"), D.ReplayInputOnsetMs);
+			On->SetNumberField(TEXT("offset_ms"), D.ReplayInputOnsetMs - D.SourceInputOnsetMs);
+			O->SetObjectField(TEXT("input_onset"), On);
+		}
+		if (!D.ReplayCSVFile.IsEmpty())
+		{
+			O->SetStringField(TEXT("replay_csv"), D.ReplayCSVFile);
+		}
+		if (D.bHasStartGate)
+		{
+			TSharedRef<FJsonObject> G = MakeShared<FJsonObject>();
+			G->SetBoolField(TEXT("passed"), D.bStartGatePassed);
+			G->SetStringField(TEXT("anchor"), D.StartGateAnchor);
+			G->SetNumberField(TEXT("source_ms"), D.StartGateSourceMs);
+			G->SetNumberField(TEXT("replay_ms"), D.StartGateReplayMs);
+			if (!D.StartGateBlocker.IsEmpty())
+			{
+				G->SetStringField(TEXT("blocker"), D.StartGateBlocker);
+			}
+			O->SetObjectField(TEXT("start_gate"), G);
+		}
 
 		// Synthesised lead (item 1c): first divergence + ranked channels + errors.
 		if (D.Summary.bValid)
@@ -685,8 +804,43 @@ namespace MCPPIE
 				DD = 0; FO->TryGetNumberField(TEXT("position_delta_cm"), DD); E.PositionDeltaCm = static_cast<float>(DD);
 				DD = 0; FO->TryGetNumberField(TEXT("velocity_delta_cms"), DD); E.VelocityDeltaCms = static_cast<float>(DD);
 				DD = 0; FO->TryGetNumberField(TEXT("rotation_delta_deg"), DD); E.RotationDeltaDeg = static_cast<float>(DD);
+				DD = 0; FO->TryGetNumberField(TEXT("source_frame"), DD); E.SourceFrame = static_cast<uint64>(DD);
+				FO->TryGetNumberField(TEXT("time"), E.Time);
+				auto ReadVec = [&FO](const TCHAR* Key, FVector& OutV)
+				{
+					const TSharedPtr<FJsonObject>* VO = nullptr;
+					if (FO->TryGetObjectField(Key, VO) && VO)
+					{
+						(*VO)->TryGetNumberField(TEXT("x"), OutV.X);
+						(*VO)->TryGetNumberField(TEXT("y"), OutV.Y);
+						(*VO)->TryGetNumberField(TEXT("z"), OutV.Z);
+					}
+				};
+				ReadVec(TEXT("position_delta"), E.PositionDelta);
+				ReadVec(TEXT("velocity_delta"), E.VelocityDelta);
 				Out.FramesOverThreshold.Add(E);
 			}
+		}
+
+		Obj->TryGetStringField(TEXT("alignment"), Out.Alignment);
+		Obj->TryGetNumberField(TEXT("replay_offset_ms"), Out.ReplayOffsetMs);
+		const TSharedPtr<FJsonObject>* OnsetObj = nullptr;
+		if (Obj->TryGetObjectField(TEXT("input_onset"), OnsetObj) && OnsetObj)
+		{
+			Out.bHasInputOnset = true;
+			(*OnsetObj)->TryGetNumberField(TEXT("source_ms"), Out.SourceInputOnsetMs);
+			(*OnsetObj)->TryGetNumberField(TEXT("replay_ms"), Out.ReplayInputOnsetMs);
+		}
+		Obj->TryGetStringField(TEXT("replay_csv"), Out.ReplayCSVFile);
+		const TSharedPtr<FJsonObject>* GateObj = nullptr;
+		if (Obj->TryGetObjectField(TEXT("start_gate"), GateObj) && GateObj)
+		{
+			Out.bHasStartGate = true;
+			(*GateObj)->TryGetBoolField(TEXT("passed"), Out.bStartGatePassed);
+			(*GateObj)->TryGetStringField(TEXT("anchor"), Out.StartGateAnchor);
+			(*GateObj)->TryGetNumberField(TEXT("source_ms"), Out.StartGateSourceMs);
+			(*GateObj)->TryGetNumberField(TEXT("replay_ms"), Out.StartGateReplayMs);
+			(*GateObj)->TryGetStringField(TEXT("blocker"), Out.StartGateBlocker);
 		}
 
 		const TSharedPtr<FJsonObject>* SumObj = nullptr;
@@ -1012,9 +1166,7 @@ namespace MCPPIE
 			AActor* A = *It;
 			if (!A) continue;
 			if (A->GetName() == Id) return A;
-#if WITH_EDITOR
 			if (A->GetActorLabel() == Id) return A;
-#endif
 			const UClass* C = A->GetClass();
 			if (C && (C->GetName() == Id || C->GetPathName() == Id)) return A;
 			if (A->GetPathName().EndsWith(Id)) return A;

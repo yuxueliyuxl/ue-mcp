@@ -681,13 +681,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ConfigureIKRetargeter(const TSharedPt
 		TEXT("chainMappings"), TEXT("ops"), TEXT("pose"),
 	});
 #if !UE_MCP_HAS_5_8_API
-	return MCPUnsupportedEngineError(TEXT("configure_ik_retargeter"), TEXT("5.8"));
+	return MCPUnsupportedEngineError(TEXT("configure_ik_retargeter"), TEXT("5.8"),
+		TEXT("On this engine, animation(create_ik_retargeter) sets the source and target rigs when it creates the asset, and the IK Retargeter editor does the rest"));
 #else
 	FString RetargeterPath;
 	if (auto Error = RequireString(Params, TEXT("retargeterPath"), RetargeterPath)) return Error;
 	if (MCPIsProtectedAssetPath(RetargeterPath))
 	{
-		return MCPError(FString::Printf(TEXT("Protected asset cannot be modified: %s"), *RetargeterPath));
+		return MCPError(FString::Printf(TEXT("Protected asset cannot be modified: %s. %s"), *RetargeterPath, *MCPProtectedMountWayForward()));
 	}
 	UIKRetargeter* Retargeter = LoadAssetByPath<UIKRetargeter>(RetargeterPath);
 	if (!Retargeter) return MCPError(FString::Printf(TEXT("IKRetargeter not found: %s"), *RetargeterPath));
@@ -764,7 +765,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ConfigureIKRetargeter(const TSharedPt
 		if (!TryGetArrayParam(Params, TEXT("chainMappings"), MappingValues) || !MappingValues)
 			return MCPError(TEXT("'chainMappings' must be an array"));
 		if (MappingValues->Num() > MaxRetargeterItems)
-			return MCPError(FString::Printf(TEXT("'chainMappings' exceeds the %d item limit"), MaxRetargeterItems));
+			return MCPBatchTooLargeError(FString::Printf(TEXT("'chainMappings' exceeds the %d item limit"), MaxRetargeterItems), MaxRetargeterItems);
 		if (!SourceRig || !TargetRig)
 			return MCPError(TEXT("'chainMappings' requires both source and target IK Rigs"));
 		const TSet<FName> SourceChains = GetChainNames(SourceRig);
@@ -860,7 +861,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ConfigureIKRetargeter(const TSharedPt
 			if (!PoseObject->TryGetArrayField(TEXT("bones"), BoneValues) || !BoneValues)
 				return MCPError(TEXT("pose.bones must be an array of bone names"));
 			if (BoneValues->Num() > MaxRetargeterItems)
-				return MCPError(FString::Printf(TEXT("pose.bones exceeds the %d item limit"), MaxRetargeterItems));
+				return MCPBatchTooLargeError(FString::Printf(TEXT("pose.bones exceeds the %d item limit"), MaxRetargeterItems), MaxRetargeterItems);
 			TSet<FName> SeenBones;
 			for (int32 Index = 0; Index < BoneValues->Num(); ++Index)
 			{
@@ -888,7 +889,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ConfigureIKRetargeter(const TSharedPt
 			if (!PoseObject->TryGetArrayField(TEXT("rotationOffsets"), RotationValues) || !RotationValues)
 				return MCPError(TEXT("pose.rotationOffsets must be an array"));
 			if (RotationValues->Num() > MaxRetargeterItems)
-				return MCPError(FString::Printf(TEXT("pose.rotationOffsets exceeds the %d item limit"), MaxRetargeterItems));
+				return MCPBatchTooLargeError(FString::Printf(TEXT("pose.rotationOffsets exceeds the %d item limit"), MaxRetargeterItems), MaxRetargeterItems);
 			TSet<FName> SeenBones;
 			for (int32 Index = 0; Index < RotationValues->Num(); ++Index)
 			{

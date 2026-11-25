@@ -1,4 +1,5 @@
-import type { ToolDef } from "../core/types.js";
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
+import type { ToolDef } from "../surface/tool-types.js";
 import { categoryTool } from "../surface/category-tool.js";
 import { specBp, schema as specSchema } from "./specs/networking.generated.js";
 
@@ -17,10 +18,11 @@ export const networkingTool: ToolDef = categoryTool(
     set_priority:          specBp("mutate", "Set NetPriority on a Blueprint's CDO. Reports existed=true and unchanged=true when the value is already nearly equal to the one asked for, and otherwise rolls back to the float the property held, with nothing lost.", "set_net_priority"),
     set_replicate_movement: specBp("mutate", "Set replicated movement on a Blueprint's CDO. Reports existed=true and unchanged=true when the class already had this value, and otherwise rolls back through this same action with the previous flag, with nothing lost.", "set_replicate_movement"),
     get_info:              specBp("read", "Get networking info.", "get_networking_info"),
+    audit_replication:     specBp("read", "Project-wide replication audit over native and Blueprint classes. Each class row lists its replicated properties (lifetime condition, push-based, RepNotify function and its REPNOTIFY condition, read from the class's own GetLifetimeReplicatedProps), its RPCs (Server / Client / NetMulticast, reliable, validated) and, for actors and components, the replication settings on its defaults (replicates, netDormancy, netCullDistanceSquared, update frequencies, priority, relevancy). findings name each problem visible from the class alone: repNotifyFunctionMissing, onRepWithoutReplicatedProperty, replicatedPropertyNotRegistered, replicatedPropertyOnNonReplicatingClass, reliableMulticast, and serverRpcWithoutValidation when requireServerValidation=true. Native scope is the project's modules and project plugins unless includeEngine=true; Blueprints come from path (default /Game). Classes with findings sort first; totals stay complete when rows are cut at limit, and dumpToFile writes every row to a JSON file.", "audit_replication"),
   },
   {
     // #1057: every key the networking handlers declare, generated from their
     // C++ registrations.
     ...specSchema,
-  },
+  }, { label: { description: "replication, dormancy, RPCs", keywords: ["replicat", "network", "dormancy"] } },
 );

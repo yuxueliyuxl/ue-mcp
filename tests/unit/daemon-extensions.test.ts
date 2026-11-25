@@ -7,11 +7,12 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startDaemon, type Daemon } from "../../src/daemon/daemon.js";
 import { signBundle, UiBundleStore } from "../../src/daemon/ui-bundles.js";
-import { DAEMON_API_VERSION } from "../../src/daemon/discovery.js";
+import { DAEMON_API_VERSION } from "../../src/contract/daemon.js";
 import { restoreEnv } from "../helpers/env.js";
 import { userSandboxEnv } from "../helpers/user-sandbox.js";
 
@@ -57,7 +58,7 @@ beforeAll(async () => {
   fs.mkdirSync(extDir, { recursive: true });
   fs.writeFileSync(path.join(extDir, "package.json"), JSON.stringify({
     name: "sample-ext", version: "0.1.0", type: "module", main: "index.js",
-    ueMcpExtension: { name: "sample", api: { min: 1, max: 1 } },
+    ueMcpExtension: { name: "sample", api: { min: 1, max: 1 }, permissions: ["registry.account"] },
   }));
   fs.writeFileSync(path.join(extDir, "index.js"), `
     export function activate(api) {
@@ -117,6 +118,40 @@ beforeAll(async () => {
   }));
   fs.writeFileSync(path.join(ahead, "index.js"), "export function activate() {}");
 
+  // Two that talk through a service, and one that provides a service and then fails to activate.
+  // Load order follows the directory listing, so the consumer may activate before or after the provider.
+  const plain = (name: string, body: string) => {
+    const dir = path.join(sandbox, "extensions", name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+      name: `${name}-ext`, version: "1.0.0", type: "module", main: "index.js",
+      ueMcpExtension: { name, api: { min: 1, max: 3 } },
+    }));
+    fs.writeFileSync(path.join(dir, "index.js"), `export function activate(api) {${body}}`);
+  };
+  plain("consumer", `
+    const seen = [];
+    let greeter;
+    api.services.watch("greeter", (impl) => { greeter = impl; seen.push(impl ? "provided" : "revoked"); });
+    api.route("GET", "/greet", () => ({ body: {
+      greeting: greeter ? greeter.greet("consumer") : null,
+      viaGet: api.services.get("greeter")?.greet("get") ?? null,
+      unknown: api.services.get("nothing") ?? null,
+      broken: api.services.get("broken.svc") ?? null,
+      seen,
+    } }));
+    api.route("GET", "/account", async () => ({ body: { account: await api.registryAccount() } }));
+  `);
+  // Declares permissions, without registry.account.
+  plain("strict", `api.route("GET", "/account", async () => ({ body: { account: await api.registryAccount() } }));`);
+  const strictPkg = path.join(sandbox, "extensions", "strict", "package.json");
+  fs.writeFileSync(strictPkg, JSON.stringify({
+    name: "strict-ext", version: "1.0.0", type: "module", main: "index.js",
+    ueMcpExtension: { name: "strict", api: { min: 1, max: 3 }, permissions: [] },
+  }));
+  plain("provider",`api.services.provide("greeter", { greet: (who) => "hello " + who });`);
+  plain("broken", `api.services.provide("broken.svc", {}); throw new Error("activation fails after providing");`);
+
   daemon = await startDaemon({
     projects: [uproject],
     publish: false,
@@ -136,7 +171,8 @@ afterAll(async () => {
 describe("extensions", () => {
   it("loads the compatible extension and skips the other", async () => {
     const health = await (await fetch(`${base}/v1/health`, { headers: auth })).json();
-    expect(health.extensions).toEqual([{ name: "sample", version: "0.1.0" }]);
+    expect(health.extensions).toEqual(expect.arrayContaining([{ name: "sample", version: "0.1.0" }, { name: "consumer", version: "1.0.0" }, { name: "provider", version: "1.0.0" }]));
+    expect(health.extensions).toHaveLength(4);
   });
 
   it("refuses an extension that needs a newer ue-mcp, and says which in health", async () => {
@@ -156,9 +192,19 @@ describe("extensions", () => {
     expect((await fetch(`${base}/v1/ext/sample/hello`)).status).toBe(401);
   });
 
-  it("reads the ue-mcp account this machine signed in with", async () => {
+  it("hands the account to an extension declaring registry.account", async () => {
     const res = await (await fetch(`${base}/v1/ext/sample/account`, { headers: auth })).json();
     expect(res).toEqual({ login: "someone", hasToken: true });
+  });
+
+  it("still hands the account to an extension with no permissions field, during the compatibility window", async () => {
+    const legacy = await (await fetch(`${base}/v1/ext/consumer/account`, { headers: auth })).json();
+    expect(legacy).toEqual({ account: { login: "someone", token: "uemcp_test", registry: "https://plugins.ue-mcp.com" } });
+  });
+
+  it("answers null to an extension that declares permissions without registry.account", async () => {
+    const strict = await (await fetch(`${base}/v1/ext/strict/account`, { headers: auth })).json();
+    expect(strict).toEqual({ account: null });
   });
 
   it("runs actions in process and publishes namespaced events", async () => {
@@ -253,6 +299,16 @@ describe("UI bundles", () => {
     expect(() => daemon.ui.install(bundle("client", "0.9.0", undefined, other))).toThrow(/signature/);
   });
 
+  it("refuses a bundle named for a loaded extension unless that extension trusted its key", async () => {
+    const other = crypto.generateKeyPairSync("ed25519");
+    daemon.ui.trustKey(other.publicKey.export({ type: "spki", format: "pem" }).toString(), "future");
+    const otherPem = other.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    expect(() => daemon.ui.install(bundle("sample", "0.1.0", undefined, otherPem))).toThrow(/signature does not verify/);
+    const res = await (await fetch(`${base}/v1/ext/sample/features`, { headers: auth })).json();
+    expect(res.features).toContain("ui.scopedKeys");
+    expect((await (await fetch(`${base}/v1/health`, { headers: auth })).json()).features).toContain("ui.scopedKeys");
+  });
+
   it("refuses a bundle with a file changed after signing", () => {
     const dir = bundle("client", "0.9.1");
     fs.writeFileSync(path.join(dir, "assets", "app.js"), "alert('changed')");
@@ -296,6 +352,42 @@ describe("UI bundles", () => {
     expect((await fetch(`${base}/v1/health`, { headers: { cookie: `ue_mcp_token_1=${"b".repeat(64)}` } })).status).toBe(401);
   });
 
+  it("clears the logins of daemons no longer listening, so restarts cannot grow the jar past the header limit", async () => {
+    // A port held open stands in for another project's daemon that is still running.
+    const live = net.createServer().listen(0, "127.0.0.1");
+    await new Promise<void>((r) => live.once("listening", () => r()));
+    const livePort = (live.address() as net.AddressInfo).port;
+    // A port opened and closed again stands in for a daemon that has exited.
+    const gone = net.createServer().listen(0, "127.0.0.1");
+    await new Promise<void>((r) => gone.once("listening", () => r()));
+    const deadPort = (gone.address() as net.AddressInfo).port;
+    await new Promise<void>((r) => gone.close(() => r()));
+    try {
+      const own = new URL(base).port;
+      // Past Node's default 16 KiB header limit: the login must still be reached.
+      const filler = Array.from({ length: 250 }, (_, i) => `other_${i}=${"c".repeat(64)}`).join("; ");
+      const jar = [
+        `ue_mcp_token=${"a".repeat(64)}`,
+        `ue_mcp_token_${deadPort}=${"b".repeat(64)}`,
+        `ue_mcp_token_${livePort}=${"d".repeat(64)}`,
+        `ue_mcp_token_${own}=${"e".repeat(64)}`,
+        filler,
+      ].join("; ");
+      expect(jar.length).toBeGreaterThan(16 * 1024);
+      const login = await fetch(`${base}/ui/?token=${daemon.token}`, { redirect: "manual", headers: { cookie: jar } });
+      expect(login.status).toBe(302);
+      const set = login.headers.getSetCookie();
+      expect(set[0]).toMatch(new RegExp(`^ue_mcp_token_${own}=${daemon.token};`));
+      const cleared = set.slice(1).map((c) => c.split("=")[0]).sort();
+      expect(cleared).toEqual(["ue_mcp_token", `ue_mcp_token_${deadPort}`].sort());
+      for (const c of set.slice(1)) expect(c).toMatch(/Max-Age=0/);
+      // The jar no longer blocks the API either.
+      expect((await fetch(`${base}/v1/health`, { headers: { cookie: `${jar}; ${set[0].split(";")[0]}` } })).status).toBe(200);
+    } finally {
+      await new Promise<void>((r) => live.close(() => r()));
+    }
+  });
+
   it("stops serving an installed bundle that is altered on disk", async () => {
     const served = daemon.ui.active()!;
     fs.appendFileSync(path.join(served.dir, "index.html"), "<script>evil()</script>");
@@ -336,5 +428,28 @@ describe("test script events", () => {
     expect(seen[1].data).toMatchObject({ runId: "run-x", awaiting: [{ index: 1 }] });
     expect(seen[2].data).toMatchObject({ seq: 7, summary: { passed: 2 } });
     expect(seen.every((e) => !("type" in e.data))).toBe(true);
+  });
+});
+
+describe("extension services", () => {
+  it("lets one extension use what another provides, whichever activates first", async () => {
+    const res = await (await fetch(`${base}/v1/ext/consumer/greet`, { headers: auth })).json();
+    expect(res).toEqual({ greeting: "hello consumer", viaGet: "hello get", unknown: null, broken: null, seen: ["provided"] });
+    const features = await (await fetch(`${base}/v1/ext/sample/features`, { headers: auth })).json();
+    expect(features.features).toContain("extension.services");
+  });
+});
+
+// Last: it stops the daemon.
+describe("extension services on shutdown", () => {
+  it("revokes each extension's services after disposing it", async () => {
+    const { ExtensionServices } = await import("../../src/daemon/extension-services.js");
+    const revoked = vi.spyOn(ExtensionServices.prototype, "revokeOwner");
+    try {
+      await daemon.close();
+      expect(revoked.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining(["sample", "consumer", "provider"]));
+    } finally {
+      revoked.mockRestore();
+    }
   });
 });

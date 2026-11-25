@@ -1,3 +1,4 @@
+// @session independent: Generated parameter declarations from the recorded C++ specs; data only, with no editor state.
 // GENERATED FILE - do not edit.
 //
 // Written by scripts/generate-handler-specs.mjs from tests/golden/handler-specs.json,
@@ -16,13 +17,13 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorLabel",
         "type": "string",
         "required": false,
-        "description": "Actor editor label; pass actorLabel or actorPath"
+        "description": "Actor editor label. Labels are not unique, so a label naming several actors is refused; pass actorPath then"
       },
       {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       },
       {
         "name": "impulse",
@@ -78,9 +79,10 @@ export const handlerSpecs: HandlerSpecs = {
       },
       {
         "name": "pieInstance",
-        "type": "number",
+        "type": "integer",
         "required": false,
-        "description": "PIE world instance (0 = server/primary); omit for the primary world"
+        "description": "PIE world instance (0 = server/primary); omit for the primary world",
+        "minimum": 0
       }
     ],
     "choices": [
@@ -104,13 +106,13 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorLabel",
         "type": "string",
         "required": false,
-        "description": "Actor editor label; pass actorLabel or actorPath"
+        "description": "Actor editor label. Labels are not unique, so a label naming several actors is refused; pass actorPath then"
       },
       {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       },
       {
         "name": "assetPath",
@@ -179,13 +181,13 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorLabel",
         "type": "string",
         "required": false,
-        "description": "Actor editor label; pass actorLabel or actorPath"
+        "description": "Actor editor label. Labels are not unique, so a label naming several actors is refused; pass actorPath then"
       },
       {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       },
       {
         "name": "collisionEnabled",
@@ -218,13 +220,13 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorLabel",
         "type": "string",
         "required": false,
-        "description": "Actor editor label; pass actorLabel or actorPath"
+        "description": "Actor editor label. Labels are not unique, so a label naming several actors is refused; pass actorPath then"
       },
       {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       },
       {
         "name": "profileName",
@@ -254,13 +256,13 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorLabel",
         "type": "string",
         "required": false,
-        "description": "Actor editor label; pass actorLabel or actorPath"
+        "description": "Actor editor label. Labels are not unique, so a label naming several actors is refused; pass actorPath then"
       },
       {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       },
       {
         "name": "mass",
@@ -308,13 +310,13 @@ export const handlerSpecs: HandlerSpecs = {
         "name": "actorLabel",
         "type": "string",
         "required": false,
-        "description": "Actor editor label; pass actorLabel or actorPath"
+        "description": "Actor editor label. Labels are not unique, so a label naming several actors is refused; pass actorPath then"
       },
       {
         "name": "actorPath",
         "type": "string",
         "required": false,
-        "description": "Full actor object path; the unambiguous selector"
+        "description": "Full actor object path, the unambiguous selector; wins over actorLabel"
       },
       {
         "name": "simulate",
@@ -342,21 +344,11 @@ export const handlerSpecs: HandlerSpecs = {
   }
 };
 
-/** The Params: clause of each spec'd bridge method. */
-export const paramsClauses: Readonly<Record<string, string>> = {
-  add_impulse: "Params: actorLabel OR actorPath, impulse (or force, or vector), mode?, componentName?, boneName?, location?, velChange?, accelChange?, world?, pieInstance?",
-  set_collision: "Params: actorLabel OR actorPath OR assetPath, componentName?, collisionProfile?, collisionEnabled?, objectType?, responseToAllChannels?, responses?",
-  set_collision_enabled: "Params: actorLabel OR actorPath, collisionEnabled (or collisionType)",
-  set_collision_profile: "Params: actorLabel OR actorPath, profileName",
-  set_physics_properties: "Params: actorLabel OR actorPath, mass?, linearDamping?, angularDamping?, enableGravity?",
-  set_simulate_physics: "Params: actorLabel OR actorPath, simulate (or enabled)",
-};
-
 /** Every key the spec'd physics handlers declare, aliases included. */
 export const schema: Record<string, z.ZodType> = {
   accelChange: z.boolean().optional().describe("Treat the force as an acceleration change"),
-  actorLabel: z.string().optional().describe("Actor editor label; pass actorLabel or actorPath"),
-  actorPath: z.string().optional().describe("Full actor object path; the unambiguous selector"),
+  actorLabel: z.string().optional().describe("Actor editor label. Labels are not unique, so a label naming several actors is refused; pass actorPath then"),
+  actorPath: z.string().optional().describe("Full actor object path, the unambiguous selector; wins over actorLabel"),
   angularDamping: z.number().optional().describe("Angular damping"),
   assetPath: z.string().optional().describe("Blueprint whose component template to edit; needs componentName"),
   boneName: z.string().optional().describe("Physics bone to push"),
@@ -373,7 +365,7 @@ export const schema: Record<string, z.ZodType> = {
   mass: z.number().optional().describe("Mass override in kg"),
   mode: z.string().optional().describe("impulse (default) | force"),
   objectType: z.string().optional().describe("Object-type channel name, e.g. WorldStatic, Pawn, ECC_GameTraceChannel1"),
-  pieInstance: z.number().optional().describe("PIE world instance (0 = server/primary); omit for the primary world"),
+  pieInstance: z.number().int().min(0).optional().describe("PIE world instance (0 = server/primary); omit for the primary world"),
   profileName: z.string().optional().describe("Collision profile (preset) name"),
   responses: z.record(z.string(), z.unknown()).optional().describe("Per-channel responses, {channelName: Block | Overlap | Ignore}"),
   responseToAllChannels: z.string().optional().describe("Block | Overlap | Ignore, applied to every channel before the per-channel responses"),
@@ -384,4 +376,4 @@ export const schema: Record<string, z.ZodType> = {
 };
 
 /** Declare an action for a spec'd bridge method: effect, summary, method. */
-export const specBp = makeSpecBp(paramsClauses, handlerSpecs);
+export const specBp = makeSpecBp(handlerSpecs);

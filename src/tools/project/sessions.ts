@@ -1,5 +1,6 @@
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
 import { checkPluginFreshness } from "../../editor/bridge-freshness.js";
-import { checkBridgeParity, deployedPlugin, freshnessWarning, pluginStaleness, recordedPluginSpecs } from "../../bridge/bridge-parity.js";
+import { checkBridgeParity, deployedPlugin, freshnessWarning, pluginStaleness, recordedPluginSpecs } from "./bridge-parity.js";
 import * as fs from "node:fs";
 import { attach, attachSummary } from "../../editor/deployer.js";
 import { collapsingEnvWarnings } from "../../config/session-env.js";
@@ -10,10 +11,11 @@ import { CLIENT_PROTOCOL_VERSION, describeProtocolMismatch } from "../../bridge/
 import { readLogState, readEngineSnapshot } from "../../editor/engine-observer.js";
 import { switchProject, isTargetDiverged } from "../../sessions/project-switch.js";
 import { ueMcpConfigRejections, describeConfigRejections } from "../../config/project.js";
-import type { ToolContext, ActionSpec } from "../../core/types.js";
+import type { ToolContext, ActionSpec } from "../../surface/tool-types.js";
 import type { EditorSession } from "../../sessions/session.js";
 import { toolGraphOf } from "../../surface/target-params.js";
-import { startProgress } from "../../cli/ui/progress.js";
+import { startProgress } from "../../terminal/progress.js";
+import { epicIntegrations } from "../../integrations/epic/project-status.js";
 
 /**
  * The environment variables flattening every registered editor into one, right
@@ -56,12 +58,36 @@ function sessionStaleness(ctx: ToolContext, s: EditorSession): Record<string, un
   };
 }
 
+/**
+ * Epic's Unreal MCP server for the session's project when it will be listening
+ * beside ue-mcp, read from the settings files; undefined otherwise, or when
+ * they cannot be read, so the common response is unchanged (#1826).
+ */
+function besideUnrealMcpServer(ctx: ToolContext, bridgePort: number): Record<string, unknown> | undefined {
+  if (!ctx.project.isLoaded || !ctx.project.projectPath) return undefined;
+  try {
+    const s = epicIntegrations(ctx.project, bridgePort).unrealMcp;
+    if (!s?.runsBeside) return undefined;
+    return {
+      url: s.url,
+      autoStartSource: s.autoStartSource,
+      portSource: s.portSource,
+      portConflicts: s.portConflicts.length > 0 ? s.portConflicts : undefined,
+      note: "Epic's MCP server starts with this editor beside ue-mcp. `ue-mcp init --yes --no-unreal-mcp-autostart` turns that off for this project; --unreal-mcp-port <n> moves it.",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Editor sessions: status, the project this session drives, and the editors the server holds. */
 export const sessionActions: Record<string, ActionSpec> = {
   get_status: {
     kind: "handler",
     effect: "read",
-    description: "Check server mode and editor connection. pluginStale is the primary staleness verdict: from the running plugin's own handler list when it published one (pluginStaleSource 'parity'), else from build timestamps ('build-timestamps'). pluginBuildStale reports the compiled bridge being older than its source, read from disk. deployedPlugin is what the binary that answered says about itself: when it was built, and how many methods this server advertises that it does not register, which is what 'Unknown method' on a real action means. answeringPid is the editor process the bridge is connected to; projectEditors and projectEditorsWarning appear when several editor processes (headless included) hold the project, and every response then carries the answering pid. Params: none (#785, #1002, #1021, #1150)",
+    offline: "Reports the connection state, and reads the editor's own log and status snapshot off disk when there is no live bridge to ask.",
+    params: {},
+    description: "Check server mode and editor connection. pluginStale is the primary staleness verdict: from the running plugin's own handler list when it published one (pluginStaleSource 'parity'), else from build timestamps ('build-timestamps'). pluginBuildStale reports the compiled bridge being older than its source, read from disk. deployedPlugin is what the binary that answered says about itself: when it was built, and how many methods this server advertises that it does not register, which is what 'Unknown method' on a real action means. answeringPid is the editor process the bridge is connected to; projectEditors and projectEditorsWarning appear when several editor processes (headless included) hold the project, and every response then carries the answering pid. unrealMcpServer appears when Epic's own Unreal MCP server (UE 5.8+) is set to start with this project's editor, with its URL and where that came from, because it then runs beside ue-mcp. (#785, #1002, #1021, #1150, #1826)",
     handler: async (ctx) => {
       const flows = ctx.getFlows?.() ?? [];
       const bridgeApiVersion = ctx.project.projectDir
@@ -119,6 +145,7 @@ export const sessionActions: Record<string, ActionSpec> = {
       const holders = await detectProjectHolders(ctx.project.projectDir, ctx.project.projectPath, answeringPid);
 
       const stale = pluginStaleness(parity, freshness);
+      const unrealMcpServer = besideUnrealMcpServer(ctx, target.port);
       return {
         engine: offlineEngine ?? undefined,
         // Parity first (6.4): read from the running binary's handler list.
@@ -180,6 +207,8 @@ export const sessionActions: Record<string, ActionSpec> = {
         // matches a flow's name/description, prefer flow(action="run")
         // over composing the sequence by hand. See SERVER_INSTRUCTIONS.
         flows: flows.length > 0 ? flows : undefined,
+        // #1826: absent unless Epic's server starts with this editor too.
+        unrealMcpServer,
         // #817: only beyond one editor, so a single-editor status response
         // is exactly what it has always been.
         editors: ctx.sessions && ctx.sessions.size > 1
@@ -191,7 +220,9 @@ export const sessionActions: Record<string, ActionSpec> = {
   set_project: {
     kind: "handler",
     effect: "mutate",
-    description: "Switch project: moves both path resolution and the editor connection to the new .uproject. Params: projectPath",
+    offline: "Retargets path resolution and the bridge socket, then reports whether the new target answered.",
+    params: { required: ["projectPath"] },
+    description: "Switch project: moves both path resolution and the editor connection to the new .uproject.",
     handler: async (ctx, p) => {
       const projectPath = p.projectPath as string;
       if (!projectPath) throw new Error("Missing 'projectPath'");
@@ -242,7 +273,10 @@ export const sessionActions: Record<string, ActionSpec> = {
   list_editors: {
     kind: "handler",
     effect: "read",
-    description: "List every editor session this server drives: name, project, bridge port, whether the socket is connected, whether anything is answering on that port, and which session untargeted calls fall through to. Params: none (#817)",
+    offline: "Lists registered sessions and probes each bridge port from outside.",
+    addressesServer: true,
+    params: {},
+    description: "List every editor session this server drives: name, project, bridge port, whether the socket is connected, whether anything is answering on that port, and which session untargeted calls fall through to. (#817)",
     handler: async (ctx) => {
       if (!ctx.sessions) {
         return {
@@ -291,7 +325,15 @@ export const sessionActions: Record<string, ActionSpec> = {
   use_editor: {
     kind: "handler",
     effect: "mutate",
-    description: "Make one editor session the default target for untargeted calls. Does not change the session set and never touches any editor process. Params: editorTarget (session name, project name, or .uproject path) (#817)",
+    offline: "Changes which registered session is the default.",
+    addressesServer: true,
+    params: {
+      required: ["editorTarget"],
+      notes: {
+        editorTarget: "session name, project name, or .uproject path",
+      },
+    },
+    description: "Make one editor session the default target for untargeted calls. Does not change the session set and never touches any editor process. (#817)",
     handler: async (ctx, p) => {
       if (!ctx.sessions) throw new Error("This server drives one editor; there is nothing to switch between.");
       const target = p.editorTarget as string;
@@ -309,7 +351,18 @@ export const sessionActions: Record<string, ActionSpec> = {
   add_editor: {
     kind: "handler",
     effect: "mutate",
-    description: "Register another project as an addressable editor session, with its own bridge connection and port. Optionally launch its editor. Every category then accepts editor=\"<name>\" to run a call there. Params: projectPath, editorName? (defaults to the project name), start? (launch the editor and wait for it to be ready), timeout? (seconds, default 300) (#817)",
+    offline: "Registers a session and attaches the plugin on disk. The connection attempt is allowed to fail.",
+    addressesServer: true,
+    params: {
+      required: ["projectPath"],
+      optional: ["editorName", "start", "timeout"],
+      notes: {
+        editorName: "defaults to the project name",
+        start: "launch the editor and wait for it to be ready",
+        timeout: "seconds, default 300",
+      },
+    },
+    description: "Register another project as an addressable editor session, with its own bridge connection and port. Optionally launch its editor. Every category then accepts editor=\"<name>\" to run a call there. (#817)",
     handler: async (ctx, p) => {
       if (!ctx.sessions) throw new Error("This server was built without a session registry.");
       const projectPath = p.projectPath as string;
@@ -381,9 +434,12 @@ export const sessionActions: Record<string, ActionSpec> = {
   drop_editor: {
     kind: "handler",
     effect: "mutate",
+    offline: "Forgets a session and closes its socket. The editor process is left running.",
+    addressesServer: true,
     // Detaches; the editor and its project are untouched.
     destructive: false,
-    description: "Forget an editor session and close its bridge socket. The editor process is LEFT RUNNING and untouched - this detaches, it does not stop anything (use editor(stop_editor) for that). Params: editorTarget (#817)",
+    params: { required: ["editorTarget"] },
+    description: "Forget an editor session and close its bridge socket. The editor process is LEFT RUNNING and untouched - this detaches, it does not stop anything (use editor(stop_editor) for that). (#817)",
     handler: async (ctx, p) => {
       if (!ctx.sessions) throw new Error("This server drives one editor; there is nothing to drop.");
       const target = p.editorTarget as string;
@@ -402,7 +458,9 @@ export const sessionActions: Record<string, ActionSpec> = {
   get_info: {
     kind: "handler",
     effect: "read",
-    description: "Read .uproject file details. Params: none",
+    offline: "Reads the .uproject file.",
+    params: {},
+    description: "Read .uproject file details.",
     handler: async (ctx) => {
       ctx.project.ensureLoaded();
       return { projectName: ctx.project.projectName, engineAssociation: ctx.project.engineAssociation, contentDir: ctx.project.contentDir, uprojectContents: JSON.parse(fs.readFileSync(ctx.project.projectPath!, "utf-8")) };

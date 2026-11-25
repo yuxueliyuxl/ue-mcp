@@ -2,9 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ToolContext, ElicitFn, ElicitResult, PluginInfo } from "../../src/core/types.js";
+import type { ToolContext, PluginInfo } from "../../src/surface/tool-types.js";
+import type { ElicitFn, ElicitResult } from "../../src/core/elicit.js";
 import { isDirectiveResponse } from "../../src/core/directive.js";
-import { clearWorkarounds } from "../../src/dispatch/workaround-tracker.js";
+import { clearWorkarounds } from "../../src/tools/editor/workaround-tracker.js";
 import type { RegistryPlugin } from "../../src/extensions/registry-catalog.js";
 
 /**
@@ -40,11 +41,12 @@ vi.mock("../../src/feedback/github-app.js", () => ({
 }));
 
 const mockReadUserAuth = vi.fn();
-vi.mock("../../src/feedback/github-auth.js", () => ({
+vi.mock("../../src/github/auth.js", () => ({
   readUserAuth: () => mockReadUserAuth(),
 }));
 
 const { feedbackTool } = await import("../../src/tools/feedback.js");
+const { ALL_TOOLS } = await import("../../src/tools.js");
 const { clearCoreSurfaceCache } = await import("../../src/feedback/feedback-routing.js");
 
 const RECORDER_REPO = { owner: "db-lyon", repo: "sample-recorder" };
@@ -77,6 +79,8 @@ function makeCtx(elicit?: ElicitFn, plugins: PluginInfo[] = []): ToolContext {
     project: { projectName: null, projectDir: null, config: {} } as never,
     elicit,
     getPlugins: () => plugins,
+    // The categories a report is labelled with come from the session's graph.
+    getToolGraph: () => ALL_TOOLS,
   };
 }
 

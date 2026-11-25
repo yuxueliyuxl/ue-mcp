@@ -5,12 +5,16 @@
 
 #include "AssetHandlers.h"
 #include "AssetHandlers_TextureSettings.h"
+#include "HandlerTextureSamplers.h"
 #include "../Material/MaterialHandlers.h"
 #include "Materials/MaterialInstance.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerAssetCreate.h"
+#include "HandlerAssetDelete.h"
+#include "PackageTools.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 #include "HandlerJsonProperty.h"
 #include "JsonSerializer.h"
 #include "AssetToolsModule.h"
@@ -26,6 +30,8 @@
 #include "Factories/TextureFactory.h"
 #include "Factories/ReimportTextureFactory.h"
 #include "Factories/CSVImportFactory.h"
+#include "EditorFramework/AssetImportData.h"
+#include "HandlerLogCapture.h"
 #include "EditorReimportHandler.h"
 #include "Curves/RichCurve.h"
 #include "Curves/SimpleCurve.h"
@@ -503,7 +509,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportSkeletalMesh(const TSharedPtr<FJson
 	FString Importer = OptionalString(Params, TEXT("importer"), TEXT("auto")).ToLower();
 	if (Importer == TEXT("auto"))
 	{
-#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+#if UE_MCP_HAS_5_8_API
 		Importer = TEXT("interchange");
 #else
 		Importer = TEXT("legacy");
@@ -514,7 +520,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportSkeletalMesh(const TSharedPtr<FJson
 	if (!FPaths::FileExists(FileName)) return MCPError(TEXT("File not found: ") + FileName);
 	const FString Destination = DestinationPath / AssetName;
 	if (AssetName.IsEmpty() || AssetName.Contains(TEXT("/")) || AssetName.Contains(TEXT(".")) || !FPackageName::IsValidLongPackageName(Destination)) return MCPError(TEXT("Invalid mesh destination: ") + Destination);
-	if (MCPIsProtectedAssetPath(Destination)) return MCPError(TEXT("Cannot import to a protected mount"));
+	if (MCPIsProtectedAssetPath(Destination)) return MCPError(TEXT("Cannot import to a protected mount. This cannot be overridden; import into /Game or a plugin content folder."));
 	if (UObject* Existing = MCPLoadAssetObject(Destination))
 	{
 		if (!bReplaceExisting) return MCPError(TEXT("Destination exists and replaceExisting is false: ") + Destination);
@@ -543,7 +549,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportSkeletalMesh(const TSharedPtr<FJson
 	{
 		UClass* PipelineClass = LoadClass<UObject>(nullptr, TEXT("/Script/InterchangePipelines.InterchangeGenericAssetsPipeline"));
 		UClass* OverrideClass = LoadClass<UObject>(nullptr, TEXT("/Script/InterchangeEngine.InterchangePipelineStackOverride"));
-		if (!PipelineClass || !OverrideClass) return MCPError(TEXT("Interchange import is unavailable; enable the Interchange Editor plugin"));
+		if (!PipelineClass || !OverrideClass) return MCPPluginUnavailableError(TEXT("Interchange import"), TEXT("InterchangeEditor"));
 		UObject* Pipeline = NewObject<UObject>(GetTransientPackage(), PipelineClass);
 		UObject* Stack = NewObject<UObject>(GetTransientPackage(), OverrideClass);
 		Roots.Add(MakeUnique<FGCRootScope>(Pipeline));
@@ -728,7 +734,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportAnimation(const TSharedPtr<FJsonObj
 	if (bHasFile) Files.Add(SingleFile);
 	else Files = JsonArrayToStringList(FilesArr);
 	if (Files.Num() == 0) return MCPError(TEXT("filePaths is empty"));
-	if (Files.Num() > 200) return MCPError(FString::Printf(TEXT("filePaths holds %d files; the limit is 200"), Files.Num()));
+	if (Files.Num() > 200) return MCPBatchTooLargeError(FString::Printf(TEXT("filePaths holds %d files; the limit is 200"), Files.Num()), 200);
 	if (bHasFiles && !AssetName.IsEmpty())
 	{
 		return MCPError(TEXT("name applies to a single filePath; a batch names each asset after its file"));
@@ -877,6 +883,139 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportAnimation(const TSharedPtr<FJsonObj
 // ships. The factory class is resolved at runtime, so no module dependency.
 // factoryProperties is how a caller turns off a factory's own options dialog,
 // which unattended mode would otherwise cancel along with the import.
+/**
+ * A DataTable's rows from CSV, without the DataTable Options dialog.
+ *
+ * Dropping a .csv on the Content Browser asks for a row type and three import
+ * options in a modal (SCSVImportOptions): Ignore Extra Fields, Ignore Missing
+ * Fields and Import Key Field. These carry the same three as parameters and
+ * hand the text to the engine's own CSV reader, UDataTable::
+ * CreateTableFromCSVString, which is what the dialog's Apply ends in. The
+ * options are set on the table the way the dialog sets them (the factory
+ * copies them onto the new table), so a later reimport keeps them.
+ *
+ * Named namespace, for the unity build: an anonymous one merges with every
+ * other file of the blob.
+ */
+namespace MCPDataTableCsv
+{
+	struct FImportOptions
+	{
+		bool bHasIgnoreExtraFields = false;
+		bool bIgnoreExtraFields = false;
+		bool bHasIgnoreMissingFields = false;
+		bool bIgnoreMissingFields = false;
+		bool bHasImportKeyField = false;
+		FString ImportKeyField;
+
+		bool IsSet() const { return bHasIgnoreExtraFields || bHasIgnoreMissingFields || bHasImportKeyField; }
+	};
+
+	static FImportOptions ReadOptions(const TSharedPtr<FJsonObject>& Params)
+	{
+		FImportOptions Options;
+		Options.bHasIgnoreExtraFields = TryGetBoolParam(Params, TEXT("ignoreExtraFields"), Options.bIgnoreExtraFields);
+		Options.bHasIgnoreMissingFields = TryGetBoolParam(Params, TEXT("ignoreMissingFields"), Options.bIgnoreMissingFields);
+		Options.bHasImportKeyField = TryGetStringParam(Params, TEXT("importKeyField"), Options.ImportKeyField);
+		return Options;
+	}
+
+	/** Set the options on the table, as the dialog's details panel sets them. */
+	static void Apply(UDataTable* Table, const FImportOptions& Options)
+	{
+		if (Options.bHasIgnoreExtraFields) Table->bIgnoreExtraFields = Options.bIgnoreExtraFields;
+		if (Options.bHasIgnoreMissingFields) Table->bIgnoreMissingFields = Options.bIgnoreMissingFields;
+		if (Options.bHasImportKeyField) Table->ImportKeyField = Options.ImportKeyField;
+	}
+
+	/** The options as the table now holds them, for the response. */
+	static TSharedPtr<FJsonObject> Describe(const UDataTable* Table)
+	{
+		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		Out->SetBoolField(TEXT("ignoreExtraFields"), Table->bIgnoreExtraFields);
+		Out->SetBoolField(TEXT("ignoreMissingFields"), Table->bIgnoreMissingFields);
+		Out->SetStringField(TEXT("importKeyField"), Table->ImportKeyField);
+		return Out;
+	}
+
+	/**
+	 * The CSV text a call names: csvString, or a .csv file at filePath. Returns
+	 * an error value on failure; on success OutCsv holds the text and
+	 * OutSourceFile the file it came from, if any.
+	 */
+	static TSharedPtr<FJsonValue> LoadCsv(bool bHasCsvString, const FString& CsvString, bool bHasFilePath, const FString& FilePath,
+		FString& OutCsv, FString& OutSourceFile)
+	{
+		OutSourceFile.Reset();
+		if (bHasCsvString)
+		{
+			OutCsv = CsvString;
+			return nullptr;
+		}
+		if (!bHasFilePath) return MCPError(TEXT("Missing csvString or filePath"));
+		if (!FPaths::GetExtension(FilePath).Equals(TEXT("csv"), ESearchCase::IgnoreCase))
+		{
+			return MCPError(FString::Printf(TEXT("filePath must name a .csv file; got %s"), *FilePath));
+		}
+		if (!FPaths::FileExists(FilePath)) return MCPError(FString::Printf(TEXT("File not found: %s"), *FilePath));
+		if (!FFileHelper::LoadFileToString(OutCsv, *FilePath))
+		{
+			return MCPError(FString::Printf(TEXT("Failed to read file: %s"), *FilePath));
+		}
+		OutSourceFile = FPaths::ConvertRelativePathToFull(FilePath);
+		return nullptr;
+	}
+
+	/** Replace the table's rows from the CSV. Returns the importer's problems. */
+	static TArray<FString> Import(UDataTable* Table, const FString& Csv, const FImportOptions& Options, const FString& SourceFile)
+	{
+		Table->Modify();
+		Apply(Table, Options);
+		TArray<FString> Problems = Table->CreateTableFromCSVString(Csv);
+		if (!SourceFile.IsEmpty() && Table->AssetImportData)
+		{
+			// What the factory records, so asset(reimport_asset) finds the file again.
+			Table->AssetImportData->Update(SourceFile);
+		}
+		Table->MarkPackageDirty();
+		return Problems;
+	}
+
+	static TArray<TSharedPtr<FJsonValue>> ProblemsJson(const TArray<FString>& Problems)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		for (const FString& Problem : Problems)
+		{
+			Out.Add(MakeShared<FJsonValueString>(Problem));
+		}
+		return Out;
+	}
+
+	/**
+	 * The problems UCSVImportFactory logged for an import: it writes each as
+	 * "<n>:<problem>" to LogCSVImportFactory and, unattended, shows nothing
+	 * else, so the log is the only place they reach.
+	 */
+	static TArray<FString> FactoryProblems(const TArray<FMCPScopedLogCapture::FLine>& Lines)
+	{
+		TArray<FString> Out;
+		for (const FMCPScopedLogCapture::FLine& Line : Lines)
+		{
+			int32 Colon = INDEX_NONE;
+			if (!Line.Message.FindChar(TEXT(':'), Colon) || Colon == 0) continue;
+			const FString Number = Line.Message.Left(Colon);
+			if (!Number.IsNumeric()) continue;
+			Out.Add(Line.Message.Mid(Colon + 1).TrimStartAndEnd());
+		}
+		for (const FMCPScopedLogCapture::FLine& Line : Lines)
+		{
+			// The factory's own refusal, logged as an error, is a problem too.
+			if (Line.Verbosity == TEXT("Error")) Out.AddUnique(Line.Message.TrimStartAndEnd());
+		}
+		return Out;
+	}
+}
+
 TSharedPtr<FJsonValue> FAssetHandlers::ImportFile(const TSharedPtr<FJsonObject>& Params)
 {
 	FString FileName;
@@ -894,6 +1033,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportFile(const TSharedPtr<FJsonObject>&
 	// An import that is never written is lost on editor close, so it saves by default like every create (#1280).
 	const bool bSaveImported = OptionalBool(Params, TEXT("save"), true);
 	const FString AssetName = OptionalString(Params, TEXT("name"));
+	const FString RowStructSpec = OptionalString(Params, TEXT("rowStruct"));
+	const MCPDataTableCsv::FImportOptions CsvOptions = MCPDataTableCsv::ReadOptions(Params);
 
 	DestinationPath.RemoveFromEnd(TEXT("/"));
 	if (MCPIsProtectedAssetPath(DestinationPath)) return MCPProtectedPathError(DestinationPath);
@@ -901,6 +1042,12 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportFile(const TSharedPtr<FJsonObject>&
 	if (!FPaths::FileExists(FileName))
 	{
 		return MCPError(FString::Printf(TEXT("File not found: %s"), *FileName));
+	}
+
+	const bool bCsvFile = FPaths::GetExtension(FileName).Equals(TEXT("csv"), ESearchCase::IgnoreCase);
+	if ((!RowStructSpec.IsEmpty() || CsvOptions.IsSet()) && !bCsvFile)
+	{
+		return MCPError(TEXT("rowStruct, ignoreExtraFields, ignoreMissingFields and importKeyField describe a .csv import into a DataTable; this file is not a .csv."));
 	}
 
 	UFactory* Factory = nullptr;
@@ -932,6 +1079,76 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportFile(const TSharedPtr<FJsonObject>&
 		{
 			return MCPError(FString::Printf(TEXT("%s does not import .%s files. It accepts: %s"),
 				*FactoryClass->GetName(), *Ext, *FString::Join(Extensions, TEXT(", "))));
+		}
+	}
+
+	// A .csv into a DataTable. The factory asks for the row type in its
+	// DataTable Options dialog unless it is told it, and unattended import
+	// cancels that dialog and the import with it. So the row type is given
+	// (rowStruct), or taken from the DataTable already at the destination,
+	// and an unattended .csv import with neither is refused here rather than
+	// left to produce nothing.
+	UScriptStruct* CsvRowStruct = nullptr;
+	UDataTable* ExistingCsvTable = nullptr;
+	const bool bCsvFactory = bCsvFile && (!Factory || Factory->IsA<UCSVImportFactory>());
+	if (bCsvFactory)
+	{
+		const FString DestName = AssetName.IsEmpty() ? FPaths::GetBaseFilename(FileName) : AssetName;
+		ExistingCsvTable = LoadAssetByPath<UDataTable>(FString::Printf(TEXT("%s/%s.%s"), *DestinationPath, *DestName, *DestName));
+		if (!RowStructSpec.IsEmpty())
+		{
+			if (!bAutomated)
+			{
+				return MCPError(TEXT("rowStruct answers the DataTable Options dialog and automated=false asks for it: pass one or the other."));
+			}
+			FString ResolveError;
+			CsvRowStruct = MCPResolveScriptStruct(RowStructSpec, &ResolveError);
+			if (!CsvRowStruct)
+			{
+				return MCPError(ResolveError.IsEmpty() ? FString::Printf(TEXT("Row struct not found: %s"), *RowStructSpec) : ResolveError);
+			}
+		}
+		else if (bAutomated && ExistingCsvTable && ExistingCsvTable->RowStruct)
+		{
+			CsvRowStruct = ExistingCsvTable->RowStruct;
+		}
+		if (bAutomated && !CsvRowStruct && !bHasFactoryProperties)
+		{
+			return MCPError(
+				TEXT("A .csv becomes a DataTable only with a row type, which the importer otherwise asks for in its DataTable Options dialog, ")
+				TEXT("and an unattended import cancels that dialog. Pass rowStruct (and ignoreExtraFields, ignoreMissingFields, importKeyField as the dialog offers), ")
+				TEXT("or use asset(create_datatable) or asset(reimport_datatable) with csvString or filePath. For a CurveTable or curve, pass ")
+				TEXT("factoryClass=CSVImportFactory with factoryProperties AutomatedImportSettings."));
+		}
+		if (CsvRowStruct)
+		{
+			if (!Factory)
+			{
+				Factory = NewObject<UCSVImportFactory>(GetTransientPackage());
+			}
+			UCSVImportFactory* CsvFactory = CastChecked<UCSVImportFactory>(Factory);
+			CsvFactory->AutomatedImportSettings.ImportType = ECSVImportType::ECSV_DataTable;
+			CsvFactory->AutomatedImportSettings.ImportRowStruct = CsvRowStruct;
+			if (CsvOptions.IsSet())
+			{
+				// A replaced table's own options win inside the factory, so
+				// they are set on it; a new one takes them from the factory's
+				// option table, as the dialog's details panel hands them over.
+				if (ExistingCsvTable)
+				{
+					ExistingCsvTable->Modify();
+					MCPDataTableCsv::Apply(ExistingCsvTable, CsvOptions);
+				}
+				else
+				{
+					CsvFactory->DataTableImportOptions = NewObject<UDataTable>(CsvFactory);
+					MCPDataTableCsv::Apply(CsvFactory->DataTableImportOptions, CsvOptions);
+				}
+			}
+		}
+		else if (CsvOptions.IsSet())
+		{
+			return MCPError(TEXT("ignoreExtraFields, ignoreMissingFields and importKeyField need rowStruct (or a DataTable at the destination to take it from)."));
 		}
 	}
 	FGCRootScope FactoryRoot(Factory);
@@ -970,7 +1187,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportFile(const TSharedPtr<FJsonObject>&
 	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
 	TArray<UAssetImportTask*> Tasks;
 	Tasks.Add(Task);
-	AssetToolsModule.Get().ImportAssetTasks(Tasks);
+	TArray<FString> CsvProblems;
+	{
+		// The CSV importer reports its problems only to the log when unattended.
+		FMCPScopedLogCapture CsvLog({ TEXT("LogCSVImportFactory") });
+		AssetToolsModule.Get().ImportAssetTasks(Tasks);
+		if (bCsvFactory) CsvProblems = MCPDataTableCsv::FactoryProblems(CsvLog.GetLines());
+	}
 
 	TArray<TSharedPtr<FJsonValue>> ImportedPaths;
 	TArray<TSharedPtr<FJsonValue>> ImportedRows;
@@ -1012,12 +1235,27 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportFile(const TSharedPtr<FJsonObject>&
 		Result->SetBoolField(TEXT("success"), false);
 		Result->SetStringField(TEXT("error"), TEXT("The import produced assets, but at least one could not be saved; its row carries saveError."));
 	}
+	if (CsvRowStruct)
+	{
+		Result->SetStringField(TEXT("rowStruct"), CsvRowStruct->GetPathName());
+	}
+	if (bCsvFactory)
+	{
+		Result->SetArrayField(TEXT("problems"), MCPDataTableCsv::ProblemsJson(CsvProblems));
+		if (CsvProblems.Num() > 0 && ImportedPaths.Num() > 0)
+		{
+			Result->SetBoolField(TEXT("success"), false);
+			Result->SetStringField(TEXT("error"), FString::Printf(
+				TEXT("The CSV import produced the asset but reported %d problem(s); see problems."), CsvProblems.Num()));
+		}
+	}
 	if (ImportedPaths.Num() == 0)
 	{
-		Result->SetStringField(TEXT("error"),
-			TEXT("Import task completed but no assets were produced. A factory that raises its own options dialog is cancelled in ")
-			TEXT("unattended mode: set the property that makes it use the supplied options through factoryProperties. ")
-			TEXT("The output log carries the factory's reason."));
+		Result->SetStringField(TEXT("error"), CsvProblems.Num() > 0
+			? FString::Printf(TEXT("Import produced no assets. The CSV importer said: %s"), *FString::Join(CsvProblems, TEXT(" | ")))
+			: FString(TEXT("Import task completed but no assets were produced. A factory that raises its own options dialog is cancelled in ")
+				TEXT("unattended mode: set the property that makes it use the supplied options through factoryProperties. ")
+				TEXT("The output log carries the factory's reason.")));
 	}
 
 	EmitImportedAssetsRollback(Result, ImportedPaths);
@@ -1091,6 +1329,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetTextureProperties(const TSharedPtr<FJs
 	const bool bBatch = TryGetArrayParam(Params, TEXT("assetPaths"), Paths);
 	const bool bSave = OptionalBool(Params, TEXT("save"), false);
 	const bool bDryRun = OptionalBool(Params, TEXT("dryRun"), false);
+	const bool bFixSamplers = OptionalBool(Params, TEXT("fixSamplers"), true);
 	TSharedPtr<FJsonObject> Settings;
 	FString Error;
 	if (!AssetTextureSettings::Parse(Params, Settings, Error)) return MCPError(Error);
@@ -1190,6 +1429,245 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetTextureProperties(const TSharedPtr<FJs
 		Result->SetStringField(TEXT("rollbackNote"), TEXT("Restores only the requested settings on each texture, using the same save choice."));
 	}
 	else Result->SetBoolField(TEXT("unchanged"), true);
+
+	// The materials sampling these textures, once for the whole batch (#1994).
+	TArray<UTexture*> Changed;
+	for (UTexture2D* Texture : Textures) Changed.Add(Texture);
+	if (!bDryRun)
+	{
+		MCPTextureSamplers::UpdateMaterialsForTextures(Result, Changed, bFixSamplers, false, bSave);
+		return MCPResult(Result);
+	}
+	// A dry run judges the samplers against the requested settings: the fields the sampler type is read
+	// from are set in memory for the check and put back before anything else can see them.
+	struct FSavedSettings
+	{
+		TEnumAsByte<TextureCompressionSettings> Compression;
+		TEnumAsByte<TextureGroup> LodGroup;
+		bool bSRGB, bNeverStream, bFlipGreen;
+		int32 MaxSize;
+	};
+	TArray<FSavedSettings> Saved;
+	for (UTexture2D* Texture : Textures)
+	{
+		Saved.Add({ Texture->CompressionSettings, Texture->LODGroup, Texture->SRGB != 0, Texture->NeverStream != 0, Texture->bFlipGreenChannel != 0, Texture->MaxTextureSize });
+		AssetTextureSettings::Apply(Texture, Settings);
+	}
+	MCPTextureSamplers::UpdateMaterialsForTextures(Result, Changed, bFixSamplers, true, false);
+	for (int32 Index = 0; Index < Textures.Num(); ++Index)
+	{
+		UTexture2D* Texture = Textures[Index];
+		const FSavedSettings& Was = Saved[Index];
+		Texture->CompressionSettings = Was.Compression;
+		Texture->LODGroup = Was.LodGroup;
+		Texture->SRGB = Was.bSRGB;
+		Texture->NeverStream = Was.bNeverStream;
+		Texture->bFlipGreenChannel = Was.bFlipGreen;
+		Texture->MaxTextureSize = Was.MaxSize;
+	}
+	return MCPResult(Result);
+}
+
+namespace
+{
+/** Where import_texture_batch keeps the packages it overwrote. restore_texture_import reads nothing outside it. */
+FString MCPTextureImportBackupRoot()
+{
+	return FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("UE_MCP") / TEXT("TextureImportBackups"));
+}
+
+/** The files a package is stored in: <Name>.uasset and the sidecars that share its base name. */
+TArray<FString> MCPPackageFilesIn(const FString& Directory, const FString& BaseName)
+{
+	static const TCHAR* Extensions[] = { TEXT(".uasset"), TEXT(".uexp"), TEXT(".ubulk"), TEXT(".uptnl"), TEXT(".m.ubulk") };
+	TArray<FString> Files;
+	for (const TCHAR* Extension : Extensions)
+	{
+		const FString Candidate = Directory / (BaseName + Extension);
+		if (IFileManager::Get().FileExists(*Candidate)) Files.Add(FString(BaseName + Extension));
+	}
+	return Files;
+}
+
+/** Copies an asset's saved package files into a fresh folder under the backup root and returns that folder,
+ *  or an empty string with the reason. A package with unsaved changes is refused: its file is not the state
+ *  the caller would expect a rollback to restore. */
+FString MCPBackupAssetPackage(const FString& AssetPath, FString& OutError)
+{
+	const FString PackageName = FPackageName::ObjectPathToPackageName(AssetPath);
+	if (UPackage* Loaded = FindPackage(nullptr, *PackageName))
+	{
+		if (Loaded->IsDirty())
+		{
+			OutError = TEXT("The texture had unsaved changes, so its package file is not the state to restore.");
+			return FString();
+		}
+	}
+	FString PackageFile;
+	if (!FPackageName::DoesPackageExist(PackageName, &PackageFile))
+	{
+		OutError = TEXT("The texture has never been saved, so there is no package file to restore.");
+		return FString();
+	}
+	PackageFile = FPaths::ConvertRelativePathToFull(PackageFile);
+	const FString SourceDir = FPaths::GetPath(PackageFile);
+	const FString BaseName = FPackageName::GetShortName(PackageName);
+	const FString BackupDir = MCPTextureImportBackupRoot() / FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	for (const FString& File : MCPPackageFilesIn(SourceDir, BaseName))
+	{
+		if (IFileManager::Get().Copy(*(BackupDir / File), *(SourceDir / File), /*Replace*/ true, /*EvenIfReadOnly*/ true) != COPY_OK)
+		{
+			IFileManager::Get().DeleteDirectory(*BackupDir, /*RequireExists*/ false, /*Tree*/ true);
+			OutError = FString::Printf(TEXT("Could not copy %s to %s."), *(SourceDir / File), *BackupDir);
+			return FString();
+		}
+	}
+	return BackupDir;
+}
+} // namespace
+
+TSharedPtr<FJsonValue> FAssetHandlers::RestoreTextureImport(const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* Items = nullptr;
+	TryGetArrayParam(Params, TEXT("items"), Items);
+	const TArray<TSharedPtr<FJsonValue>>* CreatedAssetPaths = nullptr;
+	TryGetArrayParam(Params, TEXT("createdAssetPaths"), CreatedAssetPaths);
+	if (GEditor && GEditor->PlayWorld)
+	{
+		return MCPErrorWithCode(TEXT("pie_running"), TEXT("Restoring replaced textures is refused while Play In Editor runs. ") + MCPStopPlayInEditorStep());
+	}
+
+	struct FRestore
+	{
+		FString AssetPath;
+		FString PackageName;
+		FString BackupDir;
+		FString TargetDir;
+		FString BaseName;
+		TArray<FString> Files;
+	};
+	TArray<FRestore> Restores;
+	TArray<TSharedPtr<FJsonValue>> Errors;
+	const FString BackupRoot = MCPTextureImportBackupRoot();
+	if (Items)
+	{
+		for (int32 Index = 0; Index < Items->Num(); ++Index)
+		{
+			const TSharedPtr<FJsonObject>* Item = nullptr;
+			FRestore Restore;
+			if (!(*Items)[Index].IsValid() || !(*Items)[Index]->TryGetObject(Item) || !Item || !Item->IsValid()
+				|| !(*Item)->TryGetStringField(TEXT("assetPath"), Restore.AssetPath)
+				|| !(*Item)->TryGetStringField(TEXT("backupDir"), Restore.BackupDir))
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("items[%d] needs assetPath and backupDir"), Index)));
+				continue;
+			}
+			Restore.PackageName = FPackageName::ObjectPathToPackageName(Restore.AssetPath);
+			Restore.BackupDir = FPaths::ConvertRelativePathToFull(Restore.BackupDir);
+			FPaths::NormalizeDirectoryName(Restore.BackupDir);
+			FString Relative = Restore.BackupDir;
+			// Only folders this handler's own import wrote are read, so a payload cannot copy arbitrary files into Content.
+			if (!FPaths::MakePathRelativeTo(Relative, *(BackupRoot / TEXT(""))) || Relative.StartsWith(TEXT("..")) || Relative.Contains(TEXT("/")) || Relative.IsEmpty())
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("items[%d].backupDir is not a folder import_texture_batch wrote under %s"), Index, *BackupRoot)));
+				continue;
+			}
+			FString TargetBase;
+			if (MCPIsProtectedAssetPath(Restore.AssetPath) || !FPackageName::TryConvertLongPackageNameToFilename(Restore.PackageName, TargetBase))
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("items[%d].assetPath '%s' is not a writable package"), Index, *Restore.AssetPath)));
+				continue;
+			}
+			TargetBase = FPaths::ConvertRelativePathToFull(TargetBase);
+			Restore.TargetDir = FPaths::GetPath(TargetBase);
+			Restore.BaseName = FPackageName::GetShortName(Restore.PackageName);
+			Restore.Files = MCPPackageFilesIn(Restore.BackupDir, Restore.BaseName);
+			if (!Restore.Files.Contains(Restore.BaseName + FPackageName::GetAssetPackageExtension()))
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("No saved package for '%s' in %s; it may have been cleaned up"), *Restore.AssetPath, *Restore.BackupDir)));
+				continue;
+			}
+			Restores.Add(MoveTemp(Restore));
+		}
+	}
+
+	// Let go of each loaded package's file so it can be rewritten, then copy the saved files back and reload.
+	FlushAsyncLoading();
+	UAssetEditorSubsystem* Editors = GEditor ? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>() : nullptr;
+	TArray<UPackage*> ToReload;
+	TArray<FString> Scanned;
+	TArray<TSharedPtr<FJsonValue>> Restored;
+	for (const FRestore& Restore : Restores)
+	{
+		UPackage* Package = FindPackage(nullptr, *Restore.PackageName);
+		if (Package)
+		{
+			if (Editors)
+			{
+				if (UObject* Asset = FindObject<UObject>(Package, *Restore.BaseName)) Editors->CloseAllEditorsForAsset(Asset);
+			}
+			ResetLoaders(Package);
+		}
+		for (const FString& Stale : MCPPackageFilesIn(Restore.TargetDir, Restore.BaseName))
+		{
+			if (!Restore.Files.Contains(Stale)) IFileManager::Get().Delete(*(Restore.TargetDir / Stale), false, /*EvenReadOnly*/ true, /*Quiet*/ true);
+		}
+		bool bCopied = true;
+		for (const FString& File : Restore.Files)
+		{
+			const FString Target = Restore.TargetDir / File;
+			if (IFileManager::Get().Copy(*Target, *(Restore.BackupDir / File), /*Replace*/ true, /*EvenIfReadOnly*/ true) != COPY_OK)
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Could not write %s back from %s"), *Target, *Restore.BackupDir)));
+				bCopied = false;
+				break;
+			}
+			Scanned.Add(Target);
+		}
+		if (!bCopied) continue;
+		if (Package) ToReload.Add(Package);
+		Restored.Add(MakeShared<FJsonValueString>(Restore.AssetPath));
+	}
+	FText ReloadError;
+	if (ToReload.Num() > 0)
+	{
+		UPackageTools::ReloadPackages(ToReload, ReloadError, UPackageTools::EReloadPackagesInteractionMode::AssumePositive);
+	}
+	if (Scanned.Num() > 0)
+	{
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().ScanModifiedAssetFiles(Scanned);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Deleted;
+	if (CreatedAssetPaths)
+	{
+		for (int32 Index = CreatedAssetPaths->Num() - 1; Index >= 0; --Index)
+		{
+			FString AssetPath;
+			if (!(*CreatedAssetPaths)[Index].IsValid() || !(*CreatedAssetPaths)[Index]->TryGetString(AssetPath) || MCPIsProtectedAssetPath(AssetPath))
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("createdAssetPaths[%d] is invalid"), Index)));
+				continue;
+			}
+			if (!UEditorAssetLibrary::DoesAssetExist(AssetPath)) continue;
+			bool bRemovedOrphanFile = false;
+			if (MCPDeleteAssetFromDisk(AssetPath, bRemovedOrphanFile)) Deleted.Add(MakeShared<FJsonValueString>(AssetPath));
+			else Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Could not delete created texture '%s'; it may still be referenced"), *AssetPath)));
+		}
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetBoolField(TEXT("success"), Errors.Num() == 0);
+	if (Errors.Num() > 0) Result->SetStringField(TEXT("error"), FString::Printf(TEXT("%d rollback step(s) failed; see errors"), Errors.Num()));
+	if (!ReloadError.IsEmpty()) Result->SetStringField(TEXT("warning"), ReloadError.ToString());
+	Result->SetArrayField(TEXT("restored"), Restored);
+	Result->SetArrayField(TEXT("deleted"), Deleted);
+	Result->SetArrayField(TEXT("errors"), Errors);
+	Result->SetNumberField(TEXT("restoredCount"), Restored.Num());
+	Result->SetNumberField(TEXT("deletedCount"), Deleted.Num());
+	if (Restored.Num() + Deleted.Num() > 0) MCPSetUpdated(Result);
+	else Result->SetBoolField(TEXT("unchanged"), true);
+	MCPSetNoRollback(Result, TEXT("This is the inverse of import_texture_batch. Running the import again redoes it."));
 	return MCPResult(Result);
 }
 
@@ -1230,21 +1708,28 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportTextureBatch(const TSharedPtr<FJson
 		const FString Name = OptionalString(*Item, TEXT("name"), FPaths::GetBaseFilename(FilePath));
 		const FString Destination = Folder / Name;
 		if (Name.IsEmpty() || Name.Contains(TEXT("/")) || Name.Contains(TEXT(".")) || !FPackageName::IsValidLongPackageName(Destination)) return MCPError(TEXT("Invalid texture destination: ") + Destination);
-		if (MCPIsProtectedAssetPath(Destination)) return MCPError(TEXT("Cannot import to a protected mount: ") + Destination);
-		if (UObject* Existing = MCPLoadAssetObject(Destination))
+		if (MCPIsProtectedAssetPath(Destination)) return MCPError(TEXT("Cannot import to a protected mount: ") + Destination + TEXT(". This cannot be overridden; import into /Game or a plugin content folder."));
+		UObject* Existing = MCPLoadAssetObject(Destination);
+		if (Existing)
 		{
 			if (auto Blocked = MCPAssetWriteBlockedError(Existing, Destination, TEXT("import texture"))) return Blocked;
 		}
 		if (Destinations.Contains(Destination.ToLower())) return MCPError(TEXT("Duplicate destination: ") + Destination);
 		Destinations.Add(Destination.ToLower());
-		const bool bExists = UEditorAssetLibrary::DoesAssetExist(Destination);
+		// The asset registry is only one witness. UEditorAssetLibrary answers false during Play In Editor and
+		// while the registry is behind, and a replace reported as a create hands back a rollback that deletes
+		// the asset the call overwrote (#1860). The loaded object and the package file decide it as well.
+		const bool bExists = Existing != nullptr
+			|| FPackageName::DoesPackageExist(Destination)
+			|| UEditorAssetLibrary::DoesAssetExist(Destination);
 		if (bExists && !bReplace) return MCPError(TEXT("Destination exists and replaceExisting is false: ") + Destination);
-		if (bExists && !LoadAssetByPath<UTexture2D>(Destination)) return MCPError(TEXT("Destination is not a Texture2D: ") + Destination);
+		if (bExists && !Cast<UTexture2D>(Existing ? Existing : LoadAssetByPath<UTexture2D>(Destination))) return MCPError(TEXT("Destination is not a Texture2D: ") + Destination);
 		auto Row = MCPSuccess();
 		Row->SetStringField(TEXT("filePath"), FilePath);
 		Row->SetStringField(TEXT("packagePath"), Folder);
 		Row->SetStringField(TEXT("name"), Name);
 		Row->SetBoolField(TEXT("replacedExisting"), bExists);
+		Row->SetBoolField(TEXT("existed"), bExists);
 		Row->SetObjectField(TEXT("requestedSettings"), Parsed);
 		Rows.Add(MakeShared<FJsonValueObject>(Row));
 		Settings.Add(Parsed);
@@ -1262,13 +1747,30 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportTextureBatch(const TSharedPtr<FJson
 		Task->Factory = Factory;
 		Tasks.Add(Task);
 	}
-	if (!bDryRun) FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get().ImportAssetTasks(Tasks);
+	if (!bDryRun)
+	{
+		// Every entry is valid by now. Keep each replaced texture's saved package so the rollback can put the
+		// original back rather than delete it (#1860).
+		for (const auto& RowValue : Rows)
+		{
+			auto Row = RowValue->AsObject();
+			if (!Row->GetBoolField(TEXT("replacedExisting"))) continue;
+			FString BackupError;
+			const FString BackupDir = MCPBackupAssetPackage(Row->GetStringField(TEXT("packagePath")) / Row->GetStringField(TEXT("name")), BackupError);
+			if (BackupDir.IsEmpty()) Row->SetStringField(TEXT("restoreUnavailable"), BackupError);
+			else Row->SetStringField(TEXT("backupDir"), BackupDir);
+		}
+		FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get().ImportAssetTasks(Tasks);
+	}
 	int32 Imported = 0;
 	TArray<TSharedPtr<FJsonValue>> CreatedPaths;
-	bool bReplaced = false;
+	TArray<TSharedPtr<FJsonValue>> RestoreItems;
+	TArray<FString> Unrestorable;
+	int32 ReplacedCount = 0;
 	for (int32 Index = 0; Index < Tasks.Num(); ++Index)
 	{
 		auto Row = Rows[Index]->AsObject();
+		const bool bRowExisted = Row->GetBoolField(TEXT("replacedExisting"));
 		TArray<TSharedPtr<FJsonValue>> ImportedPaths, ReadBack;
 		bool bSaved = bSave;
 		for (UObject* Object : Tasks[Index]->GetObjects())
@@ -1291,8 +1793,21 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportTextureBatch(const TSharedPtr<FJson
 			auto ReadParams = MakeShared<FJsonObject>();
 			ReadParams->SetStringField(TEXT("assetPath"), Texture->GetPathName());
 			ReadBack.Add(ListTextureProperties(ReadParams));
-			if (!Row->GetBoolField(TEXT("replacedExisting"))) CreatedPaths.Add(MakeShared<FJsonValueString>(Texture->GetPathName()));
-			else bReplaced = true;
+			if (!bRowExisted) CreatedPaths.Add(MakeShared<FJsonValueString>(Texture->GetPathName()));
+		}
+		Row->SetBoolField(TEXT("created"), !bRowExisted && ImportedPaths.Num() > 0);
+		if (bRowExisted && ImportedPaths.Num() > 0)
+		{
+			++ReplacedCount;
+			FString BackupDir;
+			if (Row->TryGetStringField(TEXT("backupDir"), BackupDir))
+			{
+				auto Restore = MakeShared<FJsonObject>();
+				Restore->SetStringField(TEXT("assetPath"), Row->GetStringField(TEXT("packagePath")) / Row->GetStringField(TEXT("name")));
+				Restore->SetStringField(TEXT("backupDir"), BackupDir);
+				RestoreItems.Add(MakeShared<FJsonValueObject>(Restore));
+			}
+			else Unrestorable.Add(Row->GetStringField(TEXT("packagePath")) / Row->GetStringField(TEXT("name")));
 		}
 		Row->SetArrayField(TEXT("importedAssets"), ImportedPaths);
 		Row->SetArrayField(TEXT("readBack"), ReadBack);
@@ -1311,17 +1826,41 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportTextureBatch(const TSharedPtr<FJson
 	bool bSuccess = true;
 	for (const auto& Row : Rows) bSuccess &= Row->AsObject()->GetBoolField(TEXT("success"));
 	Result->SetBoolField(TEXT("success"), bSuccess);
+	Result->SetNumberField(TEXT("createdCount"), CreatedPaths.Num());
+	Result->SetNumberField(TEXT("replacedCount"), ReplacedCount);
+	Result->SetBoolField(TEXT("replacedExisting"), ReplacedCount > 0);
+	// created/existed describe the batch: created when any entry made a new texture, existed when every
+	// texture it wrote was already there. updated marks that existing textures were overwritten.
 	if (CreatedPaths.Num() > 0) MCPSetCreated(Result);
-	if (bReplaced) MCPSetUpdated(Result);
-	if (CreatedPaths.Num() > 0)
+	else if (ReplacedCount > 0) MCPSetExisted(Result);
+	if (ReplacedCount > 0) MCPSetUpdated(Result);
+	if (bDryRun || Imported == 0)
+	{
+		MCPSetNoRollback(Result, bDryRun ? TEXT("Dry run: nothing was imported.") : TEXT("No texture was imported, so there is nothing to undo."));
+	}
+	else if (ReplacedCount > 0)
+	{
+		// A replace is undone by putting the saved package back, never by deleting the asset.
+		auto Rollback = MakeShared<FJsonObject>();
+		Rollback->SetArrayField(TEXT("items"), RestoreItems);
+		Rollback->SetArrayField(TEXT("createdAssetPaths"), CreatedPaths);
+		MCPSetRollback(Result, TEXT("restore_texture_import"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), Unrestorable.Num() > 0);
+		FString Note = TEXT("Rollback restores each replaced texture from the package saved before the import and deletes only the textures this call created, subject to referencer checks.");
+		if (Unrestorable.Num() > 0)
+		{
+			Note += TEXT(" These replaced textures had unsaved changes or no package file, so the rollback leaves them as imported rather than delete them: ") + FString::Join(Unrestorable, TEXT(", ")) + TEXT(".");
+		}
+		Result->SetStringField(TEXT("rollbackNote"), Note);
+	}
+	else
 	{
 		auto Rollback = MakeShared<FJsonObject>();
 		Rollback->SetArrayField(TEXT("assetPaths"), CreatedPaths);
 		MCPSetRollback(Result, TEXT("delete_asset_batch"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+		Result->SetStringField(TEXT("rollbackNote"), TEXT("Rollback deletes the textures this call created, subject to referencer checks."));
 	}
-	else Result->SetBoolField(TEXT("rollbackPossible"), false);
-	Result->SetBoolField(TEXT("rollbackLossy"), bReplaced);
-	Result->SetStringField(TEXT("rollbackNote"), TEXT("Rollback deletes only newly created textures, subject to referencer checks. Replaced source pixels cannot be restored; restore those assets from a backup."));
 	return MCPResult(Result);
 }
 
@@ -2109,6 +2648,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::AddCurveTableKey(const TSharedPtr<FJsonOb
 
 TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObject>& Params)
 {
+	// Every parameter is read before anything can fail (#1057).
+	FString CsvString;
+	const bool bHasCsvString = TryGetStringParam(Params, TEXT("csvString"), CsvString) && !CsvString.IsEmpty();
+	FString CsvFile;
+	const bool bHasCsvFile = TryGetStringParam(Params, TEXT("filePath"), CsvFile) && !CsvFile.IsEmpty();
+	const MCPDataTableCsv::FImportOptions CsvOptions = MCPDataTableCsv::ReadOptions(Params);
+
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
@@ -2117,6 +2663,23 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObj
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/DataTables"));
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
+
+	// Read the CSV before anything is created, so a missing file creates nothing.
+	FString Csv;
+	FString CsvSource;
+	const bool bWithRows = bHasCsvString || bHasCsvFile;
+	if (bHasCsvString && bHasCsvFile)
+	{
+		return MCPError(TEXT("Pass csvString or filePath, not both."));
+	}
+	if (bWithRows)
+	{
+		if (auto Err = MCPDataTableCsv::LoadCsv(bHasCsvString, CsvString, bHasCsvFile, CsvFile, Csv, CsvSource)) return Err;
+	}
+	else if (CsvOptions.IsSet())
+	{
+		return MCPError(TEXT("ignoreExtraFields, ignoreMissingFields and importKeyField shape a CSV import; pass csvString or filePath with them."));
+	}
 
 	// #1088: FTableRowBase and /Script/Engine.FTableRowBase are the spellings
 	// callers copy from headers; the UScriptStruct is named TableRowBase.
@@ -2149,6 +2712,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObj
 					ExistingObj->SetStringField(TEXT("rowStruct"), Existing->RowStruct ? Existing->RowStruct->GetName() : TEXT(""));
 					ExistingObj->SetNumberField(TEXT("rowCount"), Existing->GetRowMap().Num());
 				}
+				if (bWithRows)
+				{
+					// An existing table keeps its rows: replacing them is reimport_datatable's job, not a skip's.
+					ExistingObj->SetBoolField(TEXT("rowsImported"), false);
+					ExistingObj->SetStringField(TEXT("note"),
+						TEXT("The table already existed, so the CSV was not imported. Replace its rows with asset(reimport_datatable, csvString or filePath)."));
+				}
 			}
 		}
 		return Created.EarlyReturn;
@@ -2162,6 +2732,27 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObj
 	Result->SetStringField(TEXT("packagePath"), PackagePath);
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("rowStruct"), ScriptStruct->GetName());
+	if (bWithRows)
+	{
+		const TArray<FString> Problems = MCPDataTableCsv::Import(DataTable, Csv, CsvOptions, CsvSource);
+		Result->SetBoolField(TEXT("rowsImported"), true);
+		Result->SetStringField(TEXT("format"), TEXT("csv"));
+		if (!CsvSource.IsEmpty()) Result->SetStringField(TEXT("sourceFile"), CsvSource);
+		Result->SetObjectField(TEXT("importOptions"), MCPDataTableCsv::Describe(DataTable));
+		Result->SetArrayField(TEXT("problems"), MCPDataTableCsv::ProblemsJson(Problems));
+		if (Problems.Num() > 0)
+		{
+			// The table exists and holds whatever rows the importer managed; the
+			// problems say what it could not read, and the inverse still deletes it.
+			Result->SetBoolField(TEXT("success"), false);
+			Result->SetStringField(TEXT("error"), FString::Printf(
+				TEXT("DataTable created, but the CSV import reported %d problem(s); see problems."), Problems.Num()));
+		}
+		FString SaveError;
+		const bool bSaved = SaveAssetPackageChecked(DataTable, SaveError);
+		Result->SetBoolField(TEXT("saved"), bSaved);
+		if (!bSaved) Result->SetStringField(TEXT("saveError"), SaveError);
+	}
 	Result->SetNumberField(TEXT("rowCount"), DataTable ? DataTable->GetRowMap().Num() : 0);
 
 	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
@@ -2485,16 +3076,75 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReimportDataTable(const TSharedPtr<FJsonO
 	const bool bHasJsonString = TryGetStringParam(Params, TEXT("jsonString"), JsonString) && !JsonString.IsEmpty();
 	FString JsonPath;
 	const bool bHasJsonPath = TryGetStringParam(Params, TEXT("jsonPath"), JsonPath) && !JsonPath.IsEmpty();
+	FString CsvString;
+	const bool bHasCsvString = TryGetStringParam(Params, TEXT("csvString"), CsvString) && !CsvString.IsEmpty();
+	FString FilePath;
+	const bool bHasFilePath = TryGetStringParam(Params, TEXT("filePath"), FilePath) && !FilePath.IsEmpty();
+	const MCPDataTableCsv::FImportOptions CsvOptions = MCPDataTableCsv::ReadOptions(Params);
 
 	FString AssetPath;
 	UDataTable* DataTable = nullptr;
 	if (auto Err = MCPImportLoadTypedAsset(Params, TEXT("DataTable"), AssetPath, DataTable)) return Err;
 
+	// A .json filePath is the JSON route by another name; only a .csv takes the CSV route.
+	const bool bFileIsJson = bHasFilePath && FPaths::GetExtension(FilePath).Equals(TEXT("json"), ESearchCase::IgnoreCase);
+	if (bFileIsJson)
+	{
+		JsonPath = FilePath;
+	}
+	const bool bCsv = bHasCsvString || (bHasFilePath && !bFileIsJson);
+	if (!bCsv && CsvOptions.IsSet())
+	{
+		return MCPError(TEXT("ignoreExtraFields, ignoreMissingFields and importKeyField shape a CSV import; pass csvString or a .csv filePath with them."));
+	}
+
+	if (bCsv)
+	{
+		if (!DataTable->RowStruct)
+		{
+			return MCPError(FString::Printf(TEXT("%s has no row struct, so there is nothing to read CSV columns into."), *AssetPath));
+		}
+		FString Csv;
+		FString CsvSource;
+		if (auto Err = MCPDataTableCsv::LoadCsv(bHasCsvString, CsvString, bHasFilePath, FilePath, Csv, CsvSource)) return Err;
+
+		// The same snapshot the JSON route takes: the importer empties the
+		// table first, so the rows standing now are the only way back.
+		const int32 PriorCsvRowCount = DataTable->GetRowMap().Num();
+		const FString PriorCsvJson = PriorCsvRowCount > 0
+			? DataTable->GetTableAsJSON(EDataTableExportFlags::UseJsonObjectsForStructs)
+			: FString();
+
+		const TArray<FString> Problems = MCPDataTableCsv::Import(DataTable, Csv, CsvOptions, CsvSource);
+
+		auto Result = MCPSuccess();
+		MCPSetUpdated(Result);
+		Result->SetStringField(TEXT("assetPath"), AssetPath);
+		Result->SetStringField(TEXT("format"), TEXT("csv"));
+		if (!CsvSource.IsEmpty()) Result->SetStringField(TEXT("sourceFile"), CsvSource);
+		Result->SetStringField(TEXT("rowStruct"), DataTable->RowStruct->GetName());
+		Result->SetNumberField(TEXT("rowCount"), DataTable->GetRowMap().Num());
+		Result->SetObjectField(TEXT("importOptions"), MCPDataTableCsv::Describe(DataTable));
+		Result->SetArrayField(TEXT("problems"), MCPDataTableCsv::ProblemsJson(Problems));
+		if (Problems.Num() > 0)
+		{
+			Result->SetBoolField(TEXT("success"), false);
+			Result->SetStringField(TEXT("error"), FString::Printf(
+				TEXT("Reimport from CSV reported %d problem(s); see problems. The table holds whatever rows the importer managed."), Problems.Num()));
+		}
+		else
+		{
+			Result->SetStringField(TEXT("message"), TEXT("DataTable reimported from CSV"));
+		}
+		EmitPriorDataTableRollback(Result, AssetPath, PriorCsvJson, PriorCsvRowCount);
+		return MCPResult(Result);
+	}
+
 	// Get JSON string from either inline jsonString or from a file path
 	if (!bHasJsonString)
 	{
 		JsonString.Reset();
-		if (bHasJsonPath)
+		if (bHasJsonPath || bFileIsJson)
 		{
 			if (!FPaths::FileExists(JsonPath))
 			{
@@ -2507,7 +3157,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReimportDataTable(const TSharedPtr<FJsonO
 		}
 		else
 		{
-			return MCPError(TEXT("Missing 'jsonString' or 'jsonPath' parameter"));
+			return MCPError(TEXT("Missing a source: pass jsonString, jsonPath, csvString or filePath"));
 		}
 	}
 
@@ -2532,6 +3182,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReimportDataTable(const TSharedPtr<FJsonO
 		TSharedPtr<FJsonObject> ErrResult = MakeShared<FJsonObject>();
 		ErrResult->SetBoolField(TEXT("success"), false);
 		ErrResult->SetArrayField(TEXT("errors"), ErrorsArray);
+		ErrResult->SetArrayField(TEXT("problems"), ErrorsArray);
 		ErrResult->SetStringField(TEXT("error"), FString::Printf(TEXT("Reimport completed with %d error(s)"), Errors.Num()));
 		// CreateTableFromJSONString emptied the table before it hit these
 		// errors, so this failure is MORE destructive than the success path.
@@ -2738,7 +3389,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetDataTableRow(const TSharedPtr<FJsonObj
 		}
 		else
 		{
-			DataTable->RemoveRow(RowKey);
+			RemoveDataTableRowSafely(DataTable, RowKey);
 		}
 		return MCPError(FString::Printf(
 			TEXT("Field '%s' on row '%s' did not store the requested value: %s. The row was left unchanged."),
@@ -2831,7 +3482,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::RemoveDataTableRow(const TSharedPtr<FJson
 		}
 	}
 
-	DataTable->RemoveRow(RowKey);
+	RemoveDataTableRowSafely(DataTable, RowKey);
 	DataTable->MarkPackageDirty();
 	FString SaveReason;
 	const bool bSaved = SaveAssetPackageChecked(DataTable, SaveReason);
@@ -3369,7 +4020,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::RenameDataTableRow(const TSharedPtr<FJson
 	RowStruct->CopyScriptStruct(NewRow, *OldPtr);
 
 	DataTable->AddRow(NewKey, *reinterpret_cast<FTableRowBase*>(NewRow));
-	DataTable->RemoveRow(OldKey);
+	RemoveDataTableRowSafely(DataTable, OldKey);
 	RowStruct->DestroyStruct(NewRow);
 	FMemory::Free(NewRow);
 
@@ -3471,6 +4122,18 @@ TSharedPtr<FJsonValue> FAssetHandlers::FillDataTableFromJson(const TSharedPtr<FJ
 
 namespace
 {
+	/** Every metadata entry on one string table key, as { id: value }. */
+	TSharedPtr<FJsonObject> StringTableEntryMetaData(const UStringTable* StringTable, const FTextKey& Key)
+	{
+		TSharedPtr<FJsonObject> MetaData = MakeShared<FJsonObject>();
+		StringTable->GetStringTable()->EnumerateMetaData(Key, [&MetaData](FName MetaDataId, const FString& Value)
+		{
+			MetaData->SetStringField(MetaDataId.ToString(), Value);
+			return true;
+		});
+		return MetaData;
+	}
+
 	int32 AppendStringTableEntries(
 		const UStringTable* StringTable,
 		const FString& KeyFilter,
@@ -3502,6 +4165,7 @@ namespace
 					TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
 					Entry->SetStringField(TEXT("key"), KeyString);
 					Entry->SetStringField(TEXT("sourceString"), SourceString);
+					Entry->SetObjectField(TEXT("metadata"), StringTableEntryMetaData(StringTable, Key));
 					OutEntries.Add(MakeShared<FJsonValueObject>(Entry));
 				}
 				return true;
@@ -3660,6 +4324,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::GetStringTableEntry(const TSharedPtr<FJso
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("key"), Key);
 	Result->SetStringField(TEXT("sourceString"), SourceString);
+	Result->SetObjectField(TEXT("metadata"), StringTableEntryMetaData(StringTable, FTextKey(Key)));
 	return MCPResult(Result);
 }
 
@@ -3696,8 +4361,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetStringTableEntry(const TSharedPtr<FJso
 
 	StringTable->Modify(true);
 	// The 3-arg SetSourceString (with a trailing metadata/namespace arg) is UE 5.8+.
-	// 5.7 (and non-editor) take the 2-arg form.
-#if WITH_EDITORONLY_DATA && UE_MCP_HAS_5_8_API
+	// 5.7 takes the 2-arg form.
+#if UE_MCP_HAS_5_8_API
 	StringTable->GetMutableStringTable()->SetSourceString(EntryKey, SourceString, FString());
 #else
 	StringTable->GetMutableStringTable()->SetSourceString(EntryKey, SourceString);
@@ -3767,6 +4432,139 @@ TSharedPtr<FJsonValue> FAssetHandlers::RemoveStringTableEntry(const TSharedPtr<F
 	Payload->SetStringField(TEXT("sourceString"), PreviousSourceString);
 	MCPSetRollback(Result, TEXT("set_stringtable_entry"), Payload);
 
+	return MCPResult(Result);
+}
+
+TSharedPtr<FJsonValue> FAssetHandlers::SetStringTableEntryMetaData(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Key;
+	const TSharedPtr<FJsonValue> MissingKey = RequireString(Params, TEXT("key"), Key);
+	FString MetaDataId;
+	const TSharedPtr<FJsonValue> MissingId = RequireString(Params, TEXT("metaDataId"), MetaDataId);
+	FString Value;
+	const bool bHasValue = TryGetStringParam(Params, TEXT("metaDataValue"), Value);
+	FString AssetPath;
+	UStringTable* StringTable = nullptr;
+	if (auto Err = MCPImportLoadTypedAsset(Params, TEXT("StringTable"), AssetPath, StringTable)) return Err;
+	if (MissingKey) return MissingKey;
+	if (MissingId) return MissingId;
+	if (!bHasValue)
+	{
+		return MCPError(TEXT("Missing required parameter 'metaDataValue'"));
+	}
+
+	const FTextKey EntryKey(Key);
+	FString SourceString;
+	if (!StringTable->GetStringTable()->GetSourceString(EntryKey, SourceString))
+	{
+		return MCPError(FString::Printf(TEXT("StringTable entry not found: %s. Create it with set_stringtable_entry first."), *Key));
+	}
+
+	const FName Id(*MetaDataId);
+	bool bHadValue = false;
+	FString Previous;
+	StringTable->GetStringTable()->EnumerateMetaData(EntryKey, [&](FName ExistingId, const FString& ExistingValue)
+	{
+		if (ExistingId == Id)
+		{
+			bHadValue = true;
+			Previous = ExistingValue;
+			return false;
+		}
+		return true;
+	});
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetStringField(TEXT("key"), Key);
+	Result->SetStringField(TEXT("metaDataId"), MetaDataId);
+	Result->SetStringField(TEXT("metaDataValue"), Value);
+	if (bHadValue && Previous.Equals(Value, ESearchCase::CaseSensitive))
+	{
+		MCPSetExisted(Result);
+		Result->SetBoolField(TEXT("unchanged"), true);
+		Result->SetObjectField(TEXT("metadata"), StringTableEntryMetaData(StringTable, EntryKey));
+		return MCPResult(Result);
+	}
+
+	StringTable->Modify(true);
+	StringTable->GetMutableStringTable()->SetMetaData(EntryKey, Id, Value);
+	FString SaveReason;
+	const bool bSaved = SaveAssetPackageChecked(StringTable, SaveReason);
+
+	if (bHadValue) MCPSetUpdated(Result); else MCPSetCreated(Result);
+	MCPNoteSaveOutcome(Result, StringTable->GetPathName(), bSaved, SaveReason);
+	Result->SetObjectField(TEXT("metadata"), StringTableEntryMetaData(StringTable, EntryKey));
+
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("assetPath"), AssetPath);
+	Payload->SetStringField(TEXT("key"), Key);
+	Payload->SetStringField(TEXT("metaDataId"), MetaDataId);
+	if (bHadValue)
+	{
+		Payload->SetStringField(TEXT("metaDataValue"), Previous);
+		Result->SetStringField(TEXT("previousMetaDataValue"), Previous);
+		MCPSetRollback(Result, TEXT("set_stringtable_entry_metadata"), Payload);
+	}
+	else
+	{
+		MCPSetRollback(Result, TEXT("remove_stringtable_entry_metadata"), Payload);
+	}
+	return MCPResult(Result);
+}
+
+TSharedPtr<FJsonValue> FAssetHandlers::RemoveStringTableEntryMetaData(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Key;
+	const TSharedPtr<FJsonValue> MissingKey = RequireString(Params, TEXT("key"), Key);
+	FString MetaDataId;
+	const TSharedPtr<FJsonValue> MissingId = RequireString(Params, TEXT("metaDataId"), MetaDataId);
+	FString AssetPath;
+	UStringTable* StringTable = nullptr;
+	if (auto Err = MCPImportLoadTypedAsset(Params, TEXT("StringTable"), AssetPath, StringTable)) return Err;
+	if (MissingKey) return MissingKey;
+	if (MissingId) return MissingId;
+
+	const FTextKey EntryKey(Key);
+	const FName Id(*MetaDataId);
+	bool bHadValue = false;
+	FString Previous;
+	StringTable->GetStringTable()->EnumerateMetaData(EntryKey, [&](FName ExistingId, const FString& ExistingValue)
+	{
+		if (ExistingId == Id)
+		{
+			bHadValue = true;
+			Previous = ExistingValue;
+			return false;
+		}
+		return true;
+	});
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetStringField(TEXT("key"), Key);
+	Result->SetStringField(TEXT("metaDataId"), MetaDataId);
+	if (!bHadValue)
+	{
+		Result->SetBoolField(TEXT("alreadyRemoved"), true);
+		return MCPResult(Result);
+	}
+
+	StringTable->Modify(true);
+	StringTable->GetMutableStringTable()->RemoveMetaData(EntryKey, Id);
+	FString SaveReason;
+	const bool bSaved = SaveAssetPackageChecked(StringTable, SaveReason);
+
+	Result->SetBoolField(TEXT("deleted"), true);
+	MCPNoteSaveOutcome(Result, StringTable->GetPathName(), bSaved, SaveReason);
+	Result->SetObjectField(TEXT("metadata"), StringTableEntryMetaData(StringTable, EntryKey));
+
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("assetPath"), AssetPath);
+	Payload->SetStringField(TEXT("key"), Key);
+	Payload->SetStringField(TEXT("metaDataId"), MetaDataId);
+	Payload->SetStringField(TEXT("metaDataValue"), Previous);
+	MCPSetRollback(Result, TEXT("set_stringtable_entry_metadata"), Payload);
 	return MCPResult(Result);
 }
 
@@ -3938,8 +4736,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportStringTableCsv(const TSharedPtr<FJs
 	if (MCPIsProtectedAssetPath(AssetPath))
 	{
 		return MCPError(FString::Printf(
-			TEXT("'%s' is on a protected mount (/Engine/, /Script/, /Memory/, /Temp/), which the bridge never writes to."),
-			*AssetPath));
+			TEXT("'%s' is on a protected mount (/Engine/, /Script/, /Memory/, /Temp/), which the bridge never writes to. %s"),
+			*AssetPath, *MCPProtectedMountWayForward()));
 	}
 
 	if (MissingCsvPath) return MissingCsvPath;
@@ -4037,7 +4835,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportStringTableCsv(const TSharedPtr<FJs
 		}
 		else
 		{
-#if WITH_EDITORONLY_DATA && UE_MCP_HAS_5_8_API
+#if UE_MCP_HAS_5_8_API
 			StringTable->GetMutableStringTable()->SetSourceString(FTextKey(Entry.Key), Entry.Value, FString());
 #else
 			StringTable->GetMutableStringTable()->SetSourceString(FTextKey(Entry.Key), Entry.Value);
@@ -4385,11 +5183,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::ExportAsset(const TSharedPtr<FJsonObject>
 	// working directory, which is the engine's binaries folder: not somewhere a
 	// caller can predict, and it would put the existence probe below and the
 	// file the exporter actually writes in two different places.
-	FString AbsOutputPath = OutputPath;
-	if (FPaths::IsRelative(AbsOutputPath))
-	{
-		AbsOutputPath = FPaths::Combine(FPaths::ProjectDir(), AbsOutputPath);
-	}
+	FString AbsOutputPath;
+	if (auto Err = MCPRequireWritablePath(OutputPath, AbsOutputPath)) return Err;
 
 	// CompositeDataTable derives from DataTable; its merged rows use the same
 	// serializers. Neither table class needs a registered UExporter.
@@ -4536,8 +5331,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::ExportTexture(const TSharedPtr<FJsonObjec
 	UTexture2D* Texture = LoadAssetByPath<UTexture2D>(AssetPath);
 	if (!Texture) return MCPAssetLoadError(AssetPath, TEXT("Texture2D"));
 
-	FString AbsPath = OutputPath;
-	if (FPaths::IsRelative(AbsPath)) AbsPath = FPaths::Combine(FPaths::ProjectDir(), AbsPath);
+	FString AbsPath;
+	if (auto Err = MCPRequireWritablePath(OutputPath, AbsPath)) return Err;
 	if (!AbsPath.EndsWith(TEXT(".png"))) AbsPath += TEXT(".png");
 	// Same reason as export_asset: bReplaceIdentical is true below, so this
 	// distinguishes writing a new PNG from overwriting one that was there.
@@ -4560,8 +5355,12 @@ TSharedPtr<FJsonValue> FAssetHandlers::ExportTexture(const TSharedPtr<FJsonObjec
 	Result->SetBoolField(TEXT("overwroteExistingFile"), bOutputExisted);
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("path"), AbsPath);
-	Result->SetNumberField(TEXT("width"), Texture->GetSizeX());
-	Result->SetNumberField(TEXT("height"), Texture->GetSizeY());
+	// The exporter writes source mip 0, so report that size. Platform data reads
+	// as the 32 x 32 placeholder while the texture is still compiling (#1550).
+	const bool bFromSource = Texture->Source.IsValid();
+	if (!bFromSource) FTextureCompilingManager::Get().FinishCompilation({ Texture });
+	Result->SetNumberField(TEXT("width"), bFromSource ? Texture->Source.GetSizeX() : Texture->GetSizeX());
+	Result->SetNumberField(TEXT("height"), bFromSource ? Texture->Source.GetSizeY() : Texture->GetSizeY());
 	Result->SetNumberField(TEXT("sizeBytes"), (double)Size);
 	Result->SetBoolField(TEXT("rollbackPossible"), false);
 	Result->SetStringField(TEXT("rollbackNote"),
@@ -4583,10 +5382,11 @@ TSharedPtr<FJsonValue> FAssetHandlers::CompareTextures(const TSharedPtr<FJsonObj
 	UTexture2D* B = LoadAssetByPath<UTexture2D>(PathB);
 	if (!A) return MCPAssetLoadError(PathA, TEXT("Texture2D"));
 	if (!B) return MCPAssetLoadError(PathB, TEXT("Texture2D"));
+	// A texture still compiling reads as the 32 x 32 placeholder (#1550).
+	FTextureCompilingManager::Get().FinishCompilation({ A, B });
 
 	const bool bSameDims = A->GetSizeX() == B->GetSizeX() && A->GetSizeY() == B->GetSizeY();
 	const bool bSameFormat = A->GetPixelFormat() == B->GetPixelFormat();
-#if WITH_EDITORONLY_DATA
 #if UE_MCP_HAS_5_5_API
 	const FString IdA = A->Source.GetIdString();
 	const FString IdB = B->Source.GetIdString();
@@ -4598,9 +5398,6 @@ TSharedPtr<FJsonValue> FAssetHandlers::CompareTextures(const TSharedPtr<FJsonObj
 	const FString IdB = B->Source.GetId().ToString();
 #endif
 	const bool bSameSource = (IdA == IdB);
-#else
-	const FString IdA, IdB; const bool bSameSource = false;
-#endif
 	const bool bIdentical = bSameDims && bSameFormat && bSameSource;
 
 	auto Result = MCPSuccess();

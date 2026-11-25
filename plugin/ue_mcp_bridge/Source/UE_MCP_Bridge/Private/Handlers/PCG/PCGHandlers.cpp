@@ -1,5 +1,6 @@
 #include "PCGHandlers.h"
 #include "PCGHandlers_Internal.h"
+#include "PCGEdgeValidation.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerPagination.h"
@@ -49,13 +50,6 @@
 #include "ScopedTransaction.h"
 #include "Runtime/Launch/Resources/Version.h"
 #include <functional>
-
-#define UE_MCP_HAS_STATIC_FIND_OBJECT_FLAGS (ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7))
-
-// UPCGSubsystem::ForAllRegisteredLocalComponents answers how many local
-// components a partitioned component owns. Set to 0 on an engine where it is
-// not exported, and get_pcg_component_details reports localComponentsKnown:false.
-#define UE_MCP_HAS_PCG_LOCAL_COMPONENT_QUERY 1
 
 namespace
 {
@@ -761,8 +755,8 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		return MCPParam::Required(TEXT("targetNode"), EType::String, TEXT("Node the edge enters")).Alias(TEXT("targetNodeName"));
 	};
 	// The component actions name their actor one way or the other, never both.
-	const FMCPParamSpec SpecActorLabel = MCPParam::Optional(TEXT("actorLabel"), EType::String, TEXT("Editor label of the actor holding the PCG component; a label naming several actors is refused"));
-	const FMCPParamSpec SpecActorPath = MCPParam::Optional(TEXT("actorPath"), EType::String, TEXT("Full actor object path; the unambiguous selector"));
+	const FMCPParamSpec SpecActorLabel = MCPSharedParam::ActorLabel().Describe(TEXT("Editor label of the actor holding the PCG component; a label naming several actors is refused"));
+	const FMCPParamSpec SpecActorPath = MCPSharedParam::ActorPath();
 	const FMCPSpecRules ActorChoice = MCPSpec::ExactlyOne({ { TEXT("actorLabel") }, { TEXT("actorPath") } });
 
 	Registry.RegisterHandler(TEXT("list_pcg_graphs"), &ListPCGGraphs, {
@@ -773,7 +767,7 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("create_pcg_graph"), &CreatePCGGraph, {
 		MCPParam::Required(TEXT("name"), EType::String, TEXT("Graph asset name")),
 		MCPParam::Optional(TEXT("packagePath"), EType::String, TEXT("Folder for the new graph (default /Game/PCG)")).Alias(TEXT("path")),
-		MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("When the graph exists: skip (default, report it) | error")),
+		MCPSharedParam::OnConflict().Describe(TEXT("When the graph exists: skip (default, report it) | error")),
 	}, MCPSpec::ContractExempt(TEXT("Creates and saves a graph under the contract values; nothing it reads fails first")));
 	Registry.RegisterHandler(TEXT("read_pcg_graph"), &ReadPCGGraph, {
 		GraphPath(),
@@ -799,6 +793,8 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("sourcePin"), EType::String, TEXT("Output pin label. connect_nodes defaults to the first output pin, disconnect_nodes to any")).Alias(TEXT("sourcePinLabel")),
 		MCPParam::Optional(TEXT("targetPin"), EType::String, TEXT("Input pin label. connect_nodes defaults to the first input pin, disconnect_nodes to any")).Alias(TEXT("targetPinLabel")),
 	});
+	// #1828: Custom HLSL node source and UPCGGraph::ValidateEdge.
+	RegisterCustomHLSLHandlers(Registry);
 	Registry.RegisterHandler(TEXT("remove_pcg_node"), &RemovePCGNode, {
 		GraphPath(),
 		MCPParam::Required(TEXT("nodeName"), EType::String, TEXT("Engine name of the node, as read_graph reports it")),
@@ -813,8 +809,8 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Optional(TEXT("propertyValue"), EType::String, TEXT("The value for propertyName, as UE export text")),
 	}, MCPSpec::ExactlyOne({ { TEXT("settings") }, { TEXT("propertyName"), TEXT("propertyValue") } }));
 	// #1365: wait and timeoutSeconds are honoured by the MCP server, which polls get_pcg_generation_state.
-	const FMCPParamSpec SpecWait = MCPParam::Optional(TEXT("wait"), EType::Boolean, TEXT("Return only once this run finishes (default false); the result gains wait {state, durationMs}"));
-	const FMCPParamSpec SpecWaitTimeout = MCPParam::Optional(TEXT("timeoutSeconds"), EType::Number, TEXT("Longest wait in seconds (default 600)"));
+	const FMCPParamSpec SpecWait = MCPParam::Optional(TEXT("wait"), EType::Boolean, TEXT("Return only once this run finishes (default false); the result gains wait {state, durationMs}")).Default(false);
+	const FMCPParamSpec SpecWaitTimeout = MCPParam::Optional(TEXT("timeoutSeconds"), EType::Number, TEXT("Longest wait in seconds (default 600)")).Min(0).Default(600.0);
 	Registry.RegisterHandler(TEXT("execute_pcg_graph"), &ExecutePCGGraph, {
 		SpecActorLabel, SpecActorPath,
 		MCPParam::Optional(TEXT("seed"), EType::Integer, TEXT("Write the component's Seed before generating; the old one is reported as previousSeed")),
@@ -831,7 +827,7 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		}),
 		MCPParam::Optional(TEXT("extent"), EType::Vec3, TEXT("Half-size of the volume box {x,y,z} before scale (default 500 on each axis)")),
 		MCPParam::Optional(TEXT("label"), EType::String, TEXT("Editor label. Also the idempotency key: an existing actor with this label is reported rather than duplicated")),
-		MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("When the label exists: skip (default, report it) | error")),
+		MCPSharedParam::OnConflict().Describe(TEXT("When the label exists: skip (default, report it) | error")),
 	}, MCPSpec::ContractExempt(TEXT("Spawns a volume under the contract values; nothing it reads fails first")));
 	Registry.RegisterHandler(TEXT("read_pcg_node_settings"), &ReadPCGNodeSettings, {
 		GraphPath(),
@@ -891,11 +887,11 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Required(TEXT("levelPath"), EType::String, TEXT("Saved level (.umap) to export, package or object path")),
 		MCPParam::Optional(TEXT("assetPath"), EType::String, TEXT("The PCG data asset's own path (an object path, or an existing asset's package path, updated in place), or else the folder for it (default: the level's folder)")),
 		MCPParam::Optional(TEXT("assetName"), EType::String, TEXT("Asset name (default: <LevelName>_PCG)")),
-		MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Save the asset after export (default true)")),
+		MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Save the asset after export (default true)")).Default(true),
 	});
 	Registry.RegisterHandler(TEXT("update_pcg_level_assets"), &UpdateLevelAssets, {
 		MCPParam::Required(TEXT("assetPaths"), EType::Array, TEXT("PCG data assets to re-export from their source levels")).Items(EType::String),
-		MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Save the assets after export (default true)")),
+		MCPParam::Optional(TEXT("save"), EType::Boolean, TEXT("Save the assets after export (default true)")).Default(true),
 	});
 	// #1253: subgraph assignment and parameter overrides.
 	Registry.RegisterHandler(TEXT("set_pcg_subgraph"), &SetSubgraph, {
@@ -924,7 +920,7 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 		MCPParam::Required(TEXT("graphPath"), EType::String, TEXT("PCGGraph or PCGGraphInstance the instance runs")),
 		MCPParam::Optional(TEXT("packagePath"), EType::String, TEXT("Folder for the new instance (default /Game/PCG)")),
 		MCPParam::Optional(TEXT("overrides"), EType::Object, TEXT("{parameterName: value} overrides to set on the new instance")),
-		MCPParam::Optional(TEXT("onConflict"), EType::String, TEXT("When the asset exists: skip (default, report it) | error")),
+		MCPSharedParam::OnConflict(),
 	});
 	Registry.RegisterHandler(TEXT("set_pcg_graph_instance_overrides"), &SetGraphInstanceOverrides, {
 		MCPParam::Required(TEXT("assetPath"), EType::String, TEXT("PCGGraphInstance asset path")).Alias(TEXT("path")),
@@ -1362,11 +1358,33 @@ TSharedPtr<FJsonValue> FPCGHandlers::ConnectPCGNodes(const TSharedPtr<FJsonObjec
 	SourceNode->Modify();
 	TargetNode->Modify();
 
+	// #1828: a refused edge says why. 5.9's TryAddEdge reports the reason itself;
+	// before it, AddEdge only returns null, so the same checks run afterwards to name it.
+#if UE_MCP_HAS_5_9_API
+	FText ConnectReason;
+	const EPCGGraphConnectionResult Connected = Graph->TryAddEdge(SourceNode, ResolvedSourcePinLabel, TargetNode, ResolvedTargetPinLabel, ConnectReason);
+	if (Connected != EPCGGraphConnectionResult::Success)
+	{
+		Transaction.Cancel();
+		FMCPPCGEdgeCheck Check;
+		Check.Result = StaticEnum<EPCGGraphConnectionResult>()->GetNameStringByValue(static_cast<int64>(Connected));
+		Check.Reason = ConnectReason.ToString();
+		return MCPPCGEdgeRefusal(Check, SourceNodeName, ResolvedSourcePinLabel, TargetNodeName, ResolvedTargetPinLabel);
+	}
+#else
 	UPCGNode* ResultNode = Graph->AddEdge(SourceNode, ResolvedSourcePinLabel, TargetNode, ResolvedTargetPinLabel);
 	if (!ResultNode)
 	{
-		return MCPError(TEXT("Failed to connect pins - connection may already exist or be incompatible"));
+		Transaction.Cancel();
+		FMCPPCGEdgeCheck Check = MCPPCGValidateEdge(Graph, SourceNode, ResolvedSourcePinLabel, TargetNode, ResolvedTargetPinLabel);
+		if (Check.IsSuccess())
+		{
+			Check.Result = TEXT("Rejected");
+			Check.Reason = TEXT("UPCGGraph::AddEdge refused the edge without a reason this engine reports.");
+		}
+		return MCPPCGEdgeRefusal(Check, SourceNodeName, ResolvedSourcePinLabel, TargetNodeName, ResolvedTargetPinLabel);
 	}
+#endif
 
 	// #304: AddEdge has shipped variants that report success while failing to
 	// instantiate the UPCGEdge object on the pin. Verify by walking the source
@@ -2582,14 +2600,10 @@ TSharedPtr<FJsonValue> FPCGHandlers::SetStaticMeshSpawnerMeshes(const TSharedPtr
 
 	WeightedSelector->Modify();
 	WeightedSelector->MeshEntries = MoveTemp(Rebuilt);
-#if WITH_EDITOR
 	WeightedSelector->RefreshDisplayNames();
-#endif
 
-#if WITH_EDITOR
 	// Without the change notification, components using this graph keep their last generation until forced.
 	SpawnerSettings->PostEditChange();
-#endif
 	FoundNode->PostEditChange();
 	Graph->PostEditChange();
 
@@ -3321,12 +3335,25 @@ TSharedPtr<FJsonValue> FPCGHandlers::ImportGraph(const TSharedPtr<FJsonObject>& 
 
 			SrcNode->Modify();
 			DstNode->Modify();
+#if UE_MCP_HAS_5_9_API
+			// 5.9's TryAddEdge says why an edge is refused, as pcg(connect_nodes) reports it (#1828).
+			FText RefusedBecause;
+			const EPCGGraphConnectionResult Added = Graph->TryAddEdge(SrcNode, SrcPinName, DstNode, DstPinName, RefusedBecause);
+			if (Added != EPCGGraphConnectionResult::Success)
+			{
+				++ImportFailures;
+				Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("connection %s.%s -> %s.%s: %s (%s)"), *From, *SrcPinName.ToString(), *To, *DstPinName.ToString(),
+					*StaticEnum<EPCGGraphConnectionResult>()->GetNameStringByValue(static_cast<int64>(Added)), *RefusedBecause.ToString())));
+				continue;
+			}
+#else
 			if (!Graph->AddEdge(SrcNode, SrcPinName, DstNode, DstPinName))
 			{
 				++ImportFailures;
 				Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("connection %s.%s -> %s.%s: AddEdge failed (incompatible or duplicate?)"), *From, *SrcPinName.ToString(), *To, *DstPinName.ToString())));
 				continue;
 			}
+#endif
 			// #304: verify the UPCGEdge object was actually instantiated. Some
 			// pin/label combinations return success from AddEdge while leaving
 			// no edge in either pin's Edges array; those phantom connections

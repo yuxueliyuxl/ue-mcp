@@ -22,10 +22,11 @@ Every action on this page is in the `pie` category.
 | `resolve_in_pie` | boolean | Default `false`, and only on a step with `expect`, `arrange` or `act`. `true` means `expect.value`, and the actors `arrange` and `act` name, only exist once PIE is running, such as an actor spawned during play, so `script_create` and `script_update` do not check them against the level. |
 | `arrange` | array | Optional. Run when the step starts: a scenario's arrange entries, `{kind: "spawn", class, at?, rotation?, scale?}`, `{kind: "set", target, path, value}` or `{kind: "call", target, func, args?}`. |
 | `act` | array | Optional. Run after `arrange`: the step actions `uat_run` takes in a step's `do` (see [Arrange and act](#arrange-and-act)). |
-| `expect.value` | string | Required in `expect`. For `decreasing`, `increasing`, `eq`, `gt` and `lt`: a tracked value path, or its last segment. For `exists`: an actor id. For `visible`: a widget class or name. |
+| `expect.value` | string | Required in `expect`. For `decreasing`, `increasing`, `eq`, `gt` and `lt`: a tracked value path, or its last segment, or one of the player pawn's sampled channels, read with no profile: `pos_x`, `pos_y`, `pos_z`, `vel_x`, `vel_y`, `vel_z`, `rot_pitch`, `rot_yaw`, `rot_roll`, `speed2d` (the `recording.csv` column names). A tracked value of the same name wins. For `exists`: an actor id. For `visible`: a widget class or name. For `triggered`: an Input Action, as a package path (`/Game/Input/IA_Interact`) or an object path (`/Game/Input/IA_Interact.IA_Interact`). |
 | `expect.op` | string | Required in `expect`. One of the ops below. |
-| `expect.target` | number or boolean | Required for `eq`, `gt` and `lt`. Optional for `visible` and `exists`, default `true`; `false` asks for the opposite. Refused for `decreasing` and `increasing`. A boolean given to `eq`, `gt` or `lt` is read as 1 or 0. |
-| `expect.within_ms` | integer | How long the step has to meet its expectation, in game milliseconds from the moment it starts, or from the end of its `act` when it has one. 0 or absent uses the run's `default_within_ms`. |
+| `expect.target` | number or boolean | Required for `eq`, `gt` and `lt`. Optional for `visible` and `exists`, default `true`; `false` asks for the opposite. Optional for `decreasing` and `increasing`: a number above 0, the least change from the value at step start. A boolean given to `eq`, `gt` or `lt` is read as 1 or 0. Refused on `triggered`. |
+| `expect.within_ms` | integer | How long the step has to meet its expectation, in game milliseconds from the moment it starts, or from the end of its `act` when it has one. 0 or absent uses the run's `default_within_ms`, except on `triggered`, where 0 or absent waits with no timeout. |
+| `expect.client` | integer | `triggered` only, refused on the other ops. The player whose input is watched, counted as `act` counts them: 0 (default) the editor's own player, 1..N a remote player in join order. |
 
 A manual step takes no `expect`, and a step that has one is refused. An auto step without `expect` passes as soon as it starts (once its `act` ends, when it has one), with `evidence.reason` set to `no expectation`.
 
@@ -37,19 +38,39 @@ An auto step is checked on every observed frame from the frame it starts. It pas
 
 | Op | Holds when |
 |---|---|
-| `decreasing` | The value is lower than the first value observed in the step. |
-| `increasing` | The value is higher than the first value observed in the step. |
+| `decreasing` | The value is lower than the first value observed in the step, by at least `target` when given (`target: 300` on `pos_x`: x dropped by 300 or more). |
+| `increasing` | The value is higher than the first value observed in the step, by at least `target` when given. |
 | `eq` | The value is within 0.0001 of `target`, or within 0.01% of the larger of the two magnitudes when that is more. |
 | `gt` | The value is greater than `target`. |
 | `lt` | The value is less than `target`. |
 | `visible` | The widget is visible (or not, with `target: false`). |
 | `exists` | The actor resolves in the PIE world (or does not, with `target: false`). |
+| `triggered` | The person playing fires the Input Action on player `client`. See [Waiting for the player](#waiting-for-the-player). |
 
 Auto steps run one at a time. The next step starts on the frame the previous one settled, so the baseline of a `decreasing` or `increasing` step is the value at that frame, or at the frame its `act` ended.
 
+### Waiting for the player
+
+A `triggered` step holds the run until the person playing presses an Input Action, then the run carries on: "start the playtest, at step 5 wait until the player interacts".
+
+```json
+{
+  "instruction": "Walk to the brazier and press Interact",
+  "expect": { "op": "triggered", "value": "/Game/Input/IA_Interact" }
+}
+```
+
+- The step passes on the first frame the action is in its Triggered event on that player's Enhanced Input, after the window opens at the end of the step's `act`.
+- Only a fresh trigger counts: the action has to be seen not triggering inside the window first. A press the step's own `act` made, or a key already held when the window opened, does not pass the step; release and press again.
+- `within_ms` 0 or absent waits with no timeout, until the action fires or `script_stop`, so a person can take their time. With a `within_ms`, the step fails when nothing fires in time, with `evidence.reason` `... was not triggered by client N within M ms`.
+- The evidence records `triggered_at_ms` (game milliseconds into the run), `action_value` (a boolean, a number, or `[x, y]` / `[x, y, z]`, by the action's value type) and `value_type` (`bool`, `axis1d`, `axis2d` or `axis3d`).
+- The editor's own player is read every frame. A remote player (`client` 1..N) watches its own input and reports the trigger over the game connection, so its `triggered_at_ms` is when the editor heard of it.
+- `script_create`, `script_update` and `script_validate` check that the Input Action exists, and report one that does not on `expect.value` with candidates.
+- A replay watches the replayed input the same way, in the step's own window.
+
 ### Arrange and act
 
-A step can set up and drive what it then checks, so a script runs end to end with nobody at the controls:
+A step can set up and drive what it then checks, so a script runs end to end with nobody at the controls. `pie(uat_run)` drives the same step actions for multiplayer scenarios; see [PIE testing](pie.md#remote-players-and-acceptance-runs).
 
 ```json
 {
@@ -65,12 +86,12 @@ A step can set up and drive what it then checks, so a script runs end to end wit
 
 - **Order.** `arrange`, then `act`, then the `expect` window opens. `within_ms` counts from the end of `act`. The run holds at the step until its act ends, so the next step never starts in the middle of one.
 - **arrange** entries are a scenario's, applied by the same code `scenario_validate` checks them with: `spawn` a class (native or a Blueprint path, with or without `_C`), `set` a property on an actor by dotted path, `call` a function on an actor. An actor is named by label, name or class.
-- **act** entries are the step actions `uat_run` runs, through the same executor: `place` (`{at, offset?, face?}` next to an actor, facing it, or `{location, yaw?}`), `press` (`{action, frames?}`), `inject` (`{action, value}`), `hold` (`{action, value, ms}`), `tape` (`{action, values}`), `console`, `capture` (a label or `true`; the file lands under `<output_dir>/captures/`) and `wait_ms`. `client` (default 0, the editor's own player) sends an entry to a remote player. An act ends once every entry ran, every hold and tape on the editor's player played out, and every remote player confirmed what it was sent.
+- **act** entries are the step actions `uat_run` runs, through the same executor: `place` (`{at, offset?, face?}` next to an actor, facing it, or `{location, yaw?}`; `location` and `offset` are `[x, y, z]` or `{x, y, z}`, and any other shape is refused when the script is saved), `press` (`{action, frames?}`), `inject` (`{action, value}`), `hold` (`{action, value, ms}`), `tape` (`{action, values, hz?}`, `hz` default 60), `console`, `capture` (a label or `true`; the file lands under `<output_dir>/captures/`), `key` (`{key, event?}` or `{text}`: a Slate key press, down or up, or typed characters, sent to the run's own player so a menu in UI-only input mode moves focus and presses buttons; refused with `client` above 0) and `wait_ms`. `client` (default 0, the editor's own player) sends an entry to a remote player. Client 0 is one exact local player: the host on a listen server, or the first client window (the lowest PIE instance) when the server is dedicated or you play standalone. Input for client 0 goes to that player even when another client's world is the one the editor ticked last. To drive a different player with entries that name no client, pass `pie_instance` (and `client_id` for a split-screen local player) to `script_run`, as `inject_input` takes them; the run observes that player too, and a `triggered` step on client 0 watches it. In a dedicated-server session with two clients, `script_run(pie_instance=2)` drives the second client window. An act ends once every entry ran, every hold and tape on the editor's player played out, and every remote player confirmed what it was sent.
 - **A manual step may carry `act`**: the engine sets the scene, then the step asks for its verdict. A manual step with `act` starts its own block of manual steps.
 - **An act that fails fails its step**, with the reason in `evidence.reason`, and the run moves on.
 - `script_create`, `script_update` and `script_validate` resolve the actor every `set`, `call` and `place` names, the class every `spawn` names and the Input Action every `press`, `inject`, `hold` and `tape` names, and report one that does not exist with the field at fault, such as `act[1].press.action` or `arrange[0].target`, and candidates. `resolve_in_pie: true` lets an actor that only exists in PIE through; classes and Input Actions are always checked.
 - A [manual run](#manual-runs) has no PIE and a [replay](#replay-regression) replays the recorded input, so neither runs `arrange` or `act`. The step's `act_result` says so.
-- What the act did is in the step's `act_result` and on its `step_acted` event: `{status, reason?, arranged, actions: [{index, action, ok, error?, at_ms}], started_at_ms, ended_at_ms, duration_ms, wall_ms, captures?}`. `status` is `running`, `done`, `failed` or `skipped`. Times are game milliseconds, except `wall_ms`.
+- What the act did is in the step's `act_result` and on its `step_acted` event: `{status, reason?, arranged, actions: [{index, action, ok, error?, target?, at_ms}], started_at_ms, ended_at_ms, duration_ms, wall_ms, captures?}`. `status` is `running`, `done`, `failed` or `skipped`. Times are game milliseconds, except `wall_ms`. `target` says who an entry drove: `pie_instance N local player L in <world> (<net mode>)` for client 0, `remote client N` for a remote player, or the pawn `place` moved.
 
 ## Storing scripts
 
@@ -83,7 +104,7 @@ Scripts are data assets, saved under `/Game/PIEStudio/Scripts` unless you give a
 | `script_update` | `path`, and any of `steps`, `description`, `profile` (empty clears it), `map` (empty clears it), `default_within_ms`, `manual_only` |
 | `script_validate` | `steps`, `profile?`, `map?`, `manual_only?`. The checks `script_create` runs, without saving: `valid`, `errors` in the refusal's shape, `summary` and the parsed `steps`. |
 | `script_values` | `target?`, `profile?`, `limit?` (default 400). What a script can name in the open level: `pawn` (`class`, `source`, `components`), `values` (`path`, `kind` number, integer, boolean or enum, `type`, and an enum's `values`), `actors`, `spawned_classes`, `widgets`, `profile_values`, and with `target` a `target` object (`found`, `class`, `is_player_pawn`, `actors` of that class). |
-| `script_delete` | `path`, `confirm=true` |
+| `script_delete` | `path`, `confirm=true`. Answers `deleted: true` once the asset is gone from disk. A delete that did not finish returns `success: false` with the `reason` [`asset(delete)`](tool-reference.md) gives, such as `open_in_editor`, `in_memory_referenced` or `package_dirty`. Refused with `reason: "play_in_editor"` while PIE runs. |
 | `script_list` | `directory?` (default `/Game`). Returns `scripts` (`path`, `object_path`, `name`, `map`, `last_run`) and `count`. `last_run` is the script's newest run as [`script_runs`](#listing-runs) lists it, without its steps, or `null` when it never ran. |
 
 A `map` that is not a level asset is refused (`field: "map"`, with the closest levels as candidates). A profile that does not exist is a warning (`field: "profile"`). `map` takes a package path such as `/Game/Maps/L_Arena` or its object path `/Game/Maps/L_Arena.L_Arena`. `steps` must hold at least one step.
@@ -95,7 +116,6 @@ A `map` that is not a level asset is refused (`field: "map"`, with the closest l
 - **The value has to resolve**, the way the observer reads it, against the level open in the editor and the script's profile. A numeric op reads a profile tracked value (its path or last segment), a property path on the player pawn (the pawn player 0 possesses in the level, or the game mode's `DefaultPawnClass`), a component's property (`CollisionCylinder.CapsuleHalfHeight`), `sub:<Subsystem>.<path>`, or `bone:<bone>.<channel>`. `exists` needs an actor in the level, or a class the game mode spawns. `visible` needs a widget class, a Widget Blueprint, or a widget inside one.
 - **The op and target have to suit the value's type.** A bool takes only `eq` with `true` or `false`, an enum only `eq` with one of its values, and a number a number target. An integer is refused an `eq` target it cannot hold, and a `gt` or `lt` target it can never pass.
 - **A script needs an auto step with an `expect`.** A script judged entirely by verdicts says so with `manual_only: true`.
-
 - **What arrange and act name has to exist**: the actors, actor classes and Input Actions ([Arrange and act](#arrange-and-act)).
 
 A value that only exists once PIE is running, such as an actor spawned during play, is let through by `resolve_in_pie: true` on its step. The step's op and target are still checked as far as they can be without a type.
@@ -120,9 +140,9 @@ Only a script that cannot be written is refused: no steps, a step that does not 
 {
   "success": false,
   "errorCode": "INVALID_SCRIPT_STEPS",
-  "error": "The script cannot be saved as written (1 problem): steps[0].expect.op 'sideways' is unknown (decreasing, increasing, eq, gt, lt, visible, exists)",
+  "error": "The script cannot be saved as written (1 problem): steps[0].expect.op 'sideways' is unknown (decreasing, increasing, eq, gt, lt, visible, exists, triggered)",
   "errors": [
-    { "step": 0, "field": "expect.op", "message": "steps[0].expect.op 'sideways' is unknown (decreasing, increasing, eq, gt, lt, visible, exists)", "candidates": ["decreasing", "increasing", "eq"] }
+    { "step": 0, "field": "expect.op", "message": "steps[0].expect.op 'sideways' is unknown (decreasing, increasing, eq, gt, lt, visible, exists, triggered)", "candidates": ["decreasing", "increasing", "eq"] }
   ],
   "warnings": []
 }
@@ -130,7 +150,7 @@ Only a script that cannot be written is refused: no steps, a step that does not 
 
 `step` is `null` for a problem with the whole script, such as no auto step (`field: "steps"`, candidates `["manual_only"]`) or a missing profile (`field: "profile"`). `script_run` does not run these checks: a stored script runs whatever its warnings, and inline steps are only parsed.
 
-`script_validate` runs the same checks without saving and reports every finding in `errors`, with `valid` false when there is any, so a client can draft in a loop, and `script_values` lists the values the checks accept. The built-in `playtest` flow drafts a script with a model this way; see [Flows](flows.md#playtest).
+`script_validate` runs the same checks without saving and reports every finding in `errors`, with `valid` false when there is any, so a client can draft in a loop. `script_values` lists the values the checks accept. The built-in `playtest` flow drafts a script this way; see [Flows](flows.md#playtest).
 
 ```text
 pie(action="script_create", name="DoorOpens", profile="/Game/PIEStudio/Profiles/Door",
@@ -149,7 +169,7 @@ pie(action="script_create", name="DoorOpens", profile="/Game/PIEStudio/Profiles/
 pie(action="script_run", script="/Game/PIEStudio/Scripts/DoorOpens", start_pie=true, wait=true)
 ```
 
-`script_run` takes a stored script (`script`) or inline `steps`, exactly one of them. The editor runs one script at a time; `script_run` is refused while another run is active.
+`script_run` takes a stored script (`script`) or inline `steps`, exactly one of them. The editor runs one script at a time; `script_run` is refused while another run is active. With the [playtest mode](configuration.md#playtest-mode) set to `manual`, an MCP client's `script_run` and `script_replay` are refused.
 
 | Param | Default | Meaning |
 |---|---|---|
@@ -158,7 +178,7 @@ pie(action="script_run", script="/Game/PIEStudio/Scripts/DoorOpens", start_pie=t
 | `profile` | the script's | The observation profile to arm. |
 | `map` | the script's | The level to play in. When another level is open, the run opens this one before it arms anything, and is refused when the open level has unsaved changes or PIE is running in another level. With no map the run plays whatever level is open. `mode=manual` leaves the open level as it is. |
 | `record` | `true` | Arm the recorder too, so the run can be replayed. With `record=false` the run has no recording and cannot be replayed. |
-| `start_pie` | `false` | Start PIE when it is not running. Otherwise the run waits for the next PIE session. |
+| `start_pie` | `false` | Start PIE when it is not running. Otherwise the run waits for the next PIE session. A session already running is used as it is. |
 | `block_on_manual` | `true` | Hold the run at a manual step until it has a verdict. Consecutive manual steps are put up together and the run holds until each has one. `false` starts each manual step and moves on. |
 | `mode` | `full` | `manual` judges the script by its manual steps with no PIE. See [Manual runs](#manual-runs). |
 | `default_within_ms` | the script's, or `5000` | The window for an auto step that names none. |
@@ -206,17 +226,17 @@ With `wait=true` the answer is merged with the run's final status, without `even
 
 ### Status
 
-`script_status` (`run_id?`, `since_seq?`, `wait?`, `timeout_seconds?`) reports a run with the same fields as the `script_run` answer, plus `active`. Run states are `armed`, `running`, `awaiting_verdict`, `finished`, `stopped` and `idle`. Step statuses are `pending`, `running`, `passed`, `failed`, `awaiting_verdict` and `skipped`.
+`script_status` (`run_id?`, `since_seq?`, `wait?`, `timeout_seconds?`) reports a run with the same fields as the `script_run` answer, plus `active`, `stop_reason` once the run has ended, and `waiting_for` while an armed run waits for the player or its pawn (such as `player controller PC_0 possesses no pawn`). Run states are `armed`, `running`, `awaiting_verdict`, `finished`, `stopped` and `idle`. Step statuses are `pending`, `running`, `passed`, `failed`, `awaiting_verdict` and `skipped`.
 
 The editor holds one run in memory: the active one, or the last one to end. An older run id answers from that run's `results.json`, events included, with `live: false`. A run id with no `results.json`, and any call before the first run, answers `state: "idle"` with empty `steps`, `awaiting` and `events`, and `last_seq` equal to `since_seq`.
 
-`awaiting` lists the steps waiting for a verdict as `{ index, instruction }`. `since_seq` returns only the events after that number, so a caller that polls passes the `last_seq` it last saw. Each event is `{ seq, type, run_id, step, at_ms, wall_time, data }`, where `step` is the step index or `-1`. The editor's event types are `run_started`, `step_started`, `step_passed`, `step_failed`, `awaiting_verdict`, `verdict` and `run_finished`.
+`awaiting` lists the steps waiting for a verdict as `{ index, instruction }`. `since_seq` returns only the events after that number, so a caller that polls passes the `last_seq` it last saw. Each event is `{ seq, type, run_id, step, at_ms, wall_time, data }`, where `step` is the step index or `-1`. The editor's event types are `run_started`, `step_started`, `step_acted`, `step_passed`, `step_failed`, `awaiting_verdict`, `verdict` and `run_finished`.
 
 `wait` and `timeout_seconds` work as they do on `script_run`, and the merged answer keeps `events` after `since_seq`. Calling `script_status` on a run that has not ended also makes the server follow it again, so its events reach the daemon stream after a server restart.
 
 ### How a run ends
 
-A run finishes with `stop_reason` `all steps settled` once every step has passed, failed or been skipped. It also finishes when PIE ends (`PIE ended`) or the observation ends (`observation ended`). An auto step still running then fails with `run ended before the step settled (<reason>)`. Pending steps stay `pending` and manual steps without a verdict stay `awaiting_verdict`.
+A run finishes with `stop_reason` `all steps settled` once every step has passed, failed or been skipped. It also finishes when PIE ends (`PIE ended`) or the observation ends (`observation ended`). An observation that cannot resolve the player within 10 seconds, or attach to its pawn within 30 seconds of resolving it, ends the run with the reason as `stop_reason`, such as `No pawn to observe after 30 s in UEDPIE_0_Map: player controller PC_0 possesses no pawn`. A pawn without an input component is attached anyway after 2 seconds of game time, so a session left running by an earlier run can be observed. An auto step still running then fails with `run ended before the step settled (<reason>)`. Pending steps stay `pending` and manual steps without a verdict stay `awaiting_verdict`.
 
 `script_stop` (`run_id?`, `reason?`) ends the active run the same way with state `stopped` and `stop_reason` set to `reason` (default `stopped`), writes `results.json`, and answers with the run's fields, `stopped: true` and `changed: true`. A `run_id` that is not the active run is refused. With no active run the answer has `success: false`, `alreadyStopped: true`, and the last run's `run_id`, `state` and `results_path`.
 
@@ -368,6 +388,8 @@ The step records `verdict_source: "agent"` and the evidence in `results.json`, o
 ### Listing runs
 
 `script_runs` (`script?`, `limit?` default 50, `include_steps?` default true) lists script runs newest first: the active run, built from memory with `live: true`, then every `results.json` under `<Project>/Saved/MCPObservations`. `script` takes an asset or object path and keeps that script's runs. Each run carries `run_id`, `script`, `script_name`, `state`, `mode`, `started_at`, `ended_at`, `stop_reason`, `summary`, `results_path`, `live`, and its `steps` as `results.json` has them. The answer adds `count`, `total` (runs that matched before `limit`) and `observations_dir`.
+
+The editor keeps each parsed `results.json` until the file's timestamp or size changes, so a repeat listing reads only the files that changed. Listing 300 runs a second time took 34 ms where the first took 889 ms.
 
 ## Replay regression
 

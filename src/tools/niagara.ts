@@ -1,10 +1,21 @@
+// @session per-session: Every category tool is cloned per session and dispatches against the addressed editor.
 import { z } from "zod";
-import type { ToolContext, ToolDef } from "../core/types.js";
-import { bp, categoryTool } from "../surface/category-tool.js";
+import type { BridgeActionSpec, ToolContext, ToolDef } from "../surface/tool-types.js";
+import { categoryTool } from "../surface/category-tool.js";
 import { EDITOR_TARGET_PARAM } from "../surface/routing-params.js";
 import { handlerFailure } from "../flow/handler-outcome.js";
 import { actions as epicActions, schema as epicSchema } from "./epic/niagara.generated.js";
 import { specBp, schema as specSchema } from "./specs/niagara.generated.js";
+
+function customBridgeAction(
+  effect: "read" | "mutate",
+  description: string,
+  bridge: string,
+  mapParams?: (params: Record<string, unknown>) => Record<string, unknown>,
+  params?: { required?: readonly string[]; optional?: readonly string[] },
+): BridgeActionSpec {
+  return { kind: "bridge", effect, description, bridge, mapParams, params };
+}
 
 /** Whether a batch op's `editor` names the session the batch itself runs on. */
 function targetsSession(ctx: ToolContext, target: unknown): boolean {
@@ -44,9 +55,9 @@ export const niagaraTool: ToolDef = categoryTool(
     add_emitter:    specBp("mutate", "Add emitter to system.", "add_emitter_to_system"),
     remove_emitter: specBp("mutate", "Remove an emitter from a system (CRUD delete), addressed by emitterName or emitterIndex.", "remove_emitter_from_system"),
     list_emitters:  specBp("read", "List emitters in system.", "list_emitters_in_system"),
-    set_emitter_property: specBp("mutate", "Set emitter property.", "set_emitter_property"),
+    set_emitter_property: specBp("mutate", "Set emitter property. propertyName 'enabled' toggles the emitter and 'name' renames it (its Emitter.* parameters follow; the result's newEmitterName is the name it landed on); anything else is an FVersionedNiagaraEmitterData property.", "set_emitter_property"),
     list_modules:   specBp("read", "List Niagara module scripts, sorted by object path. pathFilter narrows the whole set rather than only the first page, which is what it always claimed to do.", "list_niagara_modules"),
-    get_emitter_info: specBp("read", "Inspect emitter.", "get_emitter_info"),
+    get_emitter_info: specBp("read", "Inspect an emitter: a standalone emitter asset by assetPath, or an emitter inside a system by systemPath plus emitterName or emitterIndex. Returns sim target, renderers, every emitter-data property with its value, and the module stack per context. Module input values such as SpawnRate or the EmitterState loop settings come from list_module_inputs.", "get_emitter_info"),
     list_renderers:   specBp("read", "List renderers on an emitter.", "list_emitter_renderers"),
     add_renderer:     specBp("mutate", "Add renderer (sprite/mesh/ribbon or full class).", "add_emitter_renderer"),
     remove_renderer:  specBp("mutate", "Remove renderer by index.", "remove_emitter_renderer"),
@@ -55,7 +66,7 @@ export const niagaraTool: ToolDef = categoryTool(
     create_system_from_spec: specBp("mutate", "Declaratively create a system + emitters: emitters=[{path}].", "create_niagara_system_from_spec"),
     get_compiled_hlsl: specBp("read", "Read GPU compute script info for an emitter.", "get_niagara_compiled_hlsl"),
     list_system_parameters: specBp("read", "List user-exposed system parameters.", "list_niagara_system_parameters"),
-    list_module_inputs:  specBp("read", "List an emitter's modules with the inputs you can actually SET - Spawn Rate, Lifetime, Colour, Sprite Size - each with its name, qualifiedName, type and a settable flag. Current values are NOT returned: the binder's value reader is not exported from NiagaraEditor, so the names and types are readable but the live value is not. Compile-time switches and enums are reported separately under switchPins; note that 'inputs' now means override-map inputs, NOT the function-call node pins it meant before (those are switchPins) (#784).", "list_niagara_module_inputs"),
+    list_module_inputs:  specBp("read", "List an emitter's modules in stack order (stackContext, stackIndex, moduleName, enabled) with the inputs you can actually SET - Spawn Rate, Lifetime, Colour, Sprite Size - each with its name, qualifiedName, type, a settable flag, its current value and valueSource: local (authored on this emitter), moduleDefault (the module script's default), or linked (driven by a dynamic input, described by list_dynamic_inputs). Compile-time switches and enums are reported separately under switchPins; note that 'inputs' now means override-map inputs, NOT the function-call node pins it meant before (those are switchPins) (#784).", "list_niagara_module_inputs"),
     set_module_input:    specBp("mutate", "Set a module input value. Override-map-bound inputs (the numeric/colour values that matter) are written through the stack override map, the same path the Niagara stack editor uses; others fall back to the pin default. Reports writePath ('overrideMap'|'pinDefault'). On the overrideMap path previousValue cannot be read back (NiagaraEditor does not export the binder's reader), so it reports '(unread: override map)' and NO rollback is offered - re-set the value explicitly instead. The pinDefault path reports a real previousValue and is rollback-safe (#769). value accepts a scalar, [x,y,z], {x,y,z[,w]} or {r,g,b[,a]} (alpha defaults to 1); anything the input's type cannot parse is REJECTED rather than written, including gapped component objects and non-finite numbers.", "set_niagara_module_input"),
     add_module:          specBp("mutate", "Add a stock /Niagara/Modules script to an emitter stack (the modules that make an emitter actually do anything). Then set_module_input to tune it.", "add_niagara_module"),
     list_static_switches: specBp("read", "List static switch inputs on a module.", "list_niagara_static_switches"),
@@ -67,7 +78,9 @@ export const niagaraTool: ToolDef = categoryTool(
     batch: {
       kind: "handler",
       effect: "mutate",
-      description: "Run a sequence of niagara operations against the bridge in order. Fails fast on the first error (returns results up to that point + error). Params: ops:[{action, params}] where action is any niagara subaction listed above.",
+      editorBound: "Runs a sequence of bridge calls against one Niagara system.",
+      params: { required: ["ops"] },
+      description: "Run a sequence of niagara operations against the bridge in order. Fails fast on the first error (returns results up to that point + error).",
       handler: async (ctx, params) => {
         const opsUnknown = params.ops;
         if (!Array.isArray(opsUnknown)) throw new Error("'ops' must be an array of {action, params}");
@@ -127,15 +140,15 @@ export const niagaraTool: ToolDef = categoryTool(
         return { results, stoppedAt: null };
       },
     },
-    describe_module_graph: bp("read", "Dump a module node's graph internals: node class, assignment targets/defaults, custom HLSL body, pins, and every data-interface input node in the same graph (particle-read source-emitter binding, spline DI, etc.). Use it to replicate module logic before converting an emitter to GPU. Params: systemPath, moduleName? (omit for all), emitterName?, emitterIndex?, stackContext? (default all)", "describe_niagara_module_graph", (p) => ({ systemPath: p.systemPath, moduleName: p.moduleName, emitterName: p.emitterName, emitterIndex: p.emitterIndex, stackContext: p.stackContext })),
-    describe_script_graph: bp("read", "Dump the source graph of an arbitrary NiagaraScript object (embedded module/scratch scripts like FX_SplineFX:Sprite_Update): module nodes with assignment targets/custom HLSL/pins, data-interface input nodes, and output nodes with usage. Params: objectPath (full script object path)", "describe_niagara_script_graph", (p) => ({ objectPath: p.objectPath })),
-    set_di_function:     bp("mutate", "Retarget a data-interface function-call node inside a NiagaraScript to a different DI function (e.g. ParticleRead 'Get Float By ID' -> 'Get Float By Index'). Index-based reads skip the GPU AcquireTag check, so cross-emitter reads work on GPU. Params: objectPath (script), newFunction (exact DI function name), nodeName? (node name), currentFunction? (substring filter on current function), outputTarget? (substring of the output pin's linked target, e.g. 'Particles.Time'), diClass? (default NiagaraDataInterfaceParticleRead), dryRun? (list matches without modifying)", "set_niagara_di_function", (p) => ({ objectPath: p.objectPath, newFunction: p.newFunction, nodeName: p.nodeName, currentFunction: p.currentFunction, outputTarget: p.outputTarget, diClass: p.diClass, dryRun: p.dryRun })),
-    graph_add_node:      bp("mutate", "Add a node to a NiagaraScript graph (embedded module/scratch scripts). nodeClass: NiagaraNodeOp (with opName), NiagaraNodeCustomHlsl (with hlsl), NiagaraNodeFunctionCall (DI call: diClass + diFunction), NiagaraNodeConvert, NiagaraNodeReroute, NiagaraNodeParameterMapGet/Set. Params: objectPath, nodeClass, opName?, hlsl?, diClass?, diFunction?", "graph_add_node", (p) => ({ objectPath: p.objectPath, nodeClass: p.nodeClass, opName: p.opName, hlsl: p.hlsl, diClass: p.diClass, diFunction: p.diFunction })),
-    graph_connect_pins:  bp("mutate", "Connect two pins inside a NiagaraScript graph. Params: objectPath, fromNode, fromPin (output), toNode, toPin (input)", "graph_connect_pins", (p) => ({ objectPath: p.objectPath, fromNode: p.fromNode, fromPin: p.fromPin, toNode: p.toNode, toPin: p.toPin })),
-    graph_disconnect_pins: bp("mutate", "Break all links on a pin. Params: objectPath, node, pin, direction? (0 input, 1 output, -1 any)", "graph_disconnect_pins", (p) => ({ objectPath: p.objectPath, node: p.node, pin: p.pin, direction: p.direction })),
-    graph_set_pin:       bp("mutate", "Set a pin's default value (breaks any existing links first). Params: objectPath, node, pin, value, direction? (default 0 input)", "graph_set_pin", (p) => ({ objectPath: p.objectPath, node: p.node, pin: p.pin, value: p.value, direction: p.direction })),
-    graph_set_node_property: bp("mutate", "Set a reflected property on a graph node (e.g. OpName on NiagaraNodeOp). Supports bool/int/float/double/name/string/text. Params: objectPath, node, propertyName, value", "graph_set_node_property", (p) => ({ objectPath: p.objectPath, node: p.node, propertyName: p.propertyName, value: p.value })),
-    graph_remove_node:   bp("mutate", "Remove a node from a NiagaraScript graph. Params: objectPath, node", "graph_remove_node", (p) => ({ objectPath: p.objectPath, node: p.node })),
+    describe_module_graph: customBridgeAction("read", "Inspect Niagara module graph internals, including assignment targets, HLSL, pins and data-interface inputs.", "describe_niagara_module_graph", (p) => ({ systemPath: p.systemPath, moduleName: p.moduleName, emitterName: p.emitterName, emitterIndex: p.emitterIndex, stackContext: p.stackContext }), { required: ["systemPath"], optional: ["moduleName", "emitterName", "emitterIndex", "stackContext"] }),
+    describe_script_graph: customBridgeAction("read", "Read an embedded NiagaraScript graph, including nodes, pins, data-interface inputs and outputs.", "describe_niagara_script_graph", (p) => ({ objectPath: p.objectPath }), { required: ["objectPath"] }),
+    set_di_function: customBridgeAction("mutate", "Change a Niagara data-interface function call, with optional dryRun inspection.", "set_niagara_di_function", (p) => ({ objectPath: p.objectPath, newFunction: p.newFunction, nodeName: p.nodeName, currentFunction: p.currentFunction, outputTarget: p.outputTarget, diClass: p.diClass, dryRun: p.dryRun }), { required: ["objectPath", "newFunction"], optional: ["nodeName", "currentFunction", "outputTarget", "diClass", "dryRun"] }),
+    graph_add_node: customBridgeAction("mutate", "Add a node to an embedded NiagaraScript graph.", "graph_add_node", (p) => ({ objectPath: p.objectPath, nodeClass: p.nodeClass, opName: p.opName, hlsl: p.hlsl, diClass: p.diClass, diFunction: p.diFunction }), { required: ["objectPath", "nodeClass"], optional: ["opName", "hlsl", "diClass", "diFunction"] }),
+    graph_connect_pins: customBridgeAction("mutate", "Connect output and input pins in a NiagaraScript graph.", "graph_connect_pins", (p) => ({ objectPath: p.objectPath, fromNode: p.fromNode, fromPin: p.fromPin, toNode: p.toNode, toPin: p.toPin }), { required: ["objectPath", "fromNode", "fromPin", "toNode", "toPin"] }),
+    graph_disconnect_pins: customBridgeAction("mutate", "Disconnect links from a NiagaraScript graph pin.", "graph_disconnect_pins", (p) => ({ objectPath: p.objectPath, node: p.node, pin: p.pin, direction: p.direction }), { required: ["objectPath", "node", "pin"], optional: ["direction"] }),
+    graph_set_pin: customBridgeAction("mutate", "Set a NiagaraScript graph pin default.", "graph_set_pin", (p) => ({ objectPath: p.objectPath, node: p.node, pin: p.pin, value: p.value, direction: p.direction }), { required: ["objectPath", "node", "pin", "value"], optional: ["direction"] }),
+    graph_set_node_property: customBridgeAction("mutate", "Set a reflected NiagaraScript graph node property.", "graph_set_node_property", (p) => ({ objectPath: p.objectPath, node: p.node, propertyName: p.propertyName, value: p.value }), { required: ["objectPath", "node", "propertyName", "value"] }),
+    graph_remove_node: customBridgeAction("mutate", "Remove a node from a NiagaraScript graph.", "graph_remove_node", (p) => ({ objectPath: p.objectPath, node: p.node }), { required: ["objectPath", "node"] }),
     ...epicActions,
   },
   {
@@ -162,5 +175,5 @@ export const niagaraTool: ToolDef = categoryTool(
     pin: z.string().optional().describe("For graph_disconnect_pins/set_pin: pin name"),
     direction: z.number().optional().describe("For graph_disconnect_pins/set_pin: 0 input, 1 output, -1 any"),
     ops: z.array(z.record(z.string(), z.unknown())).optional().describe("For batch: [{action, params}]"),
-  },
+  }, { label: { text: "vfx (niagara)", description: "VFX systems, emitters, modules", requiredPlugins: ["Niagara"], keywords: ["vfx", "emitter", "particle"] } },
 );

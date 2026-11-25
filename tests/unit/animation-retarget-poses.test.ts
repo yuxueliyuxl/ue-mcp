@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { animationTool } from "../../src/tools/animation.js";
 import { handlerSpecs } from "../../src/tools/specs/animation.generated.js";
-import type { ToolContext } from "../../src/core/types.js";
+import type { ToolContext } from "../../src/surface/tool-types.js";
 import { readHandlerFile } from "../../scripts/lib/cpp-registrations.mjs";
 
 describe("remove_retarget_pose and rename_retarget_pose (#1288)", () => {
@@ -23,6 +23,7 @@ describe("remove_retarget_pose and rename_retarget_pose (#1288)", () => {
     expect(source).toContain("PoseName == UIKRetargeter::GetDefaultPoseName()");
     expect(source).toContain("Controller->RemoveRetargetPose(PoseName, SoT)");
     expect(source).toContain("Controller->RenameRetargetPose(PoseName, NewName, SoT)");
-    expect(source).toContain('MCPUnsupportedEngineError(TEXT("remove_retarget_pose"), TEXT("5.7"))');
+    expect(source).toContain('MCPUnsupportedEngineError(TEXT("remove_retarget_pose"), TEXT("5.7"),');
+    expect(source).toContain('MCPUnsupportedEngineError(TEXT("rename_retarget_pose"), TEXT("5.7"),');
   });
 });
